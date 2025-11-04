@@ -122,11 +122,13 @@ class NemotronHMoE(nn.Module):
     def __init__(
         self,
         config: NemotronHConfig,
+        layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         parallel_config: ParallelConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
 
@@ -215,7 +217,7 @@ class NemotronHMoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        shared_output, final_hidden_states = fused_moe_out
+        shared_output, final_hidden_states, topk_ids = fused_moe_out
 
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.
@@ -239,7 +241,7 @@ class NemotronHMoE(nn.Module):
                 final_hidden_states
             )
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states.view(num_tokens, hidden_dim), topk_ids
 
 
 class NemotronHMLPDecoderLayer(nn.Module):
@@ -306,8 +308,10 @@ class NemotronHMoEDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
 
+        self.layer_idx = layer_idx
         self.mixer = NemotronHMoE(
             config,
+            layer_idx,
             quant_config=quant_config,
             parallel_config=parallel_config,
             prefix=f"{prefix}.mixer",
@@ -327,9 +331,8 @@ class NemotronHMoEDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer(hidden_states)
-        return hidden_states, residual
-
+        hidden_states, topk = self.mixer(hidden_states)
+        return hidden_states, residual, topk
 
 class NemotronHMambaDecoderLayer(nn.Module):
     def __init__(
@@ -564,6 +567,7 @@ class NemotronHModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        moe_analyzer_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -577,19 +581,30 @@ class NemotronHModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         residual = None
+        moe_layer_num = 0
         for i, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
-
+            if isinstance(layer, NemotronHMoEDecoderLayer):
+                hidden_states, residual, topk = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
+                moe_analyzer_input[:8000, moe_layer_num, ...].copy_(topk)
+                moe_layer_num += 1
+                
+            else:
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
-        return hidden_states
+
+        return hidden_states, moe_analyzer_input
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -816,6 +831,8 @@ class NemotronHForCausalLM(
             self.num_shared_experts = example_moe.n_shared_experts
             self.num_redundant_experts = example_moe.n_redundant_experts
 
+        self.moe_analyzer_buffer  = torch.empty((8000, 23, 6), dtype=torch.int32, requires_grad = False, device="cuda")
+
     def set_eplb_state(
         self,
         expert_load_view: torch.Tensor,
@@ -860,11 +877,10 @@ class NemotronHForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-
-        return hidden_states
+        hidden_states, moe_analyzer_output = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds, self.moe_analyzer_buffer
+         )
+        return hidden_states, moe_analyzer_output
 
     def compute_logits(
         self,

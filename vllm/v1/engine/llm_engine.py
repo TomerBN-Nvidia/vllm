@@ -316,7 +316,7 @@ class LLMEngine:
             )
             self.do_log_stats_with_interval()
 
-        return processed_outputs.request_outputs
+        return processed_outputs.request_outputs, outputs.moe_analyzer
 
     def start_profile(self):
         self.engine_core.profile(True)

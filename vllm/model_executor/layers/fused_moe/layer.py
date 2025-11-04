@@ -1355,6 +1355,9 @@ class FusedMoE(CustomOp):
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
 
+        self.sort_vals_buffer  = torch.empty((20000, 128), dtype=torch.float32, requires_grad = False, device="cuda")
+        self.sort_idx_buffer = torch.empty((20000, 128), dtype=torch.long, requires_grad = False, device="cuda")
+
     @property
     def shared_experts(self) -> torch.nn.Module | None:
         return None
@@ -2186,7 +2189,7 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         og_hidden_states = hidden_states.shape[-1]
         if self.hidden_size != og_hidden_states:
             hidden_states = F.pad(
@@ -2195,6 +2198,10 @@ class FusedMoE(CustomOp):
                 mode="constant",
                 value=0.0,
             )
+
+        torch.sort(router_logits, dim=-1, descending=True, out=(self.sort_vals_buffer[:router_logits.shape[0], : router_logits.shape[1]], self.sort_idx_buffer[:router_logits.shape[0], : router_logits.shape[1]]))
+        topk_ids = self.sort_idx_buffer[:8000,..., :self.top_k]
+
 
         if self.shared_experts is None:
             if current_platform.is_tpu():
@@ -2206,7 +2213,9 @@ class FusedMoE(CustomOp):
                 fused_output = torch.ops.vllm.moe_forward(
                     hidden_states, router_logits, self.layer_name
                 )
-            return fused_output[..., :og_hidden_states]
+            # Get the topk_ids that was stored during the forward pass
+            return fused_output[..., :og_hidden_states], topk_ids
+        
         else:
             if current_platform.is_tpu():
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
@@ -2221,13 +2230,14 @@ class FusedMoE(CustomOp):
             return (
                 shared_output[..., :og_hidden_states],
                 fused_output[..., :og_hidden_states],
+                topk_ids
             )
 
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.forward_native(hidden_states, router_logits)
 
     def forward_impl_chunked(

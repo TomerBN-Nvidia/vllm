@@ -152,6 +152,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
 logger = init_logger(__name__)
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -2248,6 +2250,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        moe_analyzer: torch.Tensor | None,
+        positions: torch.Tensor
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
@@ -2358,6 +2362,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
+            moe_analyzer,
+            positions
         )
 
         return (
@@ -2409,13 +2415,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Returns:
             Model output tensor
         """
-        return self.model(
+
+        hidden_states, moe_analyzer_output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+
+        return hidden_states, moe_analyzer_output
 
     @torch.inference_mode()
     def execute_model(
@@ -2517,13 +2526,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
+            model_output, moe_analyzer_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -2628,7 +2638,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # EAGLE speculative decoding can use the GPU sampled tokens
             # as inputs, and does not need to wait for bookkeeping to finish.
             propose_draft_token_ids(sampler_output.sampled_token_ids)
-
+        
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
@@ -2645,6 +2655,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_states,
                 num_scheduled_tokens,
                 spec_decode_metadata,
+                moe_analyzer_output,
+                positions,
             )
 
         if (
@@ -2668,6 +2680,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            moe_analyzer=self.moe_analyzer_tensor,
         )
 
         if not self.use_async_scheduling:
@@ -3024,7 +3037,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
+        moe_analyzer: torch.Tensor,
+        positions: torch.Tensor
     ) -> dict[str, LogprobsTensors | None]:
+        
+        acc_size = 0
+        for req_id, size in num_scheduled_tokens.items():
+            pos_ids = positions[acc_size: acc_size+size]
+            self.moe_analyzer_tensor[int(req_id),pos_ids] = moe_analyzer[acc_size: acc_size+size]
+            acc_size += size
         num_prompt_logprobs_dict = self.input_batch.num_prompt_logprobs
         if not num_prompt_logprobs_dict:
             return {}
@@ -3474,7 +3495,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
-                outputs = self.model(
+                outputs, _ = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
@@ -3494,6 +3515,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     and not self.speculative_config.enforce_eager
                 )
                 self.drafter.dummy_run(num_tokens, use_cudagraphs=use_cudagraphs)
+
+            self.moe_analyzer_tensor = -1*torch.ones((64, 8000, 23, 6), dtype=torch.int32).to("cuda")
 
         # This is necessary to avoid blocking DP.
         # For dummy runs, we typically skip EPLB since we don't have any real

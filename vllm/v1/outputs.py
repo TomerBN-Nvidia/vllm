@@ -162,7 +162,8 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
-
+    # req_id -> moe_analyzer
+    moe_analyzer: dict[str, torch.Tensor] | None = None
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
     @abstractmethod

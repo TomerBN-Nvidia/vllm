@@ -904,6 +904,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        moe_analyzer = model_runner_output.moe_analyzer
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1066,7 +1067,8 @@ class Scheduler(SchedulerInterface):
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
         }
-
+        if moe_analyzer is not None:
+            engine_core_outputs[0].moe_analyzer = moe_analyzer.clone().cpu()
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
             # Include ids of requests that finished since last outputs

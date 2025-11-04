@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
+import torch
 import torch.nn as nn
 from pydantic import ValidationError
 from tqdm.auto import tqdm
@@ -381,6 +382,7 @@ class LLM:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: list[LoRARequest] | LoRARequest | None = None,
         priority: list[int] | None = None,
+        moe_analyzer_save_dir: str | None = None
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -438,7 +440,10 @@ class LLM:
             priority=priority,
         )
 
-        outputs = self._run_engine(use_tqdm=use_tqdm)
+        outputs, moe_analyzer = self._run_engine(use_tqdm=use_tqdm)
+        if moe_analyzer_save_dir:
+            torch.save(moe_analyzer, moe_analyzer_save_dir)
+            logger.info(f"moe_analyer reilts saved to: {moe_analyzer_save_dir}")
         return self.engine_class.validate_outputs(outputs, RequestOutput)
 
     def _get_modality_specific_lora_reqs(
@@ -1720,7 +1725,7 @@ class LLM:
         total_in_toks = 0
         total_out_toks = 0
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs, moe_analyzer = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
@@ -1750,4 +1755,4 @@ class LLM:
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
-        return sorted(outputs, key=lambda x: int(x.request_id))
+        return sorted(outputs, key=lambda x: int(x.request_id)), moe_analyzer

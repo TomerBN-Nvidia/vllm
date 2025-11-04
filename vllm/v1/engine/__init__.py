@@ -122,6 +122,8 @@ class EngineCoreOutput(
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
 
+    moe_analyzer: torch.Tensor | None = None
+    
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -171,6 +173,7 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+    moe_analyzer: torch.Tensor | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:
