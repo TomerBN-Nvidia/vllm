@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize,
+    mxfp8_e4m3_quantize_python,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import flashinfer_fp4_quantize
