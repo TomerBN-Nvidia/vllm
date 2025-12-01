@@ -49,7 +49,10 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import dequant_mxfp8_to_bf16
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize_python,
+)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_Scheme
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
@@ -1904,13 +1907,16 @@ def fused_experts_impl(
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
-        qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
-            A=curr_hidden_states,
-            A_scale=a1_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
+        if use_mxfp8_fake_w8a8:
+            qcurr_hidden_states, a1q_scale = mxfp8_e4m3_quantize_python(curr_hidden_states)
+        else:
+            qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
+                A=curr_hidden_states,
+                A_scale=a1_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape,
+            )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
@@ -1965,13 +1971,16 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
+        if use_mxfp8_fake_w8a8:
+            qintermediate_cache2, a2q_scale = mxfp8_e4m3_quantize_python(intermediate_cache2)
+        else:
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                A=intermediate_cache2,
+                A_scale=a2_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape,
+            )
 
         invoke_fused_moe_kernel(
             qintermediate_cache2,
@@ -2152,13 +2161,16 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         a2q_scale: torch.Tensor | None = None
 
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            intermediate_cache2,
-            a2_scale,
-            self.quant_dtype,
-            self.per_act_token_quant,
-            self.block_shape,
-        )
+        if self.quant_config.use_mxfp8_fake_w8a8:
+            qintermediate_cache2, a2q_scale = mxfp8_e4m3_quantize_python(intermediate_cache2)
+        else:
+            qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+                intermediate_cache2,
+                a2_scale,
+                self.quant_dtype,
+                self.per_act_token_quant,
+                self.block_shape,
+            )
 
         invoke_fused_moe_kernel(
             qintermediate_cache2,
