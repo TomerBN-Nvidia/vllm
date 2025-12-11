@@ -4,6 +4,8 @@
 from collections.abc import Callable
 from enum import Enum
 from functools import partial
+from math import ceil
+
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -56,6 +58,10 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     rotate_flashinfer_fp8_moe_weights,
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize_python,
+    dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     W8A8BlockFp8LinearOp,
@@ -198,6 +204,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
         is_mx: bool = False,
+        weight_scheme: str = "static"
     ) -> None:
         super().__init__()
 
@@ -226,6 +233,7 @@ class Fp8Config(QuantizationConfig):
                 )
         self.is_mx = is_mx
         self.weight_block_size = weight_block_size
+        self.weight_scheme = weight_scheme
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -255,6 +263,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         is_mx = cls.get_from_keys_or(config, ["is_mx"], False)
+        weight_scheme = cls.get_from_keys_or(config, ["weight_scheme"], "static")
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
@@ -265,6 +274,7 @@ class Fp8Config(QuantizationConfig):
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             is_mx=is_mx,
+            weight_scheme=weight_scheme,
         )
 
     def get_xpu_quant_method(
@@ -446,7 +456,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         # WEIGHT
-        if self.quant_config.is_checkpoint_fp8_serialized:
+        if self.quant_config.is_checkpoint_fp8_serialized and self.quant_config.weight_scheme == "static":
             weight = create_fp8_weight_parameter(
                 output_size_per_partition, input_size_per_partition, weight_loader
             )
@@ -561,6 +571,10 @@ class Fp8LinearMethod(LinearMethodBase):
             else None
         )
         if self.quant_config.is_mx:
+            if self.quant_config.weight_scheme == "dynamic":
+                weight, weight_scale = mxfp8_e4m3_quantize_python(layer.weight.data.to(torch.bfloat16))
+                layer.weight = Parameter(weight.data, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
             swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
 
@@ -720,7 +734,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
 
-        if self.quant_config.is_checkpoint_fp8_serialized:
+        if self.quant_config.is_checkpoint_fp8_serialized and self.quant_config.weight_scheme == "static":
             params_dtype = torch.float8_e4m3fn
         if self.block_quant:
             assert self.weight_block_size is not None
@@ -780,7 +794,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     numu_shards * intermediate_size_per_partition,
                     hidden_size // 32,
-                    dtype=torch.float32,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -791,7 +805,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     get_tensor_model_parallel_world_size()
                     * intermediate_size_per_partition
                     // 32,
-                    dtype=torch.float32,
+                    dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
@@ -1045,31 +1059,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             if self.quant_config.is_mx:
-                # MX format already has single scale per expert
-                weight = layer.w13_weight
-                weight_scale = layer.w13_weight_scale
-                from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-                    dequant_mxfp8_to_bf16,
-                )
 
-                dq_weight = dequant_mxfp8_to_bf16(weight, weight_scale).contiguous()
-                layer.w13_weight = Parameter(dq_weight.data, requires_grad=False)
+                def maybe_quantize(weight, weight_scale_attr):
+                    """Quantize dynamically or use prequantized weights."""
+                    if self.quant_config.weight_scheme == "dynamic":
+                        return mxfp8_e4m3_quantize_python(weight.data.to(torch.bfloat16))
+                    else:
+                        return weight, weight_scale_attr
 
-                weight = layer.w2_weight
-                weight_scale = layer.w2_weight_scale
-                import math
+                # -------------------------
+                # w13 processing
+                # -------------------------
+                w13_q, w13_scale = maybe_quantize(layer.w13_weight, layer.w13_weight_scale)
 
-                dq_weight = dequant_mxfp8_to_bf16(
-                    weight,
-                    weight_scale[
-                        ...,
-                        (layer.ep_rank) * math.ceil(weight.shape[-1] / 32) : (
-                            layer.ep_rank + 1
-                        )
-                        * math.ceil(weight.shape[-1] / 32),
-                    ],
-                ).contiguous()
-                layer.w2_weight = Parameter(dq_weight.data, requires_grad=False)
+                dq_w13 = dequant_mxfp8_to_bf16(w13_q, w13_scale).contiguous()
+                layer.w13_weight = Parameter(dq_w13.data, requires_grad=False)
+
+                # -------------------------
+                # w2 processing
+                # -------------------------
+                w2_q, w2_scale_full = maybe_quantize(layer.w2_weight, layer.w2_weight_scale)
+
+                # Select expert block
+                blk = ceil(w2_q.shape[-1] / 32)
+                start = layer.ep_rank * blk
+                end = (layer.ep_rank + 1) * blk
+                w2_scale = w2_scale_full[..., start:end]
+
+                dq_w2 = dequant_mxfp8_to_bf16(w2_q, w2_scale).contiguous()
+                layer.w2_weight = Parameter(dq_w2.data, requires_grad=False)
+                
                 return
 
             assert layer.w13_weight_scale is not None

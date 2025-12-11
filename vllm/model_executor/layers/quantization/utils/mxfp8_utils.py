@@ -11,29 +11,28 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import swizzle_bl
 
 logger = init_logger(__name__)
 
-
-def mxfp8_e4m3_quantize_python(
-    data: torch.Tensor, is_sf_swizzled_layout: bool = False
-) -> tuple[torch.Tensor, torch.Tensor]:
+def cast_tensor_to_mxfp8(data: torch.Tensor):
     assert len(data.shape) == 2, "Only 2d input tensor is supported"
+
     block_size1 = 32
     block_size0 = 1
     shape_before_padding = data.shape
-    # pad data to make its shape a multiple of weight_block_size
-    # with the last element of data
-    assert data.shape[1] % block_size1 == 0 and data.shape[0] % block_size0 == 0, (
-        "Data shape must be a multiple of tile size [1, 32]"
-    )
+    # pad data to make its shape a multiple of weight_block_size with the last element of data
+    assert data.shape[1] % block_size1 == 0 and data.shape[0] % block_size0 == 0, "Data shape must be a multiple of tile size [1, 32]"
 
     # FP8
     max_dtype = torch.finfo(torch.float8_e4m3fn).max
+
     shape_after_padding = data.shape
     blk_m, blk_n = data.shape[0] // block_size0, data.shape[1] // block_size1
+
     data = data.reshape(blk_m, block_size0, blk_n, block_size1)
+
     # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
     data = data.permute(0, 2, 1, 3)
     # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
     data = data.to(torch.float32).contiguous().flatten(start_dim=2)
+
     # Calculate max absolute value per block
     max_abs = torch.amax(torch.abs(data), dim=-1, keepdim=True)
 
@@ -68,10 +67,86 @@ def mxfp8_e4m3_quantize_python(
     # remove the padding
     if data.shape != shape_before_padding:
         fp_data = fp_data[: shape_before_padding[0], : shape_before_padding[1]]
-    if is_sf_swizzled_layout:
-        exponent = swizzle_blockscale(exponent)
+
     # Convert to target format, but still in original precision container
     return fp_data, exponent
+
+def mxfp8_e4m3_quantize_python(
+    data: torch.Tensor, 
+    is_sf_swizzled_layout: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    # ---- NEW: support 3D ----
+    if data.ndim == 2:
+        data = data.unsqueeze(0)     # treat as batch=1
+        squeeze_back = True
+    elif data.ndim == 3:
+        squeeze_back = False
+    else:
+        raise AssertionError("Input must be 2D or 3D (B, M, N)")
+
+    B, M, N = data.shape
+    block_size1 = 32
+    block_size0 = 1
+
+    assert N % block_size1 == 0 and M % block_size0 == 0, \
+        "Data shape must be a multiple of tile size [1, 32]"
+
+    # FP8 limits
+    max_dtype = torch.finfo(torch.float8_e4m3fn).max
+
+    # Compute block grid
+    blk_m = M // block_size0
+    blk_n = N // block_size1
+
+    # Reshape to blocks
+    # B, blk_m, block0, blk_n, block1
+    data_blocks = data.reshape(B, blk_m, block_size0, blk_n, block_size1)
+
+    # Permute to (B, blk_m, blk_n, block0, block1)
+    data_blocks = data_blocks.permute(0, 1, 3, 2, 4)
+
+    # Flatten blocks → (B, blk_m, blk_n, block0*block1)
+    data_blocks = data_blocks.to(torch.float32).flatten(start_dim=3)
+
+    # Compute per-block max
+    max_abs = torch.amax(torch.abs(data_blocks), dim=-1, keepdim=True)
+
+    # Compute exponent
+    descale = max_abs / max_dtype
+    exponent = torch.ceil(torch.log2(descale))
+    exponent = torch.clamp(exponent, min=-127, max=127) + 127
+    exponent_uint8 = exponent.to(torch.uint8)
+
+    # Compute scale_fp = 2^(127 - exponent)
+    scale_fp = torch.where(
+        exponent_uint8 == 0,
+        1.0,
+        torch.exp2(127 - exponent_uint8.to(torch.float32))
+    )
+
+    # Scale + clamp
+    data_lp = torch.clamp(data_blocks * scale_fp, min=-max_dtype, max=max_dtype)
+
+    # Convert to FP8
+    fp_data = data_lp.to(torch.float8_e4m3fn)
+
+    # Undo block flattening
+    fp_data = fp_data.reshape(B, blk_m, blk_n, block_size0, block_size1)
+    fp_data = fp_data.permute(0, 1, 3, 2, 4)
+    fp_data = fp_data.reshape(B, M, N)
+
+    # Handle swizzled layout
+    exponent_uint8 = exponent_uint8.reshape(B, blk_m, blk_n)
+    if is_sf_swizzled_layout:
+        exponent_uint8 = swizzle_blockscale(exponent_uint8)
+
+    if squeeze_back:
+        fp_data = fp_data[0]
+        exponent_uint8 = exponent_uint8[0]
+
+    return fp_data, exponent_uint8
+
 
 
 def compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
