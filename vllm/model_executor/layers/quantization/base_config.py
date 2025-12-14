@@ -13,7 +13,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 else:
     QuantizationMethods = str
+import functools
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
@@ -60,6 +64,23 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 
     return class_embedding is not None and class_embedding is not base_embedding
 
+def log_quant_method_call(fn):
+    @functools.wraps(fn)
+    def wrapper(self, layer, prefix):
+        logger.info(
+            "[Quant] prefix=%s layer=%s (%s)",
+            prefix,
+            layer.__class__.__name__,
+            type(self).__name__,
+        )
+        result = fn(self, layer, prefix)
+        logger.info(
+            "[Quant] result=%s for prefix=%s",
+            None if result is None else type(result).__name__,
+            prefix,
+        )
+        return result
+    return wrapper
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
@@ -132,6 +153,7 @@ class QuantizationConfig(ABC):
         except ValueError:
             return default
 
+    @log_quant_method_call
     @abstractmethod
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

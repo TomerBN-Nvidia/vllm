@@ -590,6 +590,8 @@ class FusedMoE(CustomOp):
                 quant_method = self.quant_config.get_quant_method(self, prefix)
             if quant_method is None:
                 quant_method = UnquantizedFusedMoEMethod(self.moe_config)
+                logger.info_once(
+                    f"[Quant] ]No quantization method specified. Using UnquantizedFusedMoEMethod for prefix {prefix}")
             assert isinstance(quant_method, FusedMoEMethodBase)
             return quant_method
 

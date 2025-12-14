@@ -282,6 +282,9 @@ class LinearBase(CustomOp):
         self.prefix = prefix
         if quant_config is None:
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
+            logger.info_once(
+                f"[Quant] No quantization config provided for {self.quant_method.__class__.__name__}. Using UnquantizedLinearMethod for prefix {prefix}"
+            )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         self.return_bias = return_bias
