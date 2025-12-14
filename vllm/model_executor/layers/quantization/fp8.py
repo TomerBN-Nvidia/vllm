@@ -733,7 +733,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
-
+        quant_method = None
+        
         if self.quant_config.is_checkpoint_fp8_serialized and self.quant_config.weight_scheme == "static":
             params_dtype = torch.float8_e4m3fn
         if self.block_quant:
@@ -762,6 +763,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"weight quantization block_k = {block_k}."
                 )
         numu_shards = 2 if layer.is_gated else 1
+        
+        intermediate_size_per_partition = self._maybe_increase_intermediate_size_for_mxfp8(intermediate_size_per_partition)
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -802,16 +805,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 torch.ones(
                     num_experts,
                     hidden_size,
-                    get_tensor_model_parallel_world_size()
-                    * intermediate_size_per_partition
-                    // 32,
+                    intermediate_size_per_partition // 32,
                     dtype=torch.uint8,
                 ),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-
+            quant_method = FusedMoeWeightScaleSupported.MXFP8.value
         elif not (self.block_quant):
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
@@ -823,6 +824,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            quant_method = FusedMoeWeightScaleSupported.TENSOR.value
         else:
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
@@ -846,21 +848,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-
+            quant_method = FusedMoeWeightScaleSupported.BLOCK.value
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant or self.quant_config.is_mx
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        
+        assert quant_method is not None, "quant_method should be set"
+        extra_weight_attrs.update({"quant_method": quant_method})
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
         if self.quant_config.is_checkpoint_fp8_serialized:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-
+        if self.quant_config.is_mx:
+            set_weight_attrs(w13_weight, {"quant_method": quant_method})
+            set_weight_attrs(w2_weight, {"quant_method": quant_method})
         # INPUT_SCALES
         if self.quant_config.activation_scheme == "static":
             if not self.quant_config.is_checkpoint_fp8_serialized:
@@ -886,6 +888,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
         self.rocm_aiter_moe_enabled = False
+
+    def _maybe_increase_intermediate_size_for_mxfp8(self, intermediate_size_per_partition: int) -> int:
+        if self.quant_config.is_mx:
+            # For MXFP8, we need to pad the weight tensors to be deivisible by tp_size * 32
+            divisible_by = 32
+            if intermediate_size_per_partition % divisible_by != 0:
+                increase = divisible_by - intermediate_size_per_partition % divisible_by
+                logger.debug_once(
+                    f"Padding intermediate_size_per_partition from "
+                    f"{intermediate_size_per_partition} to "
+                    f"{intermediate_size_per_partition + increase} for MXFP8."
+                )
+                intermediate_size_per_partition += increase
+        return intermediate_size_per_partition
+
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Lazy import to avoid importing triton too early.
@@ -1078,13 +1095,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # -------------------------
                 # w2 processing
                 # -------------------------
-                w2_q, w2_scale_full = maybe_quantize(layer.w2_weight, layer.w2_weight_scale)
-
-                # Select expert block
-                blk = ceil(w2_q.shape[-1] / 32)
-                start = layer.ep_rank * blk
-                end = (layer.ep_rank + 1) * blk
-                w2_scale = w2_scale_full[..., start:end]
+                w2_q, w2_scale = maybe_quantize(layer.w2_weight, layer.w2_weight_scale)
 
                 dq_w2 = dequant_mxfp8_to_bf16(w2_q, w2_scale).contiguous()
                 layer.w2_weight = Parameter(dq_w2.data, requires_grad=False)

@@ -101,7 +101,7 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
-
+    MXFP8 = "mx_block"
 
 def determine_expert_map(
     ep_size: int,
@@ -927,6 +927,59 @@ class FusedMoE(CustomOp):
         )
         param.copy_(loaded_weight)
 
+    def _load_model_weight_or_scale_for_mxfp8(
+        self,
+        shard_dim: int,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        is_weight: bool,
+        load_full_w2: bool = False,
+    ):
+        """
+        Load model weights or weight scales for MxFP8 quantization.
+            :param shard_dim: dimension to shard
+            :param expert_data: parameter for a particular expert
+            :param shard_id: either w1, w2, or w3
+            :param loaded_weight: checkpoint weight to load into the param
+            :param tp_rank: tensor parallel rank
+        """
+    
+        # pad weights to be divisible by tp_size * 32
+        # pad scales to be divisible by tp_size
+        divisive_factor = (self.tp_size * 32) if (is_weight or shard_id == "w1") else self.tp_size
+
+        size = loaded_weight.shape[shard_dim]
+
+        pad_size = (divisive_factor - size % divisive_factor) % divisive_factor
+
+        if pad_size > 0:
+            logger.debug_once(
+                f"Padding {'weight' if is_weight else 'scale'} "
+                f"for shard_id {shard_id} on dim {shard_dim} "
+                f"from size {size} to size {size + pad_size}"
+            )
+            if shard_dim == 1:
+                # pad on last dim
+                pad_tuple = (0, pad_size,   # dim 1: right pad only
+                            0, 0)          # dim 0: no pad
+            else:  # shard_dim == 0
+                # pad on first dim
+                pad_tuple = (0, 0,          # dim 1: no pad
+                            0, pad_size)   # dim 0: right pad only
+            loaded_weight = F.pad(loaded_weight, pad_tuple)
+
+            
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+            tp_rank=tp_rank,
+            load_full_w2=load_full_w2,
+        )
+            
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -1324,8 +1377,20 @@ class FusedMoE(CustomOp):
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
                     load_full_w2=getattr(
-                        param, "load_full_w2", True
+                        param, "load_full_w2", False
                     ),  # TODO: this is hack only for nemotron, should be removed later
+                )
+            elif quant_method == FusedMoeWeightScaleSupported.MXFP8.value:
+                self._load_model_weight_or_scale_for_mxfp8(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    is_weight=False,
+                    load_full_w2=getattr(
+                        param, "load_full_w2", False
+                    ), 
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(
@@ -1351,13 +1416,24 @@ class FusedMoE(CustomOp):
 
         # Case model weights
         if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank,
-            )
+            quant_method = getattr(param, "quant_method", None)
+            if quant_method == FusedMoeWeightScaleSupported.MXFP8.value:
+                self._load_model_weight_or_scale_for_mxfp8(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    is_weight=True
+                )
+            else:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
             return True if return_success else None
 
         return False if return_success else None

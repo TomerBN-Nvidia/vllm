@@ -156,7 +156,7 @@ def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     scales_expanded = scales_bf16.reshape(*x.shape[:-1], -1).repeat_interleave(
         32, dim=-1
     )
-    return x.to(torch.bfloat16) * scales_expanded[..., : x.shape[-1]]
+    return x.to(torch.bfloat16) * scales_expanded
 
 
 def _matmul_launch_metadata(grid, kernel, args):
