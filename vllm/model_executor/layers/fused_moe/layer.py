@@ -591,7 +591,7 @@ class FusedMoE(CustomOp):
             if quant_method is None:
                 quant_method = UnquantizedFusedMoEMethod(self.moe_config)
                 logger.info_once(
-                    f"[Quant] ]No quantization method specified. Using UnquantizedFusedMoEMethod for prefix {prefix}")
+                    f"[Quant] No quantization method specified. Using UnquantizedFusedMoEMethod for prefix {prefix}")
             assert isinstance(quant_method, FusedMoEMethodBase)
             return quant_method
 
@@ -1380,7 +1380,7 @@ class FusedMoE(CustomOp):
                     tp_rank=self.tp_rank,
                     load_full_w2=getattr(
                         param, "load_full_w2", False
-                    ),  # TODO: this is hack only for nemotron, should be removed later
+                    ),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.MXFP8.value:
                 self._load_model_weight_or_scale_for_mxfp8(
