@@ -1291,6 +1291,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         expert_load_view: torch.Tensor | None = None,
         logical_to_physical_map: torch.Tensor | None = None,
         logical_replica_count: torch.Tensor | None = None,
+        moe_layer_num: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         
         # asserts for RL team:
@@ -1381,6 +1382,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             zero_expert_num=zero_expert_num,
             zero_expert_type=zero_expert_type,
             num_fused_shared_experts=layer.num_fused_shared_experts,
+            moe_layer_num=moe_layer_num
         )
 
         topk_weights, topk_ids, zero_expert_result = select_result

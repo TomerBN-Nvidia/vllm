@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
 )
@@ -1616,6 +1617,7 @@ class FusedMoE(CustomOp):
         zero_expert_num: int | None = None,
         zero_expert_type: str | None = None,
         num_fused_shared_experts: int = 0,
+        moe_layer_num: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1730,6 +1732,11 @@ class FusedMoE(CustomOp):
             )
         else:
             zero_expert_result = None
+        if moe_layer_num is not None:
+            get_global_experts_capturer().capture(
+                layer_id=moe_layer_num,
+                topk_ids=topk_ids,
+            )
         return topk_weights, topk_ids, zero_expert_result
 
     def must_reduce_shared_expert_outputs(self) -> bool:
@@ -1764,6 +1771,7 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        moe_layer_num: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         og_hidden_states = hidden_states.shape[-1]
         if self.hidden_size != og_hidden_states:
@@ -1811,7 +1819,8 @@ class FusedMoE(CustomOp):
                 )
             else:
                 shared_output, fused_output = torch.ops.vllm.moe_forward_shared(
-                    hidden_states, router_logits, self.layer_name
+                    hidden_states, router_logits, self.layer_name, 
+                    moe_layer_num
                 )
             return (
                 reduce_output(shared_output)[..., :og_hidden_states],
@@ -1822,14 +1831,16 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        moe_layer_num: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        return self.forward_native(hidden_states, router_logits, moe_layer_num)
 
     def forward_impl_chunked(
         self,
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
         has_separate_shared_experts: bool,
+        moe_layer_num: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
@@ -1969,6 +1980,7 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        moe_layer_num: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.quant_method is not None
 
@@ -2061,6 +2073,7 @@ class FusedMoE(CustomOp):
                 expert_load_view=self.expert_load_view,
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
+                moe_layer_num=moe_layer_num,
             )
 
             if has_separate_shared_experts:
@@ -2201,17 +2214,19 @@ def moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    moe_layer_num: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     assert self.shared_experts is not None
-    return self.forward_impl(hidden_states, router_logits)
+    return self.forward_impl(hidden_states, router_logits, moe_layer_num)
 
 
 def moe_forward_shared_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    moe_layer_num: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shared_out = torch.empty_like(hidden_states)
     fused_out = torch.empty_like(hidden_states)

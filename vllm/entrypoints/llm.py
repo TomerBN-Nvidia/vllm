@@ -221,6 +221,7 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
+        return_routed_experts: bool = False,
         **kwargs: Any,
     ) -> None:
         """LLM constructor."""
@@ -334,6 +335,7 @@ class LLM:
             structured_outputs_config=structured_outputs_instance,
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
+            return_routed_experts=return_routed_experts,
             **kwargs,
         )
 
