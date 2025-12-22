@@ -61,6 +61,7 @@ class SharedFusedMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        moe_layer_num: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_overlapped:
             if self._shared_experts is not None:
@@ -80,11 +81,13 @@ class SharedFusedMoE(FusedMoE):
             fused_out = super().forward(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                moe_layer_num=moe_layer_num,
             )
         else:
             shared_out, fused_out = super().forward(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                moe_layer_num=moe_layer_num,
             )
             # ensure early TP reduction of shared expert outputs when required
             if (

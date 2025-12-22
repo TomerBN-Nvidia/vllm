@@ -25,6 +25,12 @@ from vllm.attention.backends.abstract import (
     AttentionMetadata,
     MultipleOf,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    init_routed_experts_capturer_with_shared_cache,
+)
+
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -609,6 +615,38 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+
+    def init_routed_experts_capturer(self):
+        max_running_requests = (
+            self.max_num_tokens // 2
+            if self.max_num_reqs is None
+            else self.max_num_reqs
+            // self.vllm_config.parallel_config.data_parallel_size
+        )
+
+        if hasattr(self.model.config, "n_shared_experts"):
+            num_fused_shared_experts = 1
+        else:
+            num_fused_shared_experts = 0
+
+        # Get rank and world_size for distributed setup
+        tp_group = get_tp_group()
+        rank = tp_group.rank_in_group if tp_group else 0
+        world_size = tp_group.world_size if tp_group else 1
+
+        # Initialize with shared host cache across devices
+        init_routed_experts_capturer_with_shared_cache(
+            enable=self.vllm_config.cache_config.return_routed_experts,
+            model_config=self.model_config,
+            num_fused_shared_experts=num_fused_shared_experts,
+            num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_running_requests=max_running_requests,
+            max_model_len=self.scheduler_config.max_model_len,
+            device=self.device,
+            rank=rank,
+            world_size=world_size,
+        )
+        
     def _init_model_kwargs(self, num_tokens: int):
         model_kwargs = dict[str, Any]()
 
@@ -2275,6 +2313,7 @@ class GPUModelRunner(
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
+            routed_experts=None,
         )
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
@@ -2568,6 +2607,11 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
+        get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+            positions=self.positions.cpu[:num_scheduled_tokens],
+            num_scheduled_tokes=scheduler_output.num_scheduled_tokens
+        )
+        
         return (
             num_nans_in_logits,
             logprobs_lists,
@@ -3803,7 +3847,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices,
                 for_cudagraph_capture=True,
             )
-
+        self.init_routed_experts_capturer()
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,

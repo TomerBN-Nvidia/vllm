@@ -104,11 +104,11 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: torch.Tensor | None = None,
         logical_to_physical_map: torch.Tensor | None = None,
         logical_replica_count: torch.Tensor | None = None,
+        moe_layer_num: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Is getattr needed?
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
-
         if enable_eplb:
             if self.supports_eplb:
                 assert expert_load_view is not None
@@ -141,6 +141,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             global_num_experts=global_num_experts,
             zero_expert_num=zero_expert_num,
             zero_expert_type=zero_expert_type,
+            moe_layer_num=moe_layer_num,
         )
 
         result = self.fused_experts(
