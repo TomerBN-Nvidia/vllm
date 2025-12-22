@@ -21,6 +21,11 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -801,6 +806,31 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
             with_numpy=numpy,
         )
+
+
+    def init_routed_experts_capturer(self):
+        max_running_requests = (
+            self.max_num_tokens // 2
+            if self.max_num_reqs is None
+            else self.max_num_reqs
+            // self.vllm_config.parallel_config.data_parallel_size
+        )
+
+        if hasattr(self.model.config, "n_shared_experts"):
+            num_fused_shared_experts = 1
+        else:
+            num_fused_shared_experts = 0
+
+        capturer = RoutedExpertsCapturer.create(
+            enable=self.vllm_config.cache_config.return_routed_experts,
+            model_config=self.model_config,
+            num_fused_shared_experts=num_fused_shared_experts,
+            num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_running_requests=max_running_requests,
+            max_model_len=self.scheduler_config.max_model_len,
+            device=self.device,
+        )
+        set_global_experts_capturer(capturer)
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -2995,6 +3025,11 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
+        get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+            positions=self.positions.cpu[:num_scheduled_tokens],
+            num_scheduled_tokes=scheduler_output.num_scheduled_tokens
+        )
+        
         return (
             num_nans_in_logits,
             logprobs_lists,
@@ -4793,7 +4828,7 @@ class GPUModelRunner(
                 for_cudagraph_capture=is_graph_capturing,
                 slot_mappings=slot_mappings_by_group,
             )
-
+        self.init_routed_experts_capturer()
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,

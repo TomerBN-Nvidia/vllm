@@ -41,7 +41,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer, _RoutedExpertsCapturerNoop
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
 )
