@@ -67,14 +67,14 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 def log_quant_method_call(fn):
     @functools.wraps(fn)
     def wrapper(self, layer, prefix):
-        logger.info(
+        logger.debug_once(
             "[Quant] prefix=%s layer=%s (%s)",
             prefix,
             layer.__class__.__name__,
             type(self).__name__,
         )
         result = fn(self, layer, prefix)
-        logger.info(
+        logger.debug_once(
             "[Quant] result=%s for prefix=%s",
             None if result is None else type(result).__name__,
             prefix,

@@ -1103,8 +1103,10 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            
             if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
+                # Note: routed_experts is populated later via RPC for finished requests
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,

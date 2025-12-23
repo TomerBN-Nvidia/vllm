@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.outputs import (
@@ -204,6 +205,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        routed_experts: np.ndarray | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -253,7 +255,7 @@ class RequestState:
                 return None
 
         return self._new_request_output(
-            request_id, outputs, finished, kv_transfer_params
+            request_id, outputs, finished, kv_transfer_params, routed_experts
         )
 
     def _new_request_output(
@@ -262,6 +264,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        routed_experts: np.ndarray | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
@@ -297,6 +300,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            routed_experts=routed_experts,
         )
 
     def _new_completion_output(
@@ -501,12 +505,14 @@ class OutputProcessor:
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
+            routed_experts = engine_core_output.routed_experts
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                routed_experts,
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

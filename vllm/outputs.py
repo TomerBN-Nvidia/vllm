@@ -6,6 +6,7 @@ from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass
 from typing import Any, Generic
 
+import numpy as np
 import torch
 from typing_extensions import TypeVar
 
@@ -15,7 +16,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalPlaceholderDict
 from vllm.sequence import RequestMetrics
 from vllm.v1.metrics.stats import RequestStateStats
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer
+
 logger = init_logger(__name__)
 
 
@@ -121,7 +122,7 @@ class RequestOutput:
         *,
         multi_modal_placeholders: MultiModalPlaceholderDict | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
-        routed_experts: torch.Tensor | None = None,
+        routed_experts: np.ndarray | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -143,19 +144,18 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
-        seqlen = len(prompt_token_ids) + sum([len(output.token_ids) for output in outputs])
-        self.routed_experts = get_global_experts_capturer().get_routed_experts(request_id, seqlen=seqlen)
+        # routed_experts is passed through the output pipeline from workers
+        self.routed_experts = routed_experts
         
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        # routed_experts is only set for finished requests, so we just take
+        # the latest non-None value (they should be the same for the same request)
         if next_output.routed_experts is not None:
-            if self.routed_experts is None:
-                self.routed_experts = next_output.routed_experts
-            else:
-                self.routed_experts = torch.cat([self.routed_experts, next_output.routed_experts], dim=0)
+            self.routed_experts = next_output.routed_experts
                 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
