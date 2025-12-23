@@ -924,6 +924,15 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        # Free the routed experts capturer slots for finished/aborted requests.
+        # This ensures slots are freed even if we didn't extract routed_experts
+        # (e.g., for aborted requests).
+        capturer = get_global_experts_capturer()
+        host_cache = capturer.get_host_cache()
+        if host_cache is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                host_cache.free_slot(req_id)
+
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
@@ -2593,6 +2602,41 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    def get_routed_experts_for_requests(
+        self,
+        finished_req_ids: list[str],
+    ) -> dict[str, np.ndarray]:
+        """Get routed experts for finished requests.
+        
+        This is called by the scheduler after it determines which requests
+        have finished. Only then do we extract and convert the routing data
+        to numpy arrays for memory-efficient serialization.
+        
+        Args:
+            finished_req_ids: List of request IDs that have finished.
+            
+        Returns:
+            Dictionary mapping request ID to routed experts numpy int16 array.
+            Shape: np.ndarray[int16] = (seqlen, num_hidden_layers, num_experts_per_tok)
+        """
+        capturer = get_global_experts_capturer()
+        host_cache = capturer.get_host_cache()
+        
+        if host_cache is None:
+            return {}
+        
+        result = {}
+        for req_id in finished_req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                seqlen = len(req_state.prompt_token_ids) + len(req_state.output_token_ids) - 1
+                experts = capturer.get_routed_experts(req_id, seqlen=seqlen, free_slot=True)
+                if experts is not None:
+                    # Convert to numpy int16 array for memory-efficient serialization
+                    result[req_id] = experts.numpy()
+        
+        return result
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -3025,6 +3069,9 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
+        # Sync routed experts from device to host cache.
+        # The actual extraction is done lazily via get_routed_experts_for_requests()
+        # when the scheduler determines which requests have finished.
         get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
             positions=self.positions.cpu[:num_scheduled_tokens],
             num_scheduled_tokes=scheduler_output.num_scheduled_tokens
@@ -4828,7 +4875,7 @@ class GPUModelRunner(
                 for_cudagraph_capture=is_graph_capturing,
                 slot_mappings=slot_mappings_by_group,
             )
-        self.init_routed_experts_capturer()
+        # self.init_routed_experts_capturer()
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -5320,7 +5367,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode.name,
                 ),
             )
-
+        self.init_routed_experts_capturer()
         # We skip EPLB here since we don't want to record dummy metrics
         for batch_desc in batch_descriptors:
             num_tokens = batch_desc.num_tokens

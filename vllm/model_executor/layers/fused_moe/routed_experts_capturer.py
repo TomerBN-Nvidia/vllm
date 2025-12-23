@@ -22,6 +22,9 @@ def get_tensor_size_bytes(t: torch.Tensor):
 class _RoutedExpertsDeviceCache:
     """Per-device (GPU) cache for capturing routed expert IDs during forward pass."""
     
+    # Use int16 to save memory - sufficient for up to 32767 experts
+    DTYPE = torch.int16
+    
     def __init__(
         self,
         num_batched_tokens: int,
@@ -36,7 +39,7 @@ class _RoutedExpertsDeviceCache:
                 num_hidden_layers,
                 num_experts_per_tok,
             ),
-            dtype=torch.int32,
+            dtype=self.DTYPE,
             device=device,
         )
         self._finalize_allocation_log()
@@ -48,7 +51,8 @@ class _RoutedExpertsDeviceCache:
     def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
         assert layer_id is not None, "capturing routing experts but get layer_id None"
         batch, _ = topk_ids.shape
-        self.buffer[:batch, layer_id, :].copy_(topk_ids, non_blocking=True)
+        # Cast to int16 to match buffer dtype (saves memory, sufficient for <32K experts)
+        self.buffer[:batch, layer_id, :].copy_(topk_ids.to(self.DTYPE), non_blocking=True)
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
@@ -63,7 +67,14 @@ class _RoutedExpertsHostCache:
     
     This cache is designed to be shared across multiple GPU workers/processes
     using torch shared memory.
+    
+    The buffer is indexed by slot (not req_id directly) since req_ids can be
+    arbitrary strings (UUIDs, etc.) and the buffer size must be preallocated
+    for CUDA graph compatibility.
     """
+    
+    # Use int16 to save memory - sufficient for up to 32767 experts
+    DTYPE = torch.int16
     
     def __init__(
         self,
@@ -74,6 +85,7 @@ class _RoutedExpertsHostCache:
         use_shared_memory: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
+        self.max_running_requests = max_running_requests
         self._use_shared_memory = use_shared_memory
         
         self.buffer = torch.zeros(
@@ -83,10 +95,15 @@ class _RoutedExpertsHostCache:
                 num_hidden_layers,
                 num_experts_per_tok,
             ),
-            dtype=torch.int32,
+            dtype=self.DTYPE,
             device="cpu",
             pin_memory=not use_shared_memory,  # Can't pin shared memory
         )
+        
+        # Slot management: map req_id (string) to buffer slot index
+        # This is needed because req_ids can be arbitrary strings (UUIDs, etc.)
+        self._req_id_to_slot: dict[str, int] = {}
+        self._free_slots: set[int] = set(range(max_running_requests))
         
         # Note: share_memory_() is disabled as it can cause crashes
         # if use_shared_memory:
@@ -97,6 +114,34 @@ class _RoutedExpertsHostCache:
     def get_buffer_size_bytes(self):
         assert hasattr(self, "buffer")
         return get_tensor_size_bytes(self.buffer)
+
+    def allocate_slot(self, req_id: str) -> int:
+        """Allocate a buffer slot for a request.
+        
+        Returns existing slot if already allocated, otherwise allocates a new one.
+        """
+        if req_id in self._req_id_to_slot:
+            return self._req_id_to_slot[req_id]
+        
+        if not self._free_slots:
+            raise RuntimeError(
+                f"No free slots available for routed experts cache. "
+                f"max_running_requests={self.max_running_requests}"
+            )
+        
+        slot = self._free_slots.pop()
+        self._req_id_to_slot[req_id] = slot
+        return slot
+
+    def get_slot(self, req_id: str) -> int | None:
+        """Get the buffer slot for a request, or None if not allocated."""
+        return self._req_id_to_slot.get(req_id)
+
+    def free_slot(self, req_id: str) -> None:
+        """Free the buffer slot for a request."""
+        if req_id in self._req_id_to_slot:
+            slot = self._req_id_to_slot.pop(req_id)
+            self._free_slots.add(slot)
 
     def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
         self.buffer[layer_id, loc, :] = top_k.to(device="cpu", non_blocking=True)
@@ -157,8 +202,9 @@ class RoutedExpertsCapturer(ABC):
     
     def get_routed_experts(
         self,
-        token_indices: torch.Tensor,
+        req_id: str,
         seqlen: Optional[int] = None,
+        free_slot: bool = True,
     ):
         raise NotImplementedError
 
@@ -248,20 +294,44 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             
         acc_size = 0
         for req_id, num_scheduled_tokens in num_scheduled_tokes.items():
+            # Allocate a slot for this request (or get existing slot)
+            slot = self.host_cache.allocate_slot(req_id)
             pos_ids = positions[acc_size:acc_size + num_scheduled_tokens]
-            self.host_cache.buffer[int(req_id), pos_ids] = self.device_cache.buffer[acc_size:acc_size + num_scheduled_tokens].cpu()
+            self.host_cache.buffer[slot, pos_ids] = self.device_cache.buffer[acc_size:acc_size + num_scheduled_tokens].cpu()
             acc_size += num_scheduled_tokens
 
     def get_routed_experts(
        self,
-       req_id: int | str,
+       req_id: str,
        seqlen: int | None = None,
-    ):  
+       free_slot: bool = True,
+    ):
+        """Get the routed experts for a request.
+        
+        Args:
+            req_id: The request ID (string).
+            seqlen: The sequence length to retrieve (optional).
+            free_slot: If True, free the slot after retrieval. Set to False if
+                you need to call this multiple times for the same request.
+        
+        Returns:
+            A tensor of shape (seqlen, num_hidden_layers, num_experts_per_tok),
+            or None if no data is available.
+        """
         if self.host_cache is None:
             return None
-        if isinstance(req_id, str):
-            req_id = int(req_id)
-        return self.host_cache.buffer[req_id, :seqlen]
+        
+        slot = self.host_cache.get_slot(req_id)
+        if slot is None:
+            return None
+        
+        # Clone the data since we may free the slot
+        result = self.host_cache.buffer[slot, :seqlen].clone()
+        
+        if free_slot:
+            self.host_cache.free_slot(req_id)
+        
+        return result
 
     def get_host_cache(self):
         return self.host_cache
@@ -279,10 +349,11 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
 
     def get_routed_experts(
         self,
-        token_indices: torch.Tensor,
+        req_id: str,
         seqlen: Optional[int] = None,
+        free_slot: bool = True,
     ):
-        pass
+        return None
 
     def sync_fwd_experts_buffer_DtoH(
         self,
@@ -292,7 +363,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def get_host_cache(self):
-        pass
+        return None
 
     def get_device_cache(self):
         pass
@@ -366,10 +437,11 @@ def init_routed_experts_capturer_with_shared_cache(
 ) -> RoutedExpertsCapturer:
     """Initialize routed experts capturer with proper cache handling.
     
-    For multi-GPU setups:
-    - Only rank 0 creates the host cache (since all ranks see the same routing
-      decisions and only rank 0 needs to return them in outputs)
-    - Non-rank-0 workers only have device caches and skip host cache operations
+    For multi-GPU setups (TP > 1):
+    - Only rank 0 creates both device and host caches
+    - Non-rank-0 workers use Noop capturer (no memory allocation)
+    - This works because all ranks see the same routing decisions,
+      so only rank 0 needs to capture and return the data
     
     Args:
         enable: Whether to enable capturing.
@@ -386,13 +458,20 @@ def init_routed_experts_capturer_with_shared_cache(
         A RoutedExpertsCapturer instance.
     """
     if not enable:
-        return _RoutedExpertsCapturerNoop()
+        capturer = _RoutedExpertsCapturerNoop()
+        set_global_experts_capturer(capturer)
+        return capturer
     
-    # For multi-GPU: only rank 0 needs host cache
-    # Non-rank-0 workers skip host cache entirely (they only capture to device cache)
-    skip_host_cache = (world_size > 1 and rank != 0)
+    # For multi-GPU (TP > 1): only rank 0 needs to capture
+    # Non-rank-0 workers use Noop capturer to save GPU memory
+    # All ranks see the same routing decisions, so only rank 0 needs the data
+    if world_size > 1 and rank != 0:
+        logger.info(f"Skipping routed experts capturer for rank {rank} (non-rank-0)")
+        capturer = _RoutedExpertsCapturerNoop()
+        set_global_experts_capturer(capturer)
+        return capturer
     
-    # Create the capturer
+    # Create the real capturer (rank 0 or single-GPU)
     capturer = RoutedExpertsCapturer.create(
         enable=True,
         model_config=model_config,
@@ -401,7 +480,7 @@ def init_routed_experts_capturer_with_shared_cache(
         max_running_requests=max_running_requests,
         max_model_len=max_model_len,
         device=device,
-        skip_host_cache=skip_host_cache,
+        skip_host_cache=False,  # Rank 0 always needs host cache
     )
     
     set_global_experts_capturer(capturer)

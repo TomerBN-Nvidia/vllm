@@ -327,7 +327,7 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params
+            external_req_id, outputs, finished, kv_transfer_params, routed_experts
         )
 
     def _new_request_output(
@@ -336,6 +336,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        routed_experts: np.ndarray | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
@@ -372,6 +373,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            routed_experts=routed_experts,
         )
 
     def _new_completion_output(
@@ -646,6 +648,7 @@ class OutputProcessor:
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
+            routed_experts = engine_core_output.routed_experts
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,

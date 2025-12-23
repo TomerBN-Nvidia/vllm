@@ -1393,6 +1393,7 @@ class Scheduler(SchedulerInterface):
                 or stopped
             ):
                 # Add EngineCoreOutput for this Request.
+                # Note: routed_experts is populated later via RPC for finished requests
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,

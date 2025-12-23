@@ -156,6 +156,11 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # Routed experts for finished requests (only set when finished).
+    # Shape: np.ndarray[int16] = (seqlen, num_hidden_layers, num_experts_per_tok)
+    # Using numpy int16 array for memory efficiency (sufficient for <32K experts).
+    routed_experts: np.ndarray | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None
