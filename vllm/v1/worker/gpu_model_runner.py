@@ -924,14 +924,14 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
-        # Free the routed experts capturer slots for finished/aborted requests.
-        # This ensures slots are freed even if we didn't extract routed_experts
+        # Free the routed experts capturer buffers for finished/aborted requests.
+        # This ensures buffers are freed even if we didn't extract routed_experts
         # (e.g., for aborted requests).
         capturer = get_global_experts_capturer()
         host_cache = capturer.get_host_cache()
         if host_cache is not None:
             for req_id in scheduler_output.finished_req_ids:
-                host_cache.free_slot(req_id)
+                host_cache.free_request(req_id)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -2610,14 +2610,18 @@ class GPUModelRunner(
         
         This is called by the scheduler after it determines which requests
         have finished. Only then do we extract and convert the routing data
-        to numpy arrays for memory-efficient serialization.
+        to numpy arrays for serialization.
+        
+        Note: The seqlen is retrieved from the host_cache's internal tracking
+        (via update_seqlen during D2H sync) because the request state may have
+        already been removed from self.requests by the time this is called.
         
         Args:
             finished_req_ids: List of request IDs that have finished.
             
         Returns:
-            Dictionary mapping request ID to routed experts numpy int16 array.
-            Shape: np.ndarray[int16] = (seqlen, num_hidden_layers, num_experts_per_tok)
+            Dictionary mapping request ID to routed experts numpy array.
+            Shape: np.ndarray = (seqlen, num_hidden_layers, num_experts_per_tok)
         """
         capturer = get_global_experts_capturer()
         host_cache = capturer.get_host_cache()
@@ -2627,13 +2631,19 @@ class GPUModelRunner(
         
         result = {}
         for req_id in finished_req_ids:
-            req_state = self.requests.get(req_id)
-            if req_state is not None:
-                seqlen = len(req_state.prompt_token_ids) + len(req_state.output_token_ids) - 1
-                experts = capturer.get_routed_experts(req_id, seqlen=seqlen, free_slot=True)
+            # Get seqlen from host_cache tracking (more reliable than req_state
+            # since req_state may already be removed by _update_states)
+            seqlen = host_cache.get_buffer(req_id).shape[0]
+            if seqlen is not None and seqlen > 0:
+                experts = capturer.get_routed_experts(
+                    req_id, seqlen=seqlen, free_slot=True
+                )
                 if experts is not None:
-                    # Convert to numpy int16 array for memory-efficient serialization
                     result[req_id] = experts.numpy()
+            else:
+                # No seqlen tracked or buffer not found - still need to free the buffer
+                # to prevent memory leak
+                host_cache.free_request(req_id)
         
         return result
 

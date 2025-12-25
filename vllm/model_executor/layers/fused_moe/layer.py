@@ -604,6 +604,8 @@ class FusedMoE(CustomOp):
                 quant_method = self.quant_config.get_quant_method(self, prefix)
             if quant_method is None:
                 quant_method = UnquantizedFusedMoEMethod(self.moe_config)
+                logger.debug_once(
+                    f"[Quant] No quantization method specified. Using UnquantizedFusedMoEMethod for prefix {prefix}")
             assert isinstance(quant_method, FusedMoEMethodBase)
             return quant_method
 
@@ -2078,16 +2080,18 @@ def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    moe_layer_num: int,
 ) -> torch.Tensor:
     self = get_layer_from_name(layer_name)
     assert self.shared_experts is None
-    return self.forward_impl(hidden_states, router_logits)
+    return self.forward_impl(hidden_states, router_logits, moe_layer_num)
 
 
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    moe_layer_num: int,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
