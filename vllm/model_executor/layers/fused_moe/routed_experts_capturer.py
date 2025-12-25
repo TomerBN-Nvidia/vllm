@@ -63,14 +63,11 @@ class _RoutedExpertsDeviceCache:
 
 
 class _RoutedExpertsHostCache:
-    """Shared host (CPU) cache for storing routed expert IDs across all requests.
+    """Host (CPU) cache for storing routed expert IDs across all requests.
     
-    This cache is designed to be shared across multiple GPU workers/processes
-    using torch shared memory.
-    
-    The buffer is indexed by slot (not req_id directly) since req_ids can be
-    arbitrary strings (UUIDs, etc.) and the buffer size must be preallocated
-    for CUDA graph compatibility.
+    Uses lazy per-request allocation instead of pre-allocating a massive buffer.
+    Each request gets its own buffer sized to its actual sequence length,
+    which dramatically reduces memory usage for large models with many MoE layers.
     """
     
     # Use int16 to save memory - sufficient for up to 32767 experts
@@ -86,73 +83,90 @@ class _RoutedExpertsHostCache:
     ) -> None:
         self.max_model_len = max_model_len
         self.max_running_requests = max_running_requests
+        self.num_hidden_layers = num_hidden_layers
+        self.num_experts_per_tok = num_experts_per_tok
         self._use_shared_memory = use_shared_memory
         
-        self.buffer = torch.zeros(
-            (
-                max_running_requests,
-                max_model_len,
-                num_hidden_layers,
-                num_experts_per_tok,
-            ),
-            dtype=self.DTYPE,
-            device="cpu",
-            pin_memory=not use_shared_memory,  # Can't pin shared memory
-        )
+        # Lazy per-request allocation instead of massive pre-allocated buffer
+        # Key: req_id, Value: tensor of shape (current_seqlen, num_hidden_layers, num_experts_per_tok)
+        self._req_buffers: dict[str, torch.Tensor] = {}
         
-        # Slot management: map req_id (string) to buffer slot index
-        # This is needed because req_ids can be arbitrary strings (UUIDs, etc.)
-        self._req_id_to_slot: dict[str, int] = {}
-        self._free_slots: set[int] = set(range(max_running_requests))
-        
-        # Note: share_memory_() is disabled as it can cause crashes
-        # if use_shared_memory:
-        #     self.buffer.share_memory_()
+        # Track current memory usage for logging
+        self._total_allocated_bytes = 0
             
         self._finalize_allocation_log()
 
-    def get_buffer_size_bytes(self):
-        assert hasattr(self, "buffer")
-        return get_tensor_size_bytes(self.buffer)
-
-    def allocate_slot(self, req_id: str) -> int:
-        """Allocate a buffer slot for a request.
+    def get_buffer_size_bytes(self) -> int:
+        """Return total bytes currently allocated across all request buffers."""
+        return self._total_allocated_bytes
+    
+    def get_or_grow_buffer(self, req_id: str, max_pos: int) -> torch.Tensor:
+        """Get or create/grow buffer for request to accommodate max_pos.
         
-        Returns existing slot if already allocated, otherwise allocates a new one.
+        Args:
+            req_id: The request ID.
+            max_pos: The maximum position index that needs to be stored.
+            
+        Returns:
+            The buffer tensor for this request.
         """
-        if req_id in self._req_id_to_slot:
-            return self._req_id_to_slot[req_id]
+        required_len = max_pos + 1
         
-        if not self._free_slots:
-            raise RuntimeError(
-                f"No free slots available for routed experts cache. "
-                f"max_running_requests={self.max_running_requests}"
+        if req_id not in self._req_buffers:
+            # New request - allocate buffer
+            buf = torch.zeros(
+                (required_len, self.num_hidden_layers, self.num_experts_per_tok),
+                dtype=self.DTYPE,
+                device="cpu",
+                pin_memory=not self._use_shared_memory,
             )
+            self._req_buffers[req_id] = buf
+            self._total_allocated_bytes += buf.numel() * buf.element_size()
+            return buf
         
-        slot = self._free_slots.pop()
-        self._req_id_to_slot[req_id] = slot
-        return slot
+        buf = self._req_buffers[req_id]
+        if buf.shape[0] >= required_len:
+            # Existing buffer is large enough
+            return buf
+        
+        # Need to grow buffer (happens during generation)
+        # Grow by 2x or to required_len, whichever is larger, to reduce reallocations
+        new_len = max(required_len, buf.shape[0] * 2)
+        new_len = min(new_len, self.max_model_len)  # Cap at max_model_len
+        
+        new_buf = torch.zeros(
+            (new_len, self.num_hidden_layers, self.num_experts_per_tok),
+            dtype=self.DTYPE,
+            device="cpu",
+            pin_memory=not self._use_shared_memory,
+        )
+        # Copy existing data
+        new_buf[:buf.shape[0]] = buf
+        
+        # Update tracking
+        self._total_allocated_bytes -= buf.numel() * buf.element_size()
+        self._total_allocated_bytes += new_buf.numel() * new_buf.element_size()
+        
+        self._req_buffers[req_id] = new_buf
+        return new_buf
 
-    def get_slot(self, req_id: str) -> int | None:
-        """Get the buffer slot for a request, or None if not allocated."""
-        return self._req_id_to_slot.get(req_id)
+    def get_buffer(self, req_id: str) -> torch.Tensor | None:
+        """Get the buffer for a request, or None if not allocated."""
+        return self._req_buffers.get(req_id)
 
-    def free_slot(self, req_id: str) -> None:
-        """Free the buffer slot for a request."""
-        if req_id in self._req_id_to_slot:
-            slot = self._req_id_to_slot.pop(req_id)
-            self._free_slots.add(slot)
-
-    def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
-        self.buffer[layer_id, loc, :] = top_k.to(device="cpu", non_blocking=True)
+    def free_request(self, req_id: str) -> None:
+        """Free the buffer for a request."""
+        if req_id in self._req_buffers:
+            buf = self._req_buffers.pop(req_id)
+            self._total_allocated_bytes -= buf.numel() * buf.element_size()
 
     def _finalize_allocation_log(self):
-        """Common logging and memory usage computation for captured experts buffers."""
-        buffer_size_GB = self.get_buffer_size_bytes() / _GB
-        shared_str = " (shared memory)" if self._use_shared_memory else ""
+        """Log initialization (no pre-allocation with lazy approach)."""
         logger.info(
-            f"Routing experts host buffer allocated{shared_str}. "
-            f"#tokens: {self.max_model_len}, size: {buffer_size_GB:.2f} GB"
+            f"Routing experts host cache initialized (lazy allocation). "
+            f"max_model_len: {self.max_model_len}, "
+            f"num_hidden_layers: {self.num_hidden_layers}, "
+            f"num_experts_per_tok: {self.num_experts_per_tok}"
         )
 
 
@@ -294,10 +308,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             
         acc_size = 0
         for req_id, num_scheduled_tokens in num_scheduled_tokes.items():
-            # Allocate a slot for this request (or get existing slot)
-            slot = self.host_cache.allocate_slot(req_id)
             pos_ids = positions[acc_size:acc_size + num_scheduled_tokens]
-            self.host_cache.buffer[slot, pos_ids] = self.device_cache.buffer[acc_size:acc_size + num_scheduled_tokens].cpu()
+            
+            # Find max position to determine required buffer size
+            if len(pos_ids) > 0:
+                max_pos = int(pos_ids.max().item())
+            else:
+                acc_size += num_scheduled_tokens
+                continue
+            
+            # Get or grow the lazily-allocated buffer for this request
+            buf = self.host_cache.get_or_grow_buffer(req_id, max_pos)
+            
+            # Copy device data to host buffer at the appropriate positions
+            buf[pos_ids] = self.device_cache.buffer[acc_size:acc_size + num_scheduled_tokens].cpu()
             acc_size += num_scheduled_tokens
 
     def get_routed_experts(
@@ -311,7 +335,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         Args:
             req_id: The request ID (string).
             seqlen: The sequence length to retrieve (optional).
-            free_slot: If True, free the slot after retrieval. Set to False if
+            free_slot: If True, free the buffer after retrieval. Set to False if
                 you need to call this multiple times for the same request.
         
         Returns:
@@ -321,15 +345,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if self.host_cache is None:
             return None
         
-        slot = self.host_cache.get_slot(req_id)
-        if slot is None:
+        buf = self.host_cache.get_buffer(req_id)
+        if buf is None:
             return None
         
-        # Clone the data since we may free the slot
-        result = self.host_cache.buffer[slot, :seqlen].clone()
+        # Slice to requested seqlen
+        if seqlen is not None:
+            result = buf[:seqlen]
+        else:
+            result = buf
         
         if free_slot:
-            self.host_cache.free_slot(req_id)
+            # Clone before freeing since we're about to delete the backing buffer
+            result = result.clone()
+            self.host_cache.free_request(req_id)
         
         return result
 
