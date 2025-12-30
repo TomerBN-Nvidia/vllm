@@ -306,23 +306,27 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if self.host_cache is None:
             return
             
-        acc_size = 0
-        for req_id, num_scheduled_tokens in num_scheduled_tokes.items():
-            pos_ids = positions[acc_size:acc_size + num_scheduled_tokens]
-            
-            # Find max position to determine required buffer size
-            if len(pos_ids) > 0:
-                max_pos = int(pos_ids.max().item())
-            else:
-                acc_size += num_scheduled_tokens
+        # Single D2H copy
+        total_tokens = sum(num_scheduled_tokes.values())
+        host_values = self.device_cache.buffer[:total_tokens].cpu()
+
+        # Split once
+        sizes = list(num_scheduled_tokes.values())
+        host_values_split = torch.split(host_values, sizes)
+        positions_split = torch.split(positions, sizes)
+
+        for (req_id, _), vals, pos_ids in zip(
+            num_scheduled_tokes.items(),
+            host_values_split,
+            positions_split,
+        ):
+            if pos_ids.numel() == 0:
                 continue
-            
-            # Get or grow the lazily-allocated buffer for this request
+
+            max_pos = int(pos_ids.max())   # CPU, no sync
+
             buf = self.host_cache.get_or_grow_buffer(req_id, max_pos)
-            
-            # Copy device data to host buffer at the appropriate positions
-            buf[pos_ids] = self.device_cache.buffer[acc_size:acc_size + num_scheduled_tokens].cpu()
-            acc_size += num_scheduled_tokens
+            buf[pos_ids] = vals
 
     def get_routed_experts(
        self,
