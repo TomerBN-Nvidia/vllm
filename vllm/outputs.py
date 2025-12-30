@@ -145,7 +145,11 @@ class RequestOutput:
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
         # routed_experts is passed through the output pipeline from workers
-        self.routed_experts = routed_experts
+        if routed_experts is not None:
+            logger.debug(f"routed_experts is set, length: {len(routed_experts)}")
+            self.routed_experts = routed_experts[: len(prompt_token_ids) + sum(len(output.token_ids) for output in outputs)]
+        else:
+            self.routed_experts = None
         
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""

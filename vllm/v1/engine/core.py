@@ -489,6 +489,10 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # Fetch routed experts for finished requests if enabled.
+        if self.vllm_config.cache_config.return_routed_experts:
+            self._populate_routed_experts(engine_core_outputs)
+
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
