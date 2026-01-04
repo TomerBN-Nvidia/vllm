@@ -827,7 +827,7 @@ class GPUModelRunner(
             num_fused_shared_experts=num_fused_shared_experts,
             num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_running_requests=max_running_requests,
-            max_model_len=self.scheduler_config.max_model_len,
+            max_model_len=self.max_model_len,
             device=self.device,
         )
         set_global_experts_capturer(capturer)
