@@ -15,6 +15,26 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     mxfp8_e4m3_quantize_python,
 )
 
+# Global compiled function - will be initialized in main() based on args
+mxfp8_e4m3_quantize_compiled = None
+
+
+def get_compiled_quantize(compile_mode: str = "reduce-overhead"):
+    """
+    Get a torch.compiled version of the Python implementation.
+    
+    Args:
+        compile_mode: One of "default", "reduce-overhead", "max-autotune"
+            - "default": Good balance of compile time and runtime
+            - "reduce-overhead": Best for latency, uses CUDA graphs
+            - "max-autotune": Best performance but longer compile time
+    """
+    return torch.compile(
+        mxfp8_e4m3_quantize_python,
+        mode=compile_mode,
+        fullgraph=True,
+    )
+
 
 def benchmark_quantize(
     func,
@@ -107,15 +127,18 @@ def run_benchmark(
     device = torch.cuda.current_device()
     gpu_name = torch.cuda.get_device_name(device)
     
-    print(f"\n{'='*80}")
+    print(f"\n{'='*100}")
     print(f"MXFP8 Quantization Benchmark (GPU)")
-    print(f"{'='*80}")
+    print(f"{'='*100}")
     print(f"Device: {gpu_name} (cuda:{device})")
     print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
     print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
-    print(f"{'='*80}\n")
+    print(f"{'='*100}\n")
     
-    header = f"{'Shape':>20} | {'Flashinfer (ms)':>18} | {'Python (ms)':>18} | {'Speedup':>10}"
+    header = (
+        f"{'Shape':>16} | {'Flashinfer (ms)':>16} | {'Python (ms)':>16} | "
+        f"{'Compiled (ms)':>16} | {'FI Speedup':>10} | {'Compile Speedup':>15}"
+    )
     print(header)
     print("-" * len(header))
     
@@ -151,7 +174,7 @@ def run_benchmark(
             print(f"Flashinfer failed for shape ({M}, {N_padded}): {e}")
             fi_mean, fi_std = float('nan'), float('nan')
         
-        # Benchmark python implementation
+        # Benchmark python implementation (eager)
         try:
             py_mean, py_std = benchmark_quantize(
                 mxfp8_e4m3_quantize_python,
@@ -164,18 +187,43 @@ def run_benchmark(
             print(f"Python failed for shape ({M}, {N_padded}): {e}")
             py_mean, py_std = float('nan'), float('nan')
         
-        # Calculate speedup
+        # Benchmark compiled python implementation
+        try:
+            compiled_mean, compiled_std = benchmark_quantize(
+                mxfp8_e4m3_quantize_compiled,
+                x,
+                is_sf_swizzled_layout,
+                warmup_iters,
+                benchmark_iters,
+            )
+        except Exception as e:
+            print(f"Compiled failed for shape ({M}, {N_padded}): {e}")
+            compiled_mean, compiled_std = float('nan'), float('nan')
+        
+        # Calculate speedups
+        # FI Speedup: how much faster is flashinfer vs eager python
         if fi_mean > 0 and py_mean > 0:
-            speedup = py_mean / fi_mean
+            fi_speedup = py_mean / fi_mean
         else:
-            speedup = float('nan')
+            fi_speedup = float('nan')
+        
+        # Compile Speedup: how much faster is compiled vs eager python
+        if compiled_mean > 0 and py_mean > 0:
+            compile_speedup = py_mean / compiled_mean
+        else:
+            compile_speedup = float('nan')
         
         shape_str = f"({M}, {N_padded})"
-        fi_str = f"{fi_mean:.4f} ± {fi_std:.4f}"
-        py_str = f"{py_mean:.4f} ± {py_std:.4f}"
-        speedup_str = f"{speedup:.2f}x"
+        fi_str = f"{fi_mean:.3f} ± {fi_std:.3f}"
+        py_str = f"{py_mean:.3f} ± {py_std:.3f}"
+        compiled_str = f"{compiled_mean:.3f} ± {compiled_std:.3f}"
+        fi_speedup_str = f"{fi_speedup:.2f}x"
+        compile_speedup_str = f"{compile_speedup:.2f}x"
         
-        print(f"{shape_str:>20} | {fi_str:>18} | {py_str:>18} | {speedup_str:>10}")
+        print(
+            f"{shape_str:>16} | {fi_str:>16} | {py_str:>16} | "
+            f"{compiled_str:>16} | {fi_speedup_str:>10} | {compile_speedup_str:>15}"
+        )
         
         results.append({
             "shape": (M, N_padded),
@@ -183,14 +231,17 @@ def run_benchmark(
             "flashinfer_std": fi_std,
             "python_ms": py_mean,
             "python_std": py_std,
-            "speedup": speedup,
+            "compiled_ms": compiled_mean,
+            "compiled_std": compiled_std,
+            "fi_speedup": fi_speedup,
+            "compile_speedup": compile_speedup,
         })
     
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("Summary:")
-    print("  - Speedup > 1.0 means Flashinfer is faster")
-    print("  - Speedup < 1.0 means Python implementation is faster")
-    print("=" * 80)
+    print("  - FI Speedup > 1.0 means Flashinfer is faster than eager Python")
+    print("  - Compile Speedup > 1.0 means torch.compile is faster than eager Python")
+    print("=" * 100)
     
     return results
 
@@ -208,15 +259,15 @@ def run_3d_benchmark(
     device = torch.cuda.current_device()
     gpu_name = torch.cuda.get_device_name(device)
     
-    print(f"\n{'='*80}")
+    print(f"\n{'='*100}")
     print(f"MXFP8 Quantization Benchmark (3D/Batched, GPU)")
-    print(f"{'='*80}")
+    print(f"{'='*100}")
     print(f"Device: {gpu_name} (cuda:{device})")
     print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
     print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
-    print(f"{'='*80}\n")
+    print(f"{'='*100}\n")
     
-    header = f"{'Shape':>25} | {'Python (ms)':>18}"
+    header = f"{'Shape':>25} | {'Python (ms)':>18} | {'Compiled (ms)':>18} | {'Compile Speedup':>15}"
     print(header)
     print("-" * len(header))
     print("Note: Flashinfer doesn't support 3D inputs directly")
@@ -230,7 +281,7 @@ def run_3d_benchmark(
         N_padded = ((N + 31) // 32) * 32
         x = torch.randn(B, M, N_padded, dtype=dtype, device="cuda")
         
-        # Benchmark python implementation only (flashinfer doesn't support 3D)
+        # Benchmark python implementation (eager)
         try:
             py_mean, py_std = benchmark_quantize(
                 mxfp8_e4m3_quantize_python,
@@ -239,14 +290,43 @@ def run_3d_benchmark(
                 warmup_iters,
                 benchmark_iters,
             )
-            shape_str = f"({B}, {M}, {N_padded})"
-            py_str = f"{py_mean:.4f} ± {py_std:.4f}"
-            print(f"{shape_str:>25} | {py_str:>18}")
         except Exception as e:
             print(f"Python failed for shape ({B}, {M}, {N_padded}): {e}")
+            py_mean, py_std = float('nan'), float('nan')
+        
+        # Benchmark compiled python implementation
+        try:
+            compiled_mean, compiled_std = benchmark_quantize(
+                mxfp8_e4m3_quantize_compiled,
+                x,
+                is_sf_swizzled_layout,
+                warmup_iters,
+                benchmark_iters,
+            )
+        except Exception as e:
+            print(f"Compiled failed for shape ({B}, {M}, {N_padded}): {e}")
+            compiled_mean, compiled_std = float('nan'), float('nan')
+        
+        # Calculate speedup
+        if compiled_mean > 0 and py_mean > 0:
+            compile_speedup = py_mean / compiled_mean
+        else:
+            compile_speedup = float('nan')
+        
+        shape_str = f"({B}, {M}, {N_padded})"
+        py_str = f"{py_mean:.4f} ± {py_std:.4f}"
+        compiled_str = f"{compiled_mean:.4f} ± {compiled_std:.4f}"
+        compile_speedup_str = f"{compile_speedup:.2f}x"
+        
+        print(
+            f"{shape_str:>25} | {py_str:>18} | {compiled_str:>18} | "
+            f"{compile_speedup_str:>15}"
+        )
 
 
 def main():
+    global mxfp8_e4m3_quantize_compiled
+    
     parser = argparse.ArgumentParser(
         description="Benchmark MXFP8 quantization implementations"
     )
@@ -284,7 +364,18 @@ def main():
         action="store_true",
         help="Include 3D (batched) benchmarks",
     )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode (default: reduce-overhead)",
+    )
     args = parser.parse_args()
+    
+    # Initialize the compiled function with the selected mode
+    print(f"Initializing torch.compile with mode='{args.compile_mode}'...")
+    mxfp8_e4m3_quantize_compiled = get_compiled_quantize(args.compile_mode)
     
     # Parse dtype
     dtype_map = {
