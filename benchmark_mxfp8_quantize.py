@@ -7,7 +7,6 @@ and launch overhead by using warmup iterations.
 """
 
 import argparse
-import time
 
 import torch
 
@@ -25,26 +24,35 @@ def benchmark_quantize(
     benchmark_iters: int = 100,
 ) -> tuple[float, float]:
     """
-    Benchmark a quantization function.
+    Benchmark a quantization function using CUDA events for accurate GPU timing.
     
     Returns:
         Tuple of (mean_time_ms, std_time_ms)
     """
+    assert x.is_cuda, f"Input tensor must be on CUDA, got {x.device}"
+    
     # Warmup to exclude compilation and kernel launch overhead
     for _ in range(warmup_iters):
         _ = func(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
     
     torch.cuda.synchronize()
     
-    # Benchmark
+    # Benchmark using CUDA events for accurate GPU timing
     times = []
     for _ in range(benchmark_iters):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
         _ = func(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
-        torch.cuda.synchronize()
-        end = time.perf_counter()
-        times.append((end - start) * 1000)  # Convert to ms
+        end_event.record()
+        
+        # Wait for the events to complete
+        end_event.synchronize()
+        
+        # Get elapsed time in milliseconds
+        elapsed_ms = start_event.elapsed_time(end_event)
+        times.append(elapsed_ms)
     
     mean_time = sum(times) / len(times)
     std_time = (sum((t - mean_time) ** 2 for t in times) / len(times)) ** 0.5
@@ -58,13 +66,19 @@ def verify_correctness(
     rtol: float = 1e-2,
     atol: float = 1e-2,
 ) -> bool:
-    """Verify that both implementations produce similar results."""
+    """Verify that both implementations produce similar results and outputs are on GPU."""
     q_flashinfer, scales_flashinfer = mxfp8_e4m3_quantize(
         x, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
     q_python, scales_python = mxfp8_e4m3_quantize_python(
         x, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
+    
+    # Verify outputs are on GPU
+    assert q_flashinfer.is_cuda, "Flashinfer output not on CUDA!"
+    assert q_python.is_cuda, "Python output not on CUDA!"
+    assert scales_flashinfer.is_cuda, "Flashinfer scales not on CUDA!"
+    assert scales_python.is_cuda, "Python scales not on CUDA!"
     
     # Compare quantized values (convert to float for comparison)
     q_match = torch.allclose(
@@ -89,9 +103,14 @@ def run_benchmark(
 ):
     """Run benchmarks for multiple input shapes."""
     
+    # Get GPU info
+    device = torch.cuda.current_device()
+    gpu_name = torch.cuda.get_device_name(device)
+    
     print(f"\n{'='*80}")
-    print(f"MXFP8 Quantization Benchmark")
+    print(f"MXFP8 Quantization Benchmark (GPU)")
     print(f"{'='*80}")
+    print(f"Device: {gpu_name} (cuda:{device})")
     print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
     print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
     print(f"{'='*80}\n")
@@ -103,6 +122,9 @@ def run_benchmark(
     results = []
     
     for M, N in shapes:
+        # Clear CUDA cache to avoid memory fragmentation
+        torch.cuda.empty_cache()
+        
         # Generate random input (ensure N is divisible by 32 for both implementations)
         N_padded = ((N + 31) // 32) * 32
         x = torch.randn(M, N_padded, dtype=dtype, device="cuda")
@@ -182,9 +204,14 @@ def run_3d_benchmark(
 ):
     """Run benchmarks for 3D input shapes (batched)."""
     
+    # Get GPU info
+    device = torch.cuda.current_device()
+    gpu_name = torch.cuda.get_device_name(device)
+    
     print(f"\n{'='*80}")
-    print(f"MXFP8 Quantization Benchmark (3D/Batched)")
+    print(f"MXFP8 Quantization Benchmark (3D/Batched, GPU)")
     print(f"{'='*80}")
+    print(f"Device: {gpu_name} (cuda:{device})")
     print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
     print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
     print(f"{'='*80}\n")
@@ -196,6 +223,9 @@ def run_3d_benchmark(
     print()
     
     for B, M, N in shapes:
+        # Clear CUDA cache to avoid memory fragmentation
+        torch.cuda.empty_cache()
+        
         # Generate random input
         N_padded = ((N + 31) // 32) * 32
         x = torch.randn(B, M, N_padded, dtype=dtype, device="cuda")
