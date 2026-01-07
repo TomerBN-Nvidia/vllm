@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+Benchmark script comparing mxfp8_e4m3_quantize (flashinfer) vs mxfp8_e4m3_quantize_python.
+
+This script measures only the quantization time, excluding kernel compilation
+and launch overhead by using warmup iterations.
+"""
+
+import argparse
+import time
+
+import torch
+
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+    mxfp8_e4m3_quantize_python,
+)
+
+
+def benchmark_quantize(
+    func,
+    x: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+    warmup_iters: int = 10,
+    benchmark_iters: int = 100,
+) -> tuple[float, float]:
+    """
+    Benchmark a quantization function.
+    
+    Returns:
+        Tuple of (mean_time_ms, std_time_ms)
+    """
+    # Warmup to exclude compilation and kernel launch overhead
+    for _ in range(warmup_iters):
+        _ = func(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    times = []
+    for _ in range(benchmark_iters):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        _ = func(x, is_sf_swizzled_layout=is_sf_swizzled_layout)
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+        times.append((end - start) * 1000)  # Convert to ms
+    
+    mean_time = sum(times) / len(times)
+    std_time = (sum((t - mean_time) ** 2 for t in times) / len(times)) ** 0.5
+    
+    return mean_time, std_time
+
+
+def verify_correctness(
+    x: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> bool:
+    """Verify that both implementations produce similar results."""
+    q_flashinfer, scales_flashinfer = mxfp8_e4m3_quantize(
+        x, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+    q_python, scales_python = mxfp8_e4m3_quantize_python(
+        x, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+    
+    # Compare quantized values (convert to float for comparison)
+    q_match = torch.allclose(
+        q_flashinfer.float(), q_python.float(), rtol=rtol, atol=atol
+    )
+    
+    # Compare scales
+    scales_match = torch.allclose(
+        scales_flashinfer.float(), scales_python.float(), rtol=rtol, atol=atol
+    )
+    
+    return q_match and scales_match
+
+
+def run_benchmark(
+    shapes: list[tuple[int, int]],
+    dtype: torch.dtype = torch.bfloat16,
+    is_sf_swizzled_layout: bool = False,
+    warmup_iters: int = 10,
+    benchmark_iters: int = 100,
+    verify: bool = True,
+):
+    """Run benchmarks for multiple input shapes."""
+    
+    print(f"\n{'='*80}")
+    print(f"MXFP8 Quantization Benchmark")
+    print(f"{'='*80}")
+    print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
+    print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
+    print(f"{'='*80}\n")
+    
+    header = f"{'Shape':>20} | {'Flashinfer (ms)':>18} | {'Python (ms)':>18} | {'Speedup':>10}"
+    print(header)
+    print("-" * len(header))
+    
+    results = []
+    
+    for M, N in shapes:
+        # Generate random input (ensure N is divisible by 32 for both implementations)
+        N_padded = ((N + 31) // 32) * 32
+        x = torch.randn(M, N_padded, dtype=dtype, device="cuda")
+        
+        # Verify correctness first
+        if verify:
+            try:
+                is_correct = verify_correctness(x, is_sf_swizzled_layout)
+                if not is_correct:
+                    print(f"WARNING: Results don't match for shape ({M}, {N_padded})!")
+            except Exception as e:
+                print(f"WARNING: Verification failed for shape ({M}, {N_padded}): {e}")
+        
+        # Benchmark flashinfer implementation
+        try:
+            fi_mean, fi_std = benchmark_quantize(
+                mxfp8_e4m3_quantize,
+                x,
+                is_sf_swizzled_layout,
+                warmup_iters,
+                benchmark_iters,
+            )
+        except Exception as e:
+            print(f"Flashinfer failed for shape ({M}, {N_padded}): {e}")
+            fi_mean, fi_std = float('nan'), float('nan')
+        
+        # Benchmark python implementation
+        try:
+            py_mean, py_std = benchmark_quantize(
+                mxfp8_e4m3_quantize_python,
+                x,
+                is_sf_swizzled_layout,
+                warmup_iters,
+                benchmark_iters,
+            )
+        except Exception as e:
+            print(f"Python failed for shape ({M}, {N_padded}): {e}")
+            py_mean, py_std = float('nan'), float('nan')
+        
+        # Calculate speedup
+        if fi_mean > 0 and py_mean > 0:
+            speedup = py_mean / fi_mean
+        else:
+            speedup = float('nan')
+        
+        shape_str = f"({M}, {N_padded})"
+        fi_str = f"{fi_mean:.4f} ± {fi_std:.4f}"
+        py_str = f"{py_mean:.4f} ± {py_std:.4f}"
+        speedup_str = f"{speedup:.2f}x"
+        
+        print(f"{shape_str:>20} | {fi_str:>18} | {py_str:>18} | {speedup_str:>10}")
+        
+        results.append({
+            "shape": (M, N_padded),
+            "flashinfer_ms": fi_mean,
+            "flashinfer_std": fi_std,
+            "python_ms": py_mean,
+            "python_std": py_std,
+            "speedup": speedup,
+        })
+    
+    print("\n" + "=" * 80)
+    print("Summary:")
+    print("  - Speedup > 1.0 means Flashinfer is faster")
+    print("  - Speedup < 1.0 means Python implementation is faster")
+    print("=" * 80)
+    
+    return results
+
+
+def run_3d_benchmark(
+    shapes: list[tuple[int, int, int]],
+    dtype: torch.dtype = torch.bfloat16,
+    is_sf_swizzled_layout: bool = False,
+    warmup_iters: int = 10,
+    benchmark_iters: int = 100,
+):
+    """Run benchmarks for 3D input shapes (batched)."""
+    
+    print(f"\n{'='*80}")
+    print(f"MXFP8 Quantization Benchmark (3D/Batched)")
+    print(f"{'='*80}")
+    print(f"Config: dtype={dtype}, swizzled={is_sf_swizzled_layout}")
+    print(f"        warmup_iters={warmup_iters}, benchmark_iters={benchmark_iters}")
+    print(f"{'='*80}\n")
+    
+    header = f"{'Shape':>25} | {'Python (ms)':>18}"
+    print(header)
+    print("-" * len(header))
+    print("Note: Flashinfer doesn't support 3D inputs directly")
+    print()
+    
+    for B, M, N in shapes:
+        # Generate random input
+        N_padded = ((N + 31) // 32) * 32
+        x = torch.randn(B, M, N_padded, dtype=dtype, device="cuda")
+        
+        # Benchmark python implementation only (flashinfer doesn't support 3D)
+        try:
+            py_mean, py_std = benchmark_quantize(
+                mxfp8_e4m3_quantize_python,
+                x,
+                is_sf_swizzled_layout,
+                warmup_iters,
+                benchmark_iters,
+            )
+            shape_str = f"({B}, {M}, {N_padded})"
+            py_str = f"{py_mean:.4f} ± {py_std:.4f}"
+            print(f"{shape_str:>25} | {py_str:>18}")
+        except Exception as e:
+            print(f"Python failed for shape ({B}, {M}, {N_padded}): {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark MXFP8 quantization implementations"
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=10,
+        help="Number of warmup iterations (default: 10)",
+    )
+    parser.add_argument(
+        "--benchmark-iters",
+        type=int,
+        default=100,
+        help="Number of benchmark iterations (default: 100)",
+    )
+    parser.add_argument(
+        "--swizzled",
+        action="store_true",
+        help="Use swizzled scale factor layout",
+    )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip correctness verification",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float16", "bfloat16", "float32"],
+        help="Input data type (default: bfloat16)",
+    )
+    parser.add_argument(
+        "--include-3d",
+        action="store_true",
+        help="Include 3D (batched) benchmarks",
+    )
+    args = parser.parse_args()
+    
+    # Parse dtype
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    dtype = dtype_map[args.dtype]
+    
+    # Define test shapes (M, N) - common sizes in LLM inference
+    shapes_2d = [
+        # Small shapes
+        (128, 128),
+        (256, 256),
+        (512, 512),
+        # Medium shapes (typical hidden sizes)
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+        # Large shapes (larger models)
+        (8192, 8192),
+        # Rectangular shapes (common in attention/FFN)
+        (1024, 4096),
+        (4096, 1024),
+        (2048, 8192),
+        (8192, 2048),
+        # Batch-like shapes (seq_len x hidden_dim)
+        (1, 4096),
+        (32, 4096),
+        (128, 4096),
+        (512, 4096),
+        (1024, 4096),
+        (2048, 4096),
+    ]
+    
+    # Run 2D benchmarks
+    run_benchmark(
+        shapes_2d,
+        dtype=dtype,
+        is_sf_swizzled_layout=args.swizzled,
+        warmup_iters=args.warmup_iters,
+        benchmark_iters=args.benchmark_iters,
+        verify=not args.no_verify,
+    )
+    
+    # Optionally run 3D benchmarks
+    if args.include_3d:
+        shapes_3d = [
+            (2, 512, 4096),
+            (4, 512, 4096),
+            (8, 512, 4096),
+            (16, 256, 4096),
+            (32, 128, 4096),
+        ]
+        run_3d_benchmark(
+            shapes_3d,
+            dtype=dtype,
+            is_sf_swizzled_layout=args.swizzled,
+            warmup_iters=args.warmup_iters,
+            benchmark_iters=args.benchmark_iters,
+        )
+
+
+if __name__ == "__main__":
+    main()
+
