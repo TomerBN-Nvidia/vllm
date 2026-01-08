@@ -14,7 +14,6 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
-import numpy as np
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -351,52 +350,8 @@ class EngineCore:
             scheduler_output, model_output
         )
 
-        # Fetch routed experts for finished requests if enabled.
-        # This is done after update_from_output so we know exactly which
-        # requests finished (via their finish_reason).
-        if self.vllm_config.cache_config.return_routed_experts:
-            self._populate_routed_experts(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
-
-    def _populate_routed_experts(
-        self,
-        engine_core_outputs: dict[int, EngineCoreOutputs],
-    ) -> None:
-        """Fetch and populate routed experts for finished requests.
-        
-        This is called after the scheduler determines which requests have
-        finished, so we only do the expensive .tolist() conversion for
-        requests that actually need it.
-        """
-        # Collect finished request IDs from all outputs
-        finished_req_ids = []
-        for outputs in engine_core_outputs.values():
-            for output in outputs.outputs:
-                if output.finished:
-                    finished_req_ids.append(output.request_id)
-        
-        if not finished_req_ids:
-            return
-        
-        # Call RPC to get routed experts only for finished requests
-        # This is much more efficient than extracting for all requests
-        results = self.collective_rpc(
-            "get_routed_experts_for_requests",
-            args=(finished_req_ids,),
-        )
-        
-        # Merge results from all workers (use first non-empty result)
-        routed_experts_dict: dict[str, np.ndarray] = {}
-        for result in results:
-            if result:
-                routed_experts_dict.update(result)
-        
-        # Update the outputs with routed experts
-        for outputs in engine_core_outputs.values():
-            for output in outputs.outputs:
-                if output.request_id in routed_experts_dict:
-                    output.routed_experts = routed_experts_dict[output.request_id]
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -488,10 +443,6 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-
-        # Fetch routed experts for finished requests if enabled.
-        if self.vllm_config.cache_config.return_routed_experts:
-            self._populate_routed_experts(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

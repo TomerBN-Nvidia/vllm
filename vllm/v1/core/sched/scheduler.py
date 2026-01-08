@@ -991,6 +991,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        routed_experts_dict = model_runner_output.routed_experts_dict
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1105,8 +1106,14 @@ class Scheduler(SchedulerInterface):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             
             if new_token_ids or pooler_output is not None or kv_transfer_params:
+                # Get routed experts for finished requests (if enabled).
+                # The data was extracted in the model runner and included in
+                # the ModelRunnerOutput as a numpy array.
+                routed_experts = None
+                if stopped and routed_experts_dict is not None:
+                    routed_experts = routed_experts_dict.get(req_id)
+
                 # Add EngineCoreOutput for this Request.
-                # Note: routed_experts is populated later via RPC for finished requests
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -1121,6 +1128,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        routed_experts=routed_experts,
                     )
                 )
             else:
