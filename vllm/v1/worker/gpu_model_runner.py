@@ -924,14 +924,15 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
-        # Free the routed experts capturer buffers for finished/aborted requests.
-        # This ensures buffers are freed even if we didn't extract routed_experts
-        # (e.g., for aborted requests).
-        capturer = get_global_experts_capturer()
-        host_cache = capturer.get_host_cache()
-        if host_cache is not None:
-            for req_id in scheduler_output.finished_req_ids:
-                host_cache.free_request(req_id)
+        # Free routed experts buffers for requests that finished in the PREVIOUS
+        # step. Their data was already extracted in the previous step's 
+        # _extract_routed_experts_for_current_batch call.
+        if self.cache_config.return_routed_experts:
+            capturer = get_global_experts_capturer()
+            host_cache = capturer.get_host_cache()
+            if host_cache is not None:
+                for req_id in scheduler_output.finished_req_ids:
+                    host_cache.free_request(req_id)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -2602,50 +2603,51 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
-    def get_routed_experts_for_requests(
+    def _extract_routed_experts_for_current_batch(
         self,
-        finished_req_ids: list[str],
-    ) -> dict[str, np.ndarray]:
-        """Get routed experts for finished requests.
+        req_ids: list[str],
+    ) -> dict[str, np.ndarray] | None:
+        """Extract routed experts for requests that may finish in the current step.
         
-        This is called by the scheduler after it determines which requests
-        have finished. Only then do we extract and convert the routing data
-        to numpy arrays for serialization.
+        This is called after _bookkeeping_sync to make routed experts available
+        in the ModelRunnerOutput for the SAME step where finish conditions are
+        checked. The scheduler will only use the data for requests that actually
+        finish in this step.
         
-        Note: The seqlen is retrieved from the host_cache's internal tracking
-        (via update_seqlen during D2H sync) because the request state may have
-        already been removed from self.requests by the time this is called.
+        Note: We don't free buffers here - that happens in _update_states for
+        requests that finished in the PREVIOUS step.
         
         Args:
-            finished_req_ids: List of request IDs that have finished.
+            req_ids: List of request IDs that may finish (generated tokens).
             
         Returns:
-            Dictionary mapping request ID to routed experts numpy array.
-            Shape: np.ndarray = (seqlen, num_hidden_layers, num_experts_per_tok)
+            Dictionary mapping request ID to routed experts as numpy array,
+            or None if no data available.
+            Shape: np.ndarray[int16] = (seqlen, num_hidden_layers, num_experts_per_tok)
         """
         capturer = get_global_experts_capturer()
         host_cache = capturer.get_host_cache()
         
         if host_cache is None:
-            return {}
+            return None
         
-        result = {}
-        for req_id in finished_req_ids:
-            # Get seqlen from host_cache tracking (more reliable than req_state
-            # since req_state may already be removed by _update_states)
-            seqlen = host_cache.get_buffer(req_id).shape[0]
-            if seqlen is not None and seqlen > 0:
-                experts = capturer.get_routed_experts(
-                    req_id, seqlen=seqlen, free_slot=True
-                )
-                if experts is not None:
-                    result[req_id] = experts.numpy()
-            else:
-                # No seqlen tracked or buffer not found - still need to free the buffer
-                # to prevent memory leak
-                host_cache.free_request(req_id)
+        result: dict[str, np.ndarray] = {}
+        for req_id in req_ids:
+            buf = host_cache.get_buffer(req_id)
+            if buf is not None:
+                seqlen = buf.shape[0]
+                if seqlen > 0:
+                    # Get experts without freeing (free_slot=False)
+                    # The buffer will be freed in _update_states after the
+                    # request finishes.
+                    experts = capturer.get_routed_experts(
+                        req_id, seqlen=seqlen, free_slot=False
+                    )
+                    if experts is not None:
+                        # Convert to numpy array (memory-efficient)
+                        result[req_id] = experts.numpy().astype(np.int16)
         
-        return result
+        return result if result else None
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
@@ -3857,13 +3859,23 @@ class GPUModelRunner(
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
-                capturer = RoutedExpertsCapturer.get_instance()
-                if capturer is not None:
-                    capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
-                else:
-                    logger.error("RoutedExpertsCapturer not initialized.")
-
+            # Extract routed experts only for requests that generated tokens.
+            # Prefill-only requests won't finish this step, so no need to extract.
+            # This reduces memory pressure and serialization overhead.
+            routed_experts_dict = None
+            if self.cache_config.return_routed_experts and valid_sampled_token_ids:
+                # Find requests that generated at least one token
+                reqs_with_output = [
+                    req_id for req_id, tokens in zip(
+                        req_ids_output_copy, valid_sampled_token_ids
+                    ) if tokens  # non-empty token list
+                ]
+                if reqs_with_output:
+                    routed_experts_dict = self._extract_routed_experts_for_current_batch(
+                        reqs_with_output
+                    )
+            
+>>>>>>> 4b0bb6037 (memory optimizations)
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3876,6 +3888,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                routed_experts_dict=routed_experts_dict,
             )
 
         if not self.use_async_scheduling:

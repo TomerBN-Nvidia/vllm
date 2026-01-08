@@ -1251,6 +1251,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        routed_experts_dict = model_runner_output.routed_experts_dict
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1392,8 +1393,12 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                # Get routed experts for finished requests (if enabled).
+                routed_experts = None
+                if stopped and routed_experts_dict is not None:
+                    routed_experts = routed_experts_dict.get(req_id)
+
                 # Add EngineCoreOutput for this Request.
-                # Note: routed_experts is populated later via RPC for finished requests
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -1410,6 +1415,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        routed_experts=routed_experts,
                     )
                 )
             else:
