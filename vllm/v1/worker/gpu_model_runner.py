@@ -3859,23 +3859,17 @@ class GPUModelRunner(
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            # Extract routed experts only for requests that generated tokens.
-            # Prefill-only requests won't finish this step, so no need to extract.
-            # This reduces memory pressure and serialization overhead.
+            # Extract routed experts for all requests in the current batch.
+            # In async scheduling mode, valid_sampled_token_ids is empty at this point,
+            # so we extract for all requests and let the scheduler filter.
             routed_experts_dict = None
-            if self.cache_config.return_routed_experts and valid_sampled_token_ids:
-                # Find requests that generated at least one token
-                reqs_with_output = [
-                    req_id for req_id, tokens in zip(
-                        req_ids_output_copy, valid_sampled_token_ids
-                    ) if tokens  # non-empty token list
-                ]
-                if reqs_with_output:
-                    routed_experts_dict = self._extract_routed_experts_for_current_batch(
-                        reqs_with_output
-                    )
-            
->>>>>>> 4b0bb6037 (memory optimizations)
+            if self.cache_config.return_routed_experts:
+                # Use req_ids_output_copy (all requests in batch) since
+                # valid_sampled_token_ids may be empty in async scheduling mode.
+                routed_experts_dict = self._extract_routed_experts_for_current_batch(
+                    req_ids_output_copy
+                )
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
