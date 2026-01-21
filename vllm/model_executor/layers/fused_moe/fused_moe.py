@@ -41,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
     moe_kernel_quantize_input,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import dequant_mxfp8_to_bf16
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_Scheme
@@ -460,7 +461,8 @@ def fused_moe_kernel(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+        
+    elif use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
@@ -734,6 +736,7 @@ def invoke_fused_moe_triton_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_mxfp8_fake_w8a8: bool,
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
@@ -741,8 +744,18 @@ def invoke_fused_moe_triton_kernel(
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+    if use_mxfp8_fake_w8a8:
+        # MXFP8: Dequantize to BF16 before calling the kernel
+        assert A_scale is not None and B_scale is not None
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+        # Dequantize A and B from MXFP8 to BF16
+        A = dequant_mxfp8_to_bf16(A, A_scale)
+
+        # Clear the scales since now kernel just works with BF16 tensors
+        A_scale = None
+        B_scale = None
+        
+    elif use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
         assert block_shape is None or triton.cdiv(
             B.size(-2), block_shape[0]
@@ -1324,6 +1337,7 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp8_fake_w8a8: bool = False,
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -1351,6 +1365,7 @@ def inplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp8_fake_w8a8,
         ocp_mx_scheme,
         per_channel_quant,
         global_num_experts,
@@ -1379,6 +1394,7 @@ def inplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp8_fake_w8a8: bool = False,
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -1421,6 +1437,7 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp8_fake_w8a8: bool = False,
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -1448,6 +1465,7 @@ def outplace_fused_experts(
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_mxfp8_fake_w8a8,
         ocp_mx_scheme,
         per_channel_quant,
         global_num_experts,
@@ -1475,6 +1493,7 @@ def outplace_fused_experts_fake(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp8_fake_w8a8: bool = False,
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -1580,6 +1599,7 @@ def fused_experts(
             use_int8_w8a8=quant_config.use_int8_w8a8,
             use_int8_w8a16=quant_config.use_int8_w8a16,
             use_int4_w4a16=quant_config.use_int4_w4a16,
+            use_mxfp8_fake_w8a8=quant_config.use_mxfp8_fake_w8a8,
             ocp_mx_scheme=quant_config.ocp_mx_scheme,
             per_channel_quant=quant_config.per_act_token_quant,
             global_num_experts=global_num_experts,
@@ -1600,6 +1620,7 @@ def _get_config_quant_dtype(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     ocp_mx_scheme: str | None,
+    use_mxfp8_fake_w8a8: bool,
 ) -> None | torch.dtype | str:
     """
     Get the quantization type based on the quantization strategy flags.
@@ -1608,6 +1629,8 @@ def _get_config_quant_dtype(
     input is unquantized or has been quantized prior to calling
     fused_experts_impl.
     """
+    if use_mxfp8_fake_w8a8:
+        return "mxfp8"
     if use_fp8_w8a8:
         return torch.float8_e4m3fn
     elif use_int8_w8a8:
@@ -1634,6 +1657,7 @@ def fused_experts_impl(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
+    use_mxfp8_fake_w8a8: bool = False,
     ocp_mx_scheme: str | None = None,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
@@ -1704,6 +1728,7 @@ def fused_experts_impl(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         ocp_mx_scheme=ocp_mx_scheme,
+        use_mxfp8_fake_w8a8=use_mxfp8_fake_w8a8,
     )
 
     get_config_func = functools.partial(
@@ -2061,6 +2086,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             use_int8_w8a8=self.quant_config.use_int8_w8a8,
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            use_mxfp8_fake_w8a8=self.quant_config.use_mxfp8_fake_w8a8,
             per_channel_quant=self.per_act_token_quant,
             block_shape=self.block_shape,
             B_bias=self.w1_bias,

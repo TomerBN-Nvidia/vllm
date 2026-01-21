@@ -69,6 +69,7 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
     BLOCK = "block"
+    MXFP8 = "mxfp8_block"
 
 
 def determine_expert_map(
@@ -332,9 +333,10 @@ class FusedMoE(CustomOp):
         n_shared_experts: int | None = None,
         routing_method_type: RoutingMethodType | None = None,
         router_logits_dtype: torch.dtype | None = None,
+        is_gated: bool = True,
     ):
         super().__init__()
-
+        self.is_gated = is_gated
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
@@ -888,7 +890,10 @@ class FusedMoE(CustomOp):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = loaded_weight
+            if self.is_gated:
+                param_data[expert_id][idx] = loaded_weight
+            else:
+                param_data[expert_id] = loaded_weight
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
@@ -909,6 +914,59 @@ class FusedMoE(CustomOp):
             shard_dim, shard_size * tp_rank, shard_size
         )
         param.copy_(loaded_weight)
+
+    def _load_model_weight_or_scale_for_mxfp8(
+        self,
+        shard_dim: int,
+        expert_data: torch.Tensor,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        is_weight: bool,
+        load_full_w2: bool = False,
+    ):
+        """
+        Load model weights or weight scales for MxFP8 quantization.
+            :param shard_dim: dimension to shard
+            :param expert_data: parameter for a particular expert
+            :param shard_id: either w1, w2, or w3
+            :param loaded_weight: checkpoint weight to load into the param
+            :param tp_rank: tensor parallel rank
+        """
+
+        # pad weights to be divisible by tp_size * 32
+        # pad scales to be divisible by tp_size
+        divisive_factor = (self.tp_size * 32) if (is_weight or shard_id == "w1") else self.tp_size
+
+        size = loaded_weight.shape[shard_dim]
+
+        pad_size = (divisive_factor - size % divisive_factor) % divisive_factor
+
+        if pad_size > 0:
+            logger.info(
+                f"Padding {'weight' if is_weight else 'scale'} "
+                f"for shard_id {shard_id} on dim {shard_dim} "
+                f"from size {size} to size {size + pad_size}"
+            )
+            if shard_dim == 1:
+                # pad on last dim
+                pad_tuple = (0, pad_size,   # dim 1: right pad only
+                            0, 0)          # dim 0: no pad
+            else:  # shard_dim == 0
+                # pad on first dim
+                pad_tuple = (0, 0,          # dim 1: no pad
+                            0, pad_size)   # dim 0: right pad only
+            loaded_weight = F.pad(loaded_weight, pad_tuple)
+
+
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=expert_data,
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+            tp_rank=tp_rank,
+            load_full_w2=load_full_w2,
+        )
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -983,9 +1041,13 @@ class FusedMoE(CustomOp):
         else:
             shard_size = expert_data.shape[shard_dim]
         if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+            try:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+            except Exception as e:
+                logger.error(f"Error narrowing loaded weight: {e}")
+                raise e
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -1307,6 +1369,18 @@ class FusedMoE(CustomOp):
                     tp_rank=self.tp_rank,
                     load_full_w2=getattr(param, "load_full_w2", False),
                 )
+            elif quant_method == FusedMoeWeightScaleSupported.MXFP8.value:
+                self._load_model_weight_or_scale_for_mxfp8(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    is_weight=False,
+                    load_full_w2=getattr(
+                        param, "load_full_w2", False
+                    ), 
+                )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,
@@ -1331,13 +1405,24 @@ class FusedMoE(CustomOp):
 
         # Case model weights
         if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank,
-            )
+            quant_method = getattr(param, "quant_method", None)
+            if quant_method == FusedMoeWeightScaleSupported.MXFP8.value:
+                self._load_model_weight_or_scale_for_mxfp8(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                    is_weight=True
+                )
+            else:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
             return True if return_success else None
 
         return False if return_success else None

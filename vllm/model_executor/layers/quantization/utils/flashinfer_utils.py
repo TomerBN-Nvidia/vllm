@@ -57,7 +57,68 @@ def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
     return (
         x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
     )
+def rotate_flashinfer_fp8_moe_weights(
+    gemm1_weights: torch.Tensor, gemm2_weights: torch.Tensor, gemm1_scales, gemm2_scales
+):
+    # TODO: Hack for mxfp8
+    from flashinfer import (
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
 
+    epilogue_tile_m = 128
+    num_experts = gemm1_weights.shape[0]
+    hidden_size = gemm1_weights.shape[-1]
+    intermediate_size = gemm1_weights.shape[1] // 2
+
+    # Reorder rows of W1 for fused gated activation
+    # gemm1_weights_fp8_interleaved = []
+    # for i in range(num_experts):
+    #     gemm1_weights_fp8_interleaved.append(
+    #         reorder_rows_for_gated_act_gemm(gemm1_weights[i])
+    #     )
+
+    # Stack weights and scales for all experts
+    # gemm1_weights_fp8_interleaved = torch.stack(gemm1_weights_fp8_interleaved).reshape(
+    #     num_experts, 2 * intermediate_size, hidden_size
+    # )
+    gemm1_weights_fp8_interleaved = gemm1_weights
+
+    # Shuffle weights and scaling factors for transposed mma output
+    gemm1_weights_fp8_shuffled = []
+    gemm2_weights_fp8_shuffled = []
+    gemm1_scales_shuffled = []
+    gemm2_scales_shuffled = []
+    for i in range(num_experts):
+        gemm1_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm1_weights_fp8_interleaved[i], epilogue_tile_m)
+            # gemm1_weights_fp8_interleaved[i]
+        )
+
+        gemm1_scales_shuffled.append(
+            shuffle_matrix_sf_a(gemm1_scales[i], 128).contiguous()
+        )
+
+        gemm2_weights_fp8_shuffled.append(
+            shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
+            # gemm2_weights[i]
+        )
+        gemm2_scales_shuffled.append(
+            shuffle_matrix_sf_a(gemm2_scales[i], 128).contiguous()
+        )
+
+    # Stack weights for all experts
+    return (
+        torch.stack(gemm1_weights_fp8_shuffled),
+        torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn),
+        torch.stack(gemm1_scales_shuffled),
+        torch.stack(gemm2_scales_shuffled),
+    )
+    # gemm1_weights.data =
+    # gemm2_weights.data = torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn)
+
+    # gemm1_scales.data = torch.stack(gemm1_scales_shuffled)
+    # gemm2_scales.data = torch.stack(gemm2_scales_shuffled)
 
 def rotate_weights_for_fi_trtllm_fp8_per_tensor_moe(
     gemm1_weights: torch.Tensor, gemm2_weights: torch.Tensor

@@ -890,7 +890,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_size = self.output_sizes[loaded_shard_id]
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = getattr(self, "weight_block_size", None)
+            weight_block_size = getattr(self, "weight_block_size") # TODO: This is a hack for mxfp8
+            weight_block_size = weight_block_size if weight_block_size is not None else [1, 32]
             shard_size, shard_offset = adjust_block_scale_shard(
                 weight_block_size, shard_size, shard_offset
             )
@@ -1079,7 +1080,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = getattr(self, "weight_block_size", None)
+            weight_block_size = getattr(self, "weight_block_size") # TODO: This is a hack for mxfp8
+            weight_block_size = weight_block_size if weight_block_size is not None else [1, 32]
             shard_size, shard_offset = adjust_block_scale_shard(
                 weight_block_size, shard_size, shard_offset
             )
