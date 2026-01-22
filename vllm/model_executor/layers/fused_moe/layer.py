@@ -943,7 +943,7 @@ class FusedMoE(CustomOp):
         pad_size = (divisive_factor - size % divisive_factor) % divisive_factor
 
         if pad_size > 0:
-            logger.info(
+            logger.debug_once(
                 f"Padding {'weight' if is_weight else 'scale'} "
                 f"for shard_id {shard_id} on dim {shard_dim} "
                 f"from size {size} to size {size + pad_size}"
