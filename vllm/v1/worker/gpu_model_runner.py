@@ -1779,8 +1779,6 @@ class GPUModelRunner(
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
-        if self.model_config.enable_return_routed_experts:
-            self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -3413,13 +3411,6 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-
-        if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capturer.clear_buffer()  # noqa
-            else:
-                logger.error("RoutedExpertsCapturer not initialized.")
 
         if scheduler_output.preempted_req_ids and has_kv_transfer_group():
             get_kv_transfer_group().handle_preemptions(
@@ -6190,41 +6181,6 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
-        if self.model_config.enable_return_routed_experts:
-            self.init_routed_experts_capturer()
-
-    def init_routed_experts_capturer(self):
-        logger.info(
-            "Initializing routed experts capturer, enable_return_routed_experts: %s",
-            self.model_config.enable_return_routed_experts,
-        )
-        routed_experts_capturer = RoutedExpertsCapturer.create()
-        block_size = self.cache_config.block_size
-        self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks // len(self.kv_cache_config.kv_cache_groups)
-            + 1
-        ) * block_size
-        routed_experts_capturer.init_buffer(
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            max_num_kv_tokens=self.max_num_kv_tokens,
-            vllm_config=self.vllm_config,
-        )
-        self._bind_routed_experts_capturer(routed_experts_capturer)
-
-    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-        from vllm.model_executor.layers.fused_moe.router.base_router import (
-            BaseRouter,
-        )
-
-        for module in self.compilation_config.static_forward_context.values():
-            if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
-                layer_id = module.layer_id
-
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
-
-                module.router.set_capture_fn(_capture_fn)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

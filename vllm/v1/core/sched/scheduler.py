@@ -27,9 +27,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsReader,
-)
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.v1.core.encoder_cache_manager import (
@@ -251,24 +248,10 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
-        if self.vllm_config.model_config.enable_return_routed_experts:
+        if self.vllm_config.cache_config.return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
-                "enable_return_routed_experts does not support context parallelism "
+                "return_routed_experts does not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
-            )
-
-            self.routed_experts_reader = RoutedExpertsReader.create()
-
-            assert len(kv_cache_config.kv_cache_groups) > 0, (
-                "enable_return_routed_experts requires at least one kv cache group"
-            )
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // len(kv_cache_config.kv_cache_groups) + 1
-            ) * self.block_size
-
-            self.routed_experts_reader.attach_buffer(
-                max_num_kv_tokens=self.max_num_kv_tokens,
-                vllm_config=self.vllm_config,
             )
 
     def _mamba_block_aligned_split(
@@ -1519,7 +1502,7 @@ class Scheduler(SchedulerInterface):
         return False
 
     def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.model_config.enable_return_routed_experts:
+        if not self.vllm_config.cache_config.return_routed_experts:
             return None
 
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
