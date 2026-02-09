@@ -1328,11 +1328,8 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            routed_experts = None
             finish_reason = None
             if stopped:
-                routed_experts = self._get_routed_experts(request)
-
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
@@ -1396,7 +1393,6 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                         num_external_computed_tokens=request.num_external_computed_tokens,
-                        routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         routed_experts=routed_experts,
                     )
@@ -1500,30 +1496,6 @@ class Scheduler(SchedulerInterface):
 
         self.waiting.add_request(request)
         return False
-
-    def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.cache_config.return_routed_experts:
-            return None
-
-        kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-        block_ids = kv_blocks.get_block_ids()[0]
-        num_tokens = request.num_tokens - 1
-
-        # compute slot mapping
-        block_ids_array = np.array(block_ids, dtype=np.int32)
-        num_blocks = len(block_ids)
-        block_size = self.block_size
-
-        # generate block offsets
-        block_offsets = np.arange(0, block_size)
-
-        # compute slot mapping: slot = block_id * block_size + offset
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids_array.reshape((num_blocks, 1)) * block_size
-        ).flatten()[:num_tokens]
-
-        return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
