@@ -2631,7 +2631,7 @@ class GPUModelRunner(
         if host_cache is None:
             return None
 
-        result: dict[str, np.ndarray] = {}
+        result: dict[str, list] = {}
         for req_id in req_ids:
             # Only extract for requests that are likely finishing this step.
             req_state = self.requests.get(req_id)
@@ -2660,10 +2660,10 @@ class GPUModelRunner(
                 req_id, seqlen=seqlen, free_slot=False
             )
             if experts is not None:
+                # experts is already a numpy array (from host cache).
                 # Convert to nested Python lists for efficient Ray
-                # serialization (pickle handles lists much faster than
-                # numpy arrays through compiled DAG channels).
-                result[req_id] = experts.numpy().tolist()
+                # serialization through compiled DAG channels.
+                result[req_id] = experts.tolist()
 
         return result if result else None
 
