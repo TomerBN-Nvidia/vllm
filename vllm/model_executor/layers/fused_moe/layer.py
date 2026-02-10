@@ -41,7 +41,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer, _RoutedExpertsCapturerNoop
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import get_global_experts_capturer
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
 )
@@ -2080,18 +2080,16 @@ def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
-    moe_layer_num: int,
 ) -> torch.Tensor:
     self = get_layer_from_name(layer_name)
     assert self.shared_experts is None
-    return self.forward_impl(hidden_states, router_logits, moe_layer_num)
+    return self.forward_impl(hidden_states, router_logits)
 
 
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
-    moe_layer_num: int,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

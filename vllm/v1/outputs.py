@@ -195,10 +195,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # req_id -> routed experts array (seqlen, num_hidden_layers, num_experts_per_tok)
-    # Only populated for requests in the current batch when return_routed_experts
-    # is enabled. The scheduler uses this for requests that finish in the current step.
-    routed_experts_dict: dict[str, np.ndarray] | None = None
+    # req_id -> routed experts as nested list [seqlen][num_hidden_layers][num_experts_per_tok]
+    # Only populated for requests predicted to finish in the current step when
+    # return_routed_experts is enabled. Uses plain Python lists for efficient
+    # Ray serialization (avoids numpy/torch in the DAG channel).
+    routed_experts_dict: dict[str, list] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

@@ -1,6 +1,5 @@
 import logging
 from abc import ABC
-from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -21,10 +20,10 @@ def get_tensor_size_bytes(t: torch.Tensor):
 
 class _RoutedExpertsDeviceCache:
     """Per-device (GPU) cache for capturing routed expert IDs during forward pass."""
-    
+
     # Use int16 to save memory - sufficient for up to 32767 experts
     DTYPE = torch.int16
-    
+
     def __init__(
         self,
         num_batched_tokens: int,
@@ -58,7 +57,9 @@ class _RoutedExpertsDeviceCache:
         """Common logging and memory usage computation for captured experts buffers."""
         buffer_size_MB = self.get_buffer_size_bytes() / _MB
         logger.info(
-            f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
+            f"Routing experts device buffer allocated. "
+            f"#shape: {tuple(self.buffer.shape)}, "
+            f"size: {buffer_size_MB:.2f} MB"
         )
 
 
@@ -90,6 +91,10 @@ class _RoutedExpertsHostCache:
         # Lazy per-request allocation instead of massive pre-allocated buffer
         # Key: req_id, Value: tensor of shape (current_seqlen, num_hidden_layers, num_experts_per_tok)
         self._req_buffers: dict[str, torch.Tensor] = {}
+        
+        # Track the actual number of filled positions per request (not the
+        # allocated buffer size, which may be larger due to 2x growth strategy).
+        self._filled_len: dict[str, int] = {}
         
         # Track current memory usage for logging
         self._total_allocated_bytes = 0
@@ -154,11 +159,29 @@ class _RoutedExpertsHostCache:
         """Get the buffer for a request, or None if not allocated."""
         return self._req_buffers.get(req_id)
 
+    def update_filled_len(self, req_id: str, max_pos: int) -> None:
+        """Update the high-water mark of filled positions for a request.
+        
+        After writing routing data at positions via buf[pos_ids] = vals,
+        call this with the maximum position written so that get_filled_len()
+        returns the correct count of filled positions.
+        """
+        new_len = max_pos + 1
+        self._filled_len[req_id] = max(self._filled_len.get(req_id, 0), new_len)
+
+    def get_filled_len(self, req_id: str) -> int:
+        """Get the number of positions with routing data for a request.
+        
+        Returns 0 if no data has been recorded for this request.
+        """
+        return self._filled_len.get(req_id, 0)
+
     def free_request(self, req_id: str) -> None:
         """Free the buffer for a request."""
         if req_id in self._req_buffers:
             buf = self._req_buffers.pop(req_id)
             self._total_allocated_bytes -= buf.numel() * buf.element_size()
+        self._filled_len.pop(req_id, None)
 
     def _finalize_allocation_log(self):
         """Log initialization (no pre-allocation with lazy approach)."""
@@ -306,11 +329,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if self.host_cache is None:
             return
             
-        # Single D2H copy
+        # Single D2H copy (synchronous)
         total_tokens = sum(num_scheduled_tokes.values())
+        if total_tokens == 0:
+            return
+
         host_values = self.device_cache.buffer[:total_tokens].cpu()
 
-        # Split once
+        # Split once and scatter into per-request host cache buffers
         sizes = list(num_scheduled_tokes.values())
         host_values_split = torch.split(host_values, sizes)
         positions_split = torch.split(positions, sizes)
@@ -327,6 +353,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
             buf = self.host_cache.get_or_grow_buffer(req_id, max_pos)
             buf[pos_ids] = vals
+            self.host_cache.update_filled_len(req_id, max_pos)
 
     def get_routed_experts(
        self,

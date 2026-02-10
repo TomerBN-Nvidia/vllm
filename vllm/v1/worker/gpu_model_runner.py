@@ -22,9 +22,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
     get_global_experts_capturer,
-    set_global_experts_capturer,
 )
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -56,9 +54,6 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-)
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -809,6 +804,10 @@ class GPUModelRunner(
 
 
     def init_routed_experts_capturer(self):
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            init_routed_experts_capturer_with_shared_cache,
+        )
+
         max_running_requests = (
             self.max_num_tokens // 2
             if self.max_num_reqs is None
@@ -821,7 +820,13 @@ class GPUModelRunner(
         else:
             num_fused_shared_experts = 0
 
-        capturer = RoutedExpertsCapturer.create(
+        # Use the rank-aware initializer: only rank 0 creates a real capturer
+        # (with GPU device cache + host cache).  Non-rank-0 workers get a Noop
+        # capturer so they don't allocate buffers, run D2H copies, or add
+        # capture_fn overhead to the forward pass.  All TP ranks see the same
+        # routing decisions, so only rank 0 needs to capture.
+        tp_group = get_tp_group()
+        init_routed_experts_capturer_with_shared_cache(
             enable=self.vllm_config.cache_config.return_routed_experts,
             model_config=self.model_config,
             num_fused_shared_experts=num_fused_shared_experts,
@@ -829,8 +834,9 @@ class GPUModelRunner(
             max_running_requests=max_running_requests,
             max_model_len=self.max_model_len,
             device=self.device,
+            rank=tp_group.rank_in_group,
+            world_size=tp_group.world_size,
         )
-        set_global_experts_capturer(capturer)
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -925,11 +931,10 @@ class GPUModelRunner(
             self.input_batch.remove_request(req_id)
 
         # Free routed experts buffers for requests that finished in the PREVIOUS
-        # step. Their data was already extracted in the previous step's 
+        # step. Their data was already extracted in the previous step's
         # _extract_routed_experts_for_current_batch call.
         if self.cache_config.return_routed_experts:
-            capturer = get_global_experts_capturer()
-            host_cache = capturer.get_host_cache()
+            host_cache = get_global_experts_capturer().get_host_cache()
             if host_cache is not None:
                 for req_id in scheduler_output.finished_req_ids:
                     host_cache.free_request(req_id)
@@ -2605,46 +2610,61 @@ class GPUModelRunner(
         self,
         req_ids: list[str],
     ) -> dict[str, np.ndarray] | None:
-        """Extract routed experts for requests that may finish in the current step.
-        
-        This is called after _bookkeeping_sync to make routed experts available
-        in the ModelRunnerOutput for the SAME step where finish conditions are
-        checked. The scheduler will only use the data for requests that actually
-        finish in this step.
-        
-        Note: We don't free buffers here - that happens in _update_states for
-        requests that finished in the PREVIOUS step.
-        
-        Args:
-            req_ids: List of request IDs that may finish (generated tokens).
-            
-        Returns:
-            Dictionary mapping request ID to routed experts as numpy array,
-            or None if no data available.
-            Shape: np.ndarray[int16] = (seqlen, num_hidden_layers, num_experts_per_tok)
+        """Extract routed experts for requests predicted to finish this step.
+
+        Only extracts data for requests that have generated enough output
+        tokens to hit their ``max_tokens`` limit (the most common finish
+        condition).  This avoids serialising megabytes of numpy data through
+        the Ray DAG on every single step for requests that are NOT finishing.
+
+        For the rare case where a request finishes for another reason (EOS
+        token, stop string, …) the routed experts data will still be
+        available because the host cache persists across steps.  The scheduler
+        can request it on the next step via ``finished_req_ids``.
+
+        Note: We don't free buffers here – that happens in ``_update_states``
+        for requests that finished in the PREVIOUS step.
         """
         capturer = get_global_experts_capturer()
         host_cache = capturer.get_host_cache()
-        
+
         if host_cache is None:
             return None
-        
+
         result: dict[str, np.ndarray] = {}
         for req_id in req_ids:
-            buf = host_cache.get_buffer(req_id)
-            if buf is not None:
-                seqlen = buf.shape[0]
-                if seqlen > 0:
-                    # Get experts without freeing (free_slot=False)
-                    # The buffer will be freed in _update_states after the
-                    # request finishes.
-                    experts = capturer.get_routed_experts(
-                        req_id, seqlen=seqlen, free_slot=False
-                    )
-                    if experts is not None:
-                        # Convert to numpy array (memory-efficient)
-                        result[req_id] = experts.numpy().astype(np.int16)
-        
+            # Only extract for requests that are likely finishing this step.
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+
+            # Heuristic: request finishes when output tokens >= max_tokens.
+            sp = req_state.sampling_params
+            if sp is None:
+                continue
+            max_tokens = sp.max_tokens
+            if max_tokens is None:
+                continue
+            num_output = len(req_state.output_token_ids)
+            if num_output < max_tokens:
+                continue  # not finishing yet – skip the expensive extraction
+
+            seqlen = host_cache.get_filled_len(req_id)
+            if seqlen <= 0:
+                continue
+
+            # Get experts without freeing (free_slot=False).
+            # The buffer will be freed in _update_states after the
+            # request finishes.
+            experts = capturer.get_routed_experts(
+                req_id, seqlen=seqlen, free_slot=False
+            )
+            if experts is not None:
+                # Convert to nested Python lists for efficient Ray
+                # serialization (pickle handles lists much faster than
+                # numpy arrays through compiled DAG channels).
+                result[req_id] = experts.numpy().tolist()
+
         return result if result else None
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -3079,13 +3099,26 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
-        # Sync routed experts from device to host cache.
-        # The actual extraction is done lazily via get_routed_experts_for_requests()
-        # when the scheduler determines which requests have finished.
-        get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
-            positions=self.positions.cpu[:num_scheduled_tokens],
-            num_scheduled_tokes=scheduler_output.num_scheduled_tokens
-        )
+        # Initiate non-blocking D2H copy of routed experts from device to
+        # a pinned staging buffer.  The actual scatter into per-request host
+        # cache buffers is deferred until _extract_routed_experts_for_current_batch
+        # calls finalize_pending_sync(), allowing the GPU to keep running.
+        if self.cache_config.return_routed_experts:
+            # IMPORTANT: The positions tensor is ordered by
+            # self.input_batch.req_ids (as set up in _prepare_inputs), which
+            # may differ from the iteration order of
+            # scheduler_output.num_scheduled_tokens. We must build an ordered
+            # dict matching the positions tensor order to ensure the split
+            # assigns correct positions to each request.
+            ordered_num_scheduled = {
+                req_id: scheduler_output.num_scheduled_tokens[req_id]
+                for req_id in self.input_batch.req_ids
+                if req_id in scheduler_output.num_scheduled_tokens
+            }
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                positions=self.positions.cpu[:num_scheduled_tokens],
+                num_scheduled_tokes=ordered_num_scheduled
+            )
         
         return (
             num_nans_in_logits,
