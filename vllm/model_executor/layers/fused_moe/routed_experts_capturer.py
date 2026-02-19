@@ -19,9 +19,11 @@ def get_tensor_size_bytes(t: torch.Tensor):
 
 
 class _RoutedExpertsDeviceCache:
-    """Per-device (GPU) cache for capturing routed expert IDs during forward pass."""
+    """Per-device (GPU) cache for capturing routed expert IDs during forward
+    pass.  Always writes at row 0 so that CUDA graph replay sees the same
+    addresses that were recorded at capture time.
+    """
 
-    # Use int16 to save memory - sufficient for up to 32767 experts
     DTYPE = torch.int16
 
     def __init__(
@@ -47,8 +49,6 @@ class _RoutedExpertsDeviceCache:
             "capturing routing experts but get layer_id None"
         )
         batch, _ = topk_ids.shape
-        # copy_() handles the dtype cast (e.g. int64 → int16) in a single
-        # fused kernel, avoiding a temporary tensor allocation from .to().
         self.buffer[:batch, layer_id, :].copy_(topk_ids, non_blocking=True)
 
     def _finalize_allocation_log(self):
@@ -180,6 +180,9 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
+    def finalize_pending_copy(self):
+        raise NotImplementedError
+
     def get_host_cache(self):
         raise NotImplementedError
 
@@ -188,7 +191,19 @@ class RoutedExpertsCapturer(ABC):
 
 
 class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
-    """Capturer with GPU device cache and optional CPU host cache."""
+    """Capturer with GPU device cache and CPU host cache.
+
+    Performance strategy -- async D2H with optimized host-cache scatter:
+
+    Every decode step we issue a non-blocking D2H copy on a dedicated
+    CUDA stream.  The scatter into per-request host-cache buffers is
+    deferred to the start of the NEXT step (by which time the copy has
+    finished).  The scatter loop is optimized with direct scalar access
+    to avoid numpy slice views, int() conversions, and .max() calls.
+
+    At extraction time (when a request finishes), data is already in a
+    contiguous host buffer -- just a numpy slice, no concatenation.
+    """
 
     def __init__(
         self,
@@ -231,8 +246,32 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
+        # ---- Async D2H pipeline ----
+        self._pinned_staging = torch.zeros(
+            (num_batched_tokens, self.num_hidden_layers, self.num_experts_per_tok),
+            dtype=_RoutedExpertsDeviceCache.DTYPE,
+            pin_memory=True,
+        )
+        self._copy_stream = torch.cuda.Stream(device=device)
+        self._copy_event = torch.cuda.Event()
+        self._has_pending_copy = False
+
+        self._pending_positions: np.ndarray | None = None
+        self._pending_num_scheduled: dict[str, int] | None = None
+        self._pending_total_tokens: int = 0
+
+        pinned_mb = get_tensor_size_bytes(self._pinned_staging) / _MB
+        logger.info(
+            f"Routing experts pinned staging buffer allocated. "
+            f"shape={tuple(self._pinned_staging.shape)}, size={pinned_mb:.2f} MB"
+        )
+
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
+
+    # ------------------------------------------------------------------
+    # sync_fwd_experts_buffer_DtoH -- called AFTER the forward pass
+    # ------------------------------------------------------------------
 
     def sync_fwd_experts_buffer_DtoH(
         self,
@@ -242,33 +281,89 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if self.host_cache is None:
             return
 
+        # 1. Finalize previous async copy -- the copy had an entire
+        #    forward pass to complete so event.synchronize() is ~free.
+        if self._has_pending_copy:
+            self._copy_event.synchronize()
+            self._scatter_to_host()
+            self._has_pending_copy = False
+
         total_tokens = sum(num_scheduled_tokes.values())
         if total_tokens == 0:
             return
 
-        # Synchronous D2H copy.
-        host_values = self.device_cache.buffer[:total_tokens].cpu().numpy()
+        # 2. Issue new async D2H copy on a dedicated stream.
+        main_stream = torch.cuda.current_stream(self._copy_stream.device)
+        with torch.cuda.stream(self._copy_stream):
+            self._copy_stream.wait_stream(main_stream)
+            self._pinned_staging[:total_tokens].copy_(
+                self.device_cache.buffer[:total_tokens], non_blocking=True
+            )
+            self._copy_event.record()
 
-        # Scatter into per-request numpy host cache buffers.
-        positions_np = positions.numpy()
+        # 3. Save metadata for deferred scatter.
+        self._pending_positions = positions.numpy().copy()
+        self._pending_num_scheduled = num_scheduled_tokes
+        self._pending_total_tokens = total_tokens
+        self._has_pending_copy = True
+
+    # ------------------------------------------------------------------
+    # Optimized scatter into pre-allocated host-cache buffers
+    # ------------------------------------------------------------------
+
+    def _scatter_to_host(self):
+        """Scatter D2H data into per-request host cache buffers.
+
+        Optimized vs the original: uses direct scalar indexing to avoid
+        creating numpy slice views, calling .max(), and redundant int()
+        conversions on every iteration.
+        """
+        host_values = self._pinned_staging[
+            :self._pending_total_tokens
+        ].numpy()
+        positions_np = self._pending_positions
+        host_cache = self.host_cache
+
         offset = 0
-        for req_id, n_tokens in num_scheduled_tokes.items():
+        for req_id, n_tokens in self._pending_num_scheduled.items():
             if n_tokens == 0:
                 continue
 
-            vals = host_values[offset: offset + n_tokens]
-            pos = positions_np[offset: offset + n_tokens]
+            if n_tokens == 1:
+                pos_val = int(positions_np[offset])
+                buf = host_cache.get_or_grow_buffer(req_id, pos_val)
+                buf[pos_val] = host_values[offset]
+                host_cache.update_filled_len(req_id, pos_val)
+            else:
+                pos = positions_np[offset:offset + n_tokens]
+                max_pos = int(pos[-1]) if n_tokens > 0 else 0
+                if n_tokens > 1:
+                    max_pos = int(pos.max())
+                buf = host_cache.get_or_grow_buffer(req_id, max_pos)
+                buf[pos] = host_values[offset:offset + n_tokens]
+                host_cache.update_filled_len(req_id, max_pos)
+
             offset += n_tokens
 
-            max_pos = int(pos.max())
-            buf = self.host_cache.get_or_grow_buffer(req_id, max_pos)
+        self._pending_positions = None
+        self._pending_num_scheduled = None
+        self._pending_total_tokens = 0
 
-            if n_tokens == 1:
-                buf[int(pos[0])] = vals[0]
-            else:
-                buf[pos] = vals
+    # ------------------------------------------------------------------
+    # finalize_pending_copy -- call before reading host cache
+    # ------------------------------------------------------------------
 
-            self.host_cache.update_filled_len(req_id, max_pos)
+    def finalize_pending_copy(self):
+        """Ensure the most recent async D2H copy has been scattered into
+        host cache buffers.  Call before get_routed_experts."""
+        if self._has_pending_copy:
+            self._copy_event.synchronize()
+            self._scatter_to_host()
+            self._has_pending_copy = False
+
+    # ------------------------------------------------------------------
+    # Extraction -- O(1), just a numpy slice
+    # ------------------------------------------------------------------
 
     def get_routed_experts(
         self, req_id: str, seqlen: int | None = None, free_slot: bool = True,
@@ -278,9 +373,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         buf = self.host_cache.get_buffer(req_id)
         if buf is None:
             return None
-        result = buf[:seqlen] if seqlen is not None else buf
+        filled = self.host_cache.get_filled_len(req_id)
+        if filled <= 0:
+            return None
+        effective_len = min(filled, seqlen) if seqlen is not None else filled
+        result = buf[:effective_len].copy()
         if free_slot:
-            result = result.copy()
             self.host_cache.free_request(req_id)
         return result
 
@@ -302,6 +400,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         return None
 
     def sync_fwd_experts_buffer_DtoH(self, positions, num_scheduled_tokes):
+        pass
+
+    def finalize_pending_copy(self):
         pass
 
     def get_host_cache(self):

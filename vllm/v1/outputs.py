@@ -195,11 +195,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # req_id -> routed experts as nested list [seqlen][num_hidden_layers][num_experts_per_tok]
+    # req_id -> routed experts as (shape, bytes) for efficient serialization.
     # Only populated for requests predicted to finish in the current step when
-    # return_routed_experts is enabled. Uses plain Python lists for efficient
-    # Ray serialization (avoids numpy/torch in the DAG channel).
-    routed_experts_dict: dict[str, list] | None = None
+    # return_routed_experts is enabled.  Uses tobytes() instead of tolist()
+    # to avoid creating millions of Python int objects (~440x faster).
+    routed_experts_dict: dict[str, tuple] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

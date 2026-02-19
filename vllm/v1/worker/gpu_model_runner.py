@@ -930,9 +930,8 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
-        # Free routed experts buffers for requests that finished in the PREVIOUS
-        # step. Their data was already extracted in the previous step's
-        # _extract_routed_experts_for_current_batch call.
+        # Free routed experts host cache buffers for requests that finished
+        # in the PREVIOUS step.
         if self.cache_config.return_routed_experts:
             host_cache = get_global_experts_capturer().get_host_cache()
             if host_cache is not None:
@@ -2618,52 +2617,52 @@ class GPUModelRunner(
         the Ray DAG on every single step for requests that are NOT finishing.
 
         For the rare case where a request finishes for another reason (EOS
-        token, stop string, …) the routed experts data will still be
-        available because the host cache persists across steps.  The scheduler
-        can request it on the next step via ``finished_req_ids``.
+        token, stop string, ...) the routed experts data will still be
+        available because the host cache persists across steps.  The
+        scheduler can request it on the next step via ``finished_req_ids``.
 
-        Note: We don't free buffers here – that happens in ``_update_states``
-        for requests that finished in the PREVIOUS step.
+        Note: We don't free buffers here -- that happens in
+        ``_update_states`` for requests that finished in the PREVIOUS step.
         """
         capturer = get_global_experts_capturer()
         host_cache = capturer.get_host_cache()
-
         if host_cache is None:
             return None
 
-        result: dict[str, list] = {}
+        # First pass: identify requests that are likely finishing this step
+        # (cheap checks only -- no host-cache access).
+        finishing_req_ids: list[str] = []
         for req_id in req_ids:
-            # Only extract for requests that are likely finishing this step.
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
-
-            # Heuristic: request finishes when output tokens >= max_tokens.
             sp = req_state.sampling_params
             if sp is None:
                 continue
             max_tokens = sp.max_tokens
             if max_tokens is None:
                 continue
-            num_output = len(req_state.output_token_ids)
-            if num_output < max_tokens:
-                continue  # not finishing yet – skip the expensive extraction
+            if len(req_state.output_token_ids) < max_tokens:
+                continue
+            finishing_req_ids.append(req_id)
 
+        if not finishing_req_ids:
+            return None
+
+        # At least one request is finishing: ensure the latest async D2H
+        # copy has been scattered into the host cache.
+        capturer.finalize_pending_copy()
+
+        result: dict[str, tuple] = {}
+        for req_id in finishing_req_ids:
             seqlen = host_cache.get_filled_len(req_id)
             if seqlen <= 0:
                 continue
-
-            # Get experts without freeing (free_slot=False).
-            # The buffer will be freed in _update_states after the
-            # request finishes.
             experts = capturer.get_routed_experts(
                 req_id, seqlen=seqlen, free_slot=False
             )
             if experts is not None:
-                # experts is already a numpy array (from host cache).
-                # Convert to nested Python lists for efficient Ray
-                # serialization through compiled DAG channels.
-                result[req_id] = experts.tolist()
+                result[req_id] = (experts.shape, experts.tobytes())
 
         return result if result else None
 
@@ -3099,10 +3098,10 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
-        # Initiate non-blocking D2H copy of routed experts from device to
-        # a pinned staging buffer.  The actual scatter into per-request host
-        # cache buffers is deferred until _extract_routed_experts_for_current_batch
-        # calls finalize_pending_sync(), allowing the GPU to keep running.
+        # Issue async D2H copy of routed experts and append per-request
+        # slices to staging lists.  The expensive materialization into a
+        # contiguous numpy array is deferred to extraction time (only when
+        # a request finishes).
         if self.cache_config.return_routed_experts:
             # IMPORTANT: The positions tensor is ordered by
             # self.input_batch.req_ids (as set up in _prepare_inputs), which

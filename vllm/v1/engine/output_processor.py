@@ -649,6 +649,11 @@ class OutputProcessor:
 
             # 4) Create and handle RequestOutput objects.
             routed_experts = engine_core_output.routed_experts
+            if routed_experts is not None:
+                shape, data = routed_experts
+                routed_experts = np.frombuffer(
+                    data, dtype=np.int16
+                ).copy().reshape(shape)
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,

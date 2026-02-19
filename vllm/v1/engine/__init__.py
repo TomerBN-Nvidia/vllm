@@ -156,9 +156,9 @@ class EngineCoreOutput(
     num_nans_in_logits: int = 0
 
     # Routed experts for finished requests (only set when finished).
-    # Nested list: [seqlen][num_hidden_layers][num_experts_per_tok]
-    # Uses plain Python lists for efficient msgspec/Ray serialization.
-    routed_experts: list | None = None
+    # Encoded as (shape_tuple, raw_bytes) for efficient serialization.
+    # Reconstructed to numpy array in the output processor.
+    routed_experts: tuple | None = None
 
     @property
     def finished(self) -> bool:
