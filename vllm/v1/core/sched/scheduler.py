@@ -250,20 +250,6 @@ class Scheduler(SchedulerInterface):
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
-            self.routed_experts_reader = RoutedExpertsReader.create()
-
-            assert len(kv_cache_config.kv_cache_groups) > 0, (
-                "enable_return_routed_experts requires at least one kv cache group"
-            )
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // len(kv_cache_config.kv_cache_groups) + 1
-            ) * self.block_size
-
-            self.routed_experts_reader.attach_buffer(
-                max_num_kv_tokens=self.max_num_kv_tokens,
-                vllm_config=self.vllm_config,
-            )
-
         self._pause_state: PauseState = PauseState.UNPAUSED
 
     def _mamba_block_aligned_split(

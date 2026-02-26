@@ -245,6 +245,42 @@ Each active request: `seq_len * layers * experts_per_tok * 2 bytes`
 
 ---
 
+## Bug Fixes
+
+### Bug Fix 1: Stale Routing Data for Prefill Tokens (CUDA Graph Double-Init)
+
+**Symptom**: The first several tokens (prompt/prefill tokens) in every request had routing data `[0, 1, 2, ..., 21]` for the last few MoE layers -- a sequential pattern matching `arange(num_experts_per_tok)` rather than real routing decisions. Decode tokens were correct.
+
+**Root Cause**: `init_routed_experts_capturer()` was called inside `_capture_cudagraphs()` in `gpu_model_runner.py`. This method is invoked **twice** during startup -- once for PIECEWISE mode (mixed prefill-decode) and once for FULL mode (pure decode). Each call created a **new** global capturer with a **new** device buffer, replacing the previous one.
+
+The sequence:
+1. PIECEWISE capture → capturer #1 created, device buffer A allocated → CUDA graphs record `copy_()` ops writing to buffer A
+2. FULL capture → capturer #2 created, device buffer B allocated → CUDA graphs record `copy_()` ops writing to buffer B → global capturer replaced with #2
+3. During inference: PIECEWISE graphs (used for prefill) replay writes to **dead buffer A**; FULL graphs (used for decode) write to **live buffer B**; `sync_fwd_experts_buffer_DtoH` reads from buffer B
+
+Result: prefill tokens got stale warmup data (`[0,1,...,21]` from dummy zero-input forward passes during graph warmup), while decode tokens got correct routing.
+
+**Fix** (`gpu_model_runner.py`):
+- Moved `self.init_routed_experts_capturer()` from inside `_capture_cudagraphs()` to `capture_model()`, called **once** before the CUDA graph capture loop. Both PIECEWISE and FULL graphs now write to the same device buffer.
+- Added a call in the early-return path when CUDA graphs are disabled (`CUDAGraphMode.NONE` / `enforce_eager=True`) to ensure the capturer is still initialized.
+
+### Bug Fix 2: Stale Routing Data After Request Preemption
+
+**Symptom**: If a request was preempted (evicted from running queue to free KV cache memory) and later resumed, the routing data could contain stale entries from the previous run.
+
+**Root Cause**: When the scheduler preempts a request, it resets `num_computed_tokens = 0` and frees KV cache blocks (the request will be re-prefilled from scratch). However, the routing host cache buffer and its `_filled_len` were **not cleared**. The `_filled_len` tracking uses `max(old, new)`, so if the first run reached position 500 (`_filled_len = 501`) and the resumed run only reached position 200, extraction would read `buf[:501]` including 301 rows of stale data from the first run.
+
+**Fix** (`gpu_model_runner.py`, `_update_states()`):
+- Added cleanup of host cache buffers for preempted requests using `scheduler_output.preempted_req_ids`, which is already populated by the scheduler. Calls `host_cache.free_request()` for each preempted request, clearing both the numpy buffer and `_filled_len`. Mirrors how KV cache blocks are freed on preemption.
+
+### DP > 1 / Multi-Node Analysis
+
+**Concern**: The implementation assumes "rank 0 sees all the data", which could break with DP > 1.
+
+**Finding**: The architecture already handles DP > 1 correctly. Each DP rank runs an independent `EngineCore` with its own `Scheduler`, `Executor`, and TP group. Requests are load-balanced across DP ranks at ingestion time and never migrate between engines. Within each DP group, TP rank 0 creates a real capturer (others get Noop), captures routing for its own requests, and returns data via its own `ModelRunnerOutput` to its own scheduler. With DP=16 TP=4: 16 real capturers (one per DP rank) + 48 noop capturers, all in separate processes with no interference.
+
+---
+
 ## Key Constraints to Remember
 
 1. **CUDA graphs freeze addresses**: `capture_fwd_routed_experts` MUST write at a fixed offset (0). Any attempt to use a dynamic `_write_offset` will silently produce stale data during graph replay.
@@ -261,12 +297,72 @@ Each active request: `seq_len * layers * experts_per_tok * 2 bytes`
 
 ## Potential Future Optimizations
 
-1. **Move scatter to C++**: The per-step Python scatter loop (~1ms for 256 requests) could be implemented as a small C++ extension to eliminate Python interpreter overhead. Expected improvement: 5-10x faster scatter.
+Ranked by expected impact:
 
-2. **Streaming/chunked extraction for very long sequences**: Instead of materializing the full array at finish time, stream routing data in chunks during the request lifetime.
+### Priority 1: C++ scatter loop (biggest per-step win)
 
-3. **Compression**: Routing decisions have low entropy (most tokens route to the same experts). Run-length encoding or dictionary coding could reduce memory by 5-10x.
+The per-step Python scatter loop in `_scatter_to_host` (~1ms for 256 requests) is the single largest remaining overhead. Each iteration does Python dict lookups + numpy scalar writes. Moving this to a C++ extension in `csrc/` would eliminate Python interpreter overhead entirely. Expected: ~0.1ms instead of ~1ms (10x improvement). Could use a simple function signature:
 
-4. **Async extraction in background thread**: Move the `finalize_pending_copy + get_routed_experts + tobytes` work to a background thread so it doesn't block the engine loop. The GIL limits this for Python-heavy work, but the numpy operations (copy, tobytes) release the GIL.
+```cpp
+void scatter_routing_data(
+    const int16_t* host_values,   // pinned staging buffer (flat)
+    const int64_t* positions,     // position per token
+    const int* req_offsets,       // CSR-style offsets per request
+    int16_t** req_buffers,        // per-request host cache pointers
+    int* req_buf_sizes,           // for bounds checking
+    int num_requests,
+    int layers,
+    int experts_per_tok
+);
+```
 
-5. **Configurable routing capture granularity**: Allow capturing routing data for only a subset of layers or only every Nth token to reduce memory and bandwidth.
+### Priority 2: Pre-allocate host cache buffers
+
+Currently `get_or_grow_buffer` starts small and doubles (~18 reallocations for a 256K sequence). Each reallocation copies the entire existing buffer. If the request's `max_tokens` is known at scheduling time (which it usually is), pre-allocate to that size in a single allocation. Eliminates all reallocation + copy overhead during the decode loop. Small code change in `_scatter_to_host` or at request arrival time.
+
+### Priority 3: Move extraction off the GPU worker's critical path
+
+`_extract_routed_experts_for_current_batch` (finalize + get_routed_experts + tobytes) runs inside `execute_model`, blocking the next decode step. Two options:
+
+- **Extract in the scheduler** (EngineCore process): Pass a raw host cache buffer reference (or memoryview) through Ray and let the scheduler do the slice + tobytes. Completely removes extraction from the GPU worker's step loop.
+
+- **Background thread in the worker**: The `.copy()` and `.tobytes()` are numpy operations that release the GIL, so a background thread could run them in parallel with the next step's Python bookkeeping. The `finalize_pending_copy()` event sync is also GIL-free.
+
+### Priority 4: Pass bytes all the way to the API response
+
+Currently the output processor reconstructs a numpy array from `(shape, bytes)` via `np.frombuffer().copy().reshape()`. This array eventually needs to be serialized to JSON for the API response, which may implicitly call `.tolist()` (creating millions of Python objects). Instead, pass the `(shape, bytes)` tuple all the way to `RequestOutput` and let the API layer base64-encode the bytes directly. Eliminates any accidental `.tolist()` at the JSON serialization boundary. The one adjustment needed: `RequestOutput.__init__` currently slices `routed_experts[:prompt_len + output_len]`, which would need to handle the bytes format.
+
+### Priority 5: Skip routing capture during prefill
+
+If the consumer only needs routing for output tokens (common for routing replay), skip capturing during prefill entirely. The `capture_fn` could check a flag or the scheduler could signal "prefill-only" steps. This cuts data size by `prompt_len / total_len` -- often 50%+ for long-context scenarios. Simple to implement: add a `self._capture_enabled` flag on the device cache and toggle it from the model runner.
+
+### Priority 6: Batch tobytes for simultaneously finishing requests
+
+When many requests finish at once (e.g., 24 in a burst), we call `.copy()` + `.tobytes()` 24 times sequentially. Instead, gather all finishing requests' buffer slices into one large concatenated array, call `.tobytes()` once, then split the bytes by size on the receiver side. One large memcpy is faster than many small ones due to DMA alignment and reduced Python call overhead.
+
+### Priority 7: Delta / RLE compression for long sequences
+
+Routing decisions have low entropy -- adjacent tokens often route to the same experts. For 256K sequences (440MB per request), compression could be very effective:
+
+- **Delta encoding**: Store differences between consecutive tokens' expert IDs. Most deltas are 0, which compresses well.
+- **Run-length encoding**: Collapse repeated routing patterns.
+- **9-bit packing**: Expert IDs fit in 9 bits (max 512 experts) but are stored as int16. Packing to 9 bits saves 44% (440MB → 250MB). Libraries like `sub-byte` or `bitstruct` (with C extensions) can do this. Best applied only at serialization time to avoid slowing the per-step scatter.
+
+Expected reduction: 3-10x for typical workloads. Higher effort due to custom encode/decode logic.
+
+### Priority 8: Configurable capture granularity
+
+Allow capturing routing data for only a subset of layers (e.g., every 4th MoE layer) or every Nth token. For analysis purposes, sampling 10 of 40 layers often suffices and gives 4x memory reduction with proportional bandwidth savings. Implement as a `capture_every_n_layers` config parameter on the capturer.
+
+### Summary Table
+
+| # | Optimization | Per-step impact | Memory impact | Effort |
+|---|---|---|---|---|
+| 1 | C++ scatter loop | ~1ms → ~0.1ms | None | Medium |
+| 2 | Pre-allocate buffers | Eliminates realloc stalls | None | Small |
+| 3 | Off-critical-path extraction | Removes extraction from step loop | None | Medium |
+| 4 | Bytes all the way through | Avoids API-layer tolist | None | Small |
+| 5 | Skip prefill capture | None (prefill already cheap) | 50%+ reduction | Small |
+| 6 | Batch tobytes | Minor serialization win | None | Small |
+| 7 | Delta/RLE/9-bit compression | None | 3-10x reduction | Large |
+| 8 | Configurable granularity | Proportional to skip ratio | Proportional | Small |

@@ -976,12 +976,16 @@ class GPUModelRunner(
             self.input_batch.remove_request(req_id)
 
         # Free routed experts host cache buffers for requests that finished
-        # in the PREVIOUS step.
+        # in the PREVIOUS step, and clear stale routing data for preempted
+        # requests (they will be re-prefilled from scratch).
         if self.cache_config.return_routed_experts:
             host_cache = get_global_experts_capturer().get_host_cache()
             if host_cache is not None:
                 for req_id in scheduler_output.finished_req_ids:
                     host_cache.free_request(req_id)
+                if scheduler_output.preempted_req_ids:
+                    for req_id in scheduler_output.preempted_req_ids:
+                        host_cache.free_request(req_id)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -5370,6 +5374,7 @@ class GPUModelRunner(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
+            self.init_routed_experts_capturer()
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
@@ -5396,6 +5401,13 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
+        # Initialize the routed experts capturer once before any CUDA graph
+        # capture.  Previously this was inside _capture_cudagraphs() which
+        # is called once per capture mode (PIECEWISE, FULL).  Creating the
+        # capturer twice replaces the device buffer: graphs captured in the
+        # first mode write to the old (dead) buffer while the active capturer
+        # reads from the new one, causing prefill tokens to have stale data.
+        self.init_routed_experts_capturer()
         with freeze_gc(), graph_capture(device=self.device):
             start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
@@ -5468,7 +5480,6 @@ class GPUModelRunner(
                     cudagraph_runtime_mode.name,
                 ),
             )
-        self.init_routed_experts_capturer()
         # We skip EPLB here since we don't want to record dummy metrics
         for batch_desc in batch_descriptors:
             num_tokens = batch_desc.num_tokens
