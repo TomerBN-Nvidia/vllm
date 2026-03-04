@@ -2662,15 +2662,9 @@ class GPUModelRunner(
     ) -> dict[str, np.ndarray] | None:
         """Extract routed experts for requests predicted to finish this step.
 
-        Only extracts data for requests that have generated enough output
-        tokens to hit their ``max_tokens`` limit (the most common finish
-        condition).  This avoids serialising megabytes of numpy data through
-        the Ray DAG on every single step for requests that are NOT finishing.
-
-        For the rare case where a request finishes for another reason (EOS
-        token, stop string, ...) the routed experts data will still be
-        available because the host cache persists across steps.  The
-        scheduler can request it on the next step via ``finished_req_ids``.
+        Checks all stop conditions the scheduler will check (max_tokens,
+        EOS token, stop tokens, max_model_len) so that every finished
+        request gets its routing data attached to the ModelRunnerOutput.
 
         Note: We don't free buffers here -- that happens in
         ``_update_states`` for requests that finished in the PREVIOUS step.
@@ -2680,8 +2674,6 @@ class GPUModelRunner(
         if host_cache is None:
             return None
 
-        # First pass: identify requests that are likely finishing this step
-        # (cheap checks only -- no host-cache access).
         finishing_req_ids: list[str] = []
         for req_id in req_ids:
             req_state = self.requests.get(req_id)
@@ -2690,12 +2682,39 @@ class GPUModelRunner(
             sp = req_state.sampling_params
             if sp is None:
                 continue
-            max_tokens = sp.max_tokens
-            if max_tokens is None:
+            output_ids = req_state.output_token_ids
+            if not output_ids:
                 continue
-            if len(req_state.output_token_ids) < max_tokens:
+            if len(output_ids) < sp.min_tokens:
                 continue
-            finishing_req_ids.append(req_id)
+
+            finishing = False
+            last_token = output_ids[-1]
+
+            # EOS token (mirrors check_stop: eos_token_id is None
+            # when ignore_eos=True, so this naturally respects that)
+            if last_token == sp.eos_token_id:
+                finishing = True
+
+            # Explicit stop token IDs
+            if not finishing and sp.stop_token_ids \
+                    and last_token in sp.stop_token_ids:
+                finishing = True
+
+            # max_tokens / max_model_len length cap
+            if not finishing:
+                if sp.max_tokens is not None \
+                        and len(output_ids) >= sp.max_tokens:
+                    finishing = True
+                else:
+                    req_idx = self.input_batch.req_id_to_index.get(req_id)
+                    if req_idx is not None:
+                        total = self.input_batch.num_tokens_no_spec[req_idx]
+                        if total >= self.max_model_len:
+                            finishing = True
+
+            if finishing:
+                finishing_req_ids.append(req_id)
 
         if not finishing_req_ids:
             return None
