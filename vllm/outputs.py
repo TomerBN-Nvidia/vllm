@@ -42,7 +42,7 @@ class CompletionOutput:
     token_ids: GenericSequence[int]
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
-    routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
+    routed_experts: np.ndarray | None = None  # [gen_len, layer_num, topk]
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
@@ -55,7 +55,8 @@ class CompletionOutput:
             f"CompletionOutput(index={self.index}, "
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
-            f"routed_experts={self.routed_experts}, "
+            f"routed_experts="
+            f"{self.routed_experts.shape if self.routed_experts is not None else None}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
@@ -121,7 +122,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
-        routed_experts: np.ndarray | None = None,
+        prompt_routed_experts: np.ndarray | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -142,23 +143,16 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
-        # routed_experts is passed through the output pipeline from workers
-        if routed_experts is not None:
-            logger.debug(f"routed_experts is set, length: {len(routed_experts)}")
-            self.routed_experts = routed_experts[: len(prompt_token_ids) + sum(len(output.token_ids) for output in outputs)]
-        else:
-            self.routed_experts = None
+        self.prompt_routed_experts = prompt_routed_experts
         
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
-        # routed_experts is only set for finished requests, so we just take
-        # the latest non-None value (they should be the same for the same request)
-        if next_output.routed_experts is not None:
-            self.routed_experts = next_output.routed_experts
-                
+        if next_output.prompt_routed_experts is not None:
+            self.prompt_routed_experts = next_output.prompt_routed_experts
+
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
                 if completion.index == next_completion.index:

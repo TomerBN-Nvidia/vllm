@@ -314,8 +314,15 @@ class RequestState:
                 finished,
             )
 
+        prompt_routed_experts = None
+        gen_routed_experts = None
+        if routed_experts is not None:
+            prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
+            prompt_routed_experts = routed_experts[:prompt_len]
+            gen_routed_experts = routed_experts[prompt_len:]
+
         output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason, routed_experts
+            new_token_ids, finish_reason, stop_reason, gen_routed_experts
         )
 
         if self.parent_req is None:
@@ -327,7 +334,8 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params, routed_experts
+            external_req_id, outputs, finished, kv_transfer_params,
+            prompt_routed_experts,
         )
 
     def _new_request_output(
@@ -336,7 +344,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
-        routed_experts: np.ndarray | None = None,
+        prompt_routed_experts: np.ndarray | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -372,7 +380,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
-            routed_experts=routed_experts,
+            prompt_routed_experts=prompt_routed_experts,
         )
 
     def _new_completion_output(
