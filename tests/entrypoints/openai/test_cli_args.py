@@ -247,6 +247,13 @@ def test_default_chat_template_kwargs_default_none(serve_parser):
     assert args.default_chat_template_kwargs is None
 
 
+def test_enable_moe_topk_indices_nemo_rl_block_store(serve_parser):
+    args = serve_parser.parse_args(
+        args=["--enable-moe-topk-indices-nemo-rl-block-store"]
+    )
+    assert args.enable_moe_topk_indices_nemo_rl_block_store is True
+
+
 def test_default_chat_template_kwargs_invalid_json(serve_parser):
     """Ensure invalid JSON raises an error"""
     with pytest.raises(SystemExit):

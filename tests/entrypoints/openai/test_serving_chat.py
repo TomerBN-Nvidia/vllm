@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 import pytest_asyncio
 from openai import OpenAI
@@ -527,6 +528,7 @@ class MockModelConfig:
     encoder_config = None
     generation_config: str = "auto"
     override_generation_config: dict[str, Any] = field(default_factory=dict)
+    enable_moe_topk_indices_nemo_rl_block_store: bool = False
     media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
     skip_tokenizer_init: bool = False
     is_encoder_decoder: bool = False
@@ -1040,6 +1042,141 @@ async def test_serving_chat_data_parallel_rank_extraction():
     # Verify that data_parallel_rank defaults to None
     assert "data_parallel_rank" in mock_engine.generate.call_args.kwargs
     assert mock_engine.generate.call_args.kwargs["data_parallel_rank"] is None
+
+
+@pytest.mark.asyncio
+async def test_serving_chat_returns_moe_topk_indices():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+    )
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id=req.request_id,
+            prompt="what is 1+1?",
+            prompt_token_ids=[1, 2],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="2",
+                    token_ids=[3],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    routed_experts=np.array([[[7, 8]]], dtype=np.int16),
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            prompt_routed_experts=np.array([[[1, 2]], [[3, 4]]], dtype=np.int16),
+        )
+
+    response = await serving_chat.chat_completion_full_generator(
+        request=req,
+        result_generator=result_generator(),
+        request_id="chatcmpl-test",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id=req.request_id),
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    assert response.prompt_moe_topk_indices == [[[1, 2]], [[3, 4]]]
+    assert response.choices[0].moe_topk_indices == [[[7, 8]]]
+
+
+@pytest.mark.asyncio
+async def test_serving_chat_stores_moe_topk_indices_in_block_store(monkeypatch):
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig(
+        enable_moe_topk_indices_nemo_rl_block_store=True
+    )
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+    )
+
+    class FakePutNumpy:
+        def __init__(self):
+            self.args = None
+
+        def remote(self, *args):
+            self.args = args
+            return "put-ref"
+
+    fake_put_numpy = FakePutNumpy()
+    serving_chat.block_store_instance_id = "nemo_rl.block_store.node.127.0.0.1"
+    serving_chat.block_store_instance = MagicMock()
+    serving_chat.block_store_instance.put_numpy = fake_put_numpy
+
+    ray = pytest.importorskip("ray")
+
+    monkeypatch.setattr(ray, "get", lambda ref: ref)
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id=req.request_id,
+            prompt="what is 1+1?",
+            prompt_token_ids=[1, 2],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="2",
+                    token_ids=[3],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    routed_experts=np.array([[[7, 8]]], dtype=np.int16),
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            prompt_routed_experts=np.array([[[1, 2]], [[3, 4]]], dtype=np.int16),
+        )
+
+    response = await serving_chat.chat_completion_full_generator(
+        request=req,
+        result_generator=result_generator(),
+        request_id="chatcmpl-test",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id=req.request_id),
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    block_cache_key = {
+        "instance_id": "nemo_rl.block_store.node.127.0.0.1",
+        "req_id": "test",
+        "key": "moe_topk_indices",
+    }
+    assert response.prompt_moe_topk_indices == {"block_cache_key": block_cache_key}
+    assert response.choices[0].moe_topk_indices == {
+        "block_cache_key": block_cache_key
+    }
+    assert fake_put_numpy.args is not None
+    assert fake_put_numpy.args[0] == "test"
+    assert fake_put_numpy.args[1] == "moe_topk_indices"
+    np.testing.assert_array_equal(
+        fake_put_numpy.args[2],
+        np.array([[[1, 2]], [[3, 4]], [[7, 8]]], dtype=np.int16),
+    )
 
 
 class TestServingChatWithHarmony:
