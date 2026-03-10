@@ -13,6 +13,7 @@ from openai import OpenAI
 
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config import MultiModalConfig
+from vllm.entrypoints.openai.chat_completion import serving as chat_serving_module
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1177,6 +1178,56 @@ async def test_serving_chat_stores_moe_topk_indices_in_block_store(monkeypatch):
         fake_put_numpy.args[2],
         np.array([[[1, 2]], [[3, 4]], [[7, 8]]], dtype=np.int16),
     )
+
+
+def test_normalize_moe_topk_indices_warns_on_nested_lists(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        chat_serving_module.logger,
+        "warning_once",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    routed_experts = [[[1, 2]], [[3, 4]]]
+    normalized = OpenAIServingChat._normalize_moe_topk_indices_array(
+        routed_experts,
+        expected_len=2,
+        field_name="prompt_routed_experts",
+    )
+
+    np.testing.assert_array_equal(
+        normalized,
+        np.array([[[1, 2]], [[3, 4]]], dtype=np.int16),
+    )
+    assert warnings == [
+        "prompt_routed_experts uses nested Python lists for MoE top-k indices; "
+        "list[np.ndarray] is preferred."
+    ]
+
+
+def test_normalize_moe_topk_indices_warns_on_other_types(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        chat_serving_module.logger,
+        "warning_once",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    routed_experts = (((1, 2),),)
+    normalized = OpenAIServingChat._normalize_moe_topk_indices_array(
+        routed_experts,
+        expected_len=1,
+        field_name="routed_experts",
+    )
+
+    np.testing.assert_array_equal(
+        normalized,
+        np.array([[[1, 2]]], dtype=np.int16),
+    )
+    assert warnings == [
+        "routed_experts has MoE top-k indices type tuple; expected np.ndarray or "
+        "list[np.ndarray]. Attempting numpy conversion."
+    ]
 
 
 class TestServingChatWithHarmony:

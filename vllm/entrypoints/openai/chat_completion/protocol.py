@@ -81,7 +81,8 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
-MoETopKIndices = dict[str, Any] | list[str] | list[list[list[int]]] | None
+MoETopKIndices = list[Any] | list[list[list[int]]] | None
+MoETopKIndicesPayload = dict[str, Any] | MoETopKIndices
 
 
 class ChatCompletionResponseChoice(OpenAIBaseModel):
@@ -95,7 +96,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
-    moe_topk_indices: MoETopKIndices = None
+    moe_topk_indices: MoETopKIndicesPayload = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -114,7 +115,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
-    prompt_moe_topk_indices: MoETopKIndices = None
+    prompt_moe_topk_indices: MoETopKIndicesPayload = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

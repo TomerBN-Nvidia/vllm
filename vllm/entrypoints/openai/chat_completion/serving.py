@@ -35,6 +35,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    MoETopKIndices,
+    MoETopKIndicesPayload,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -1834,7 +1836,7 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request_id: str,
         routed_experts: Any,
-    ) -> dict[str, Any] | list[str] | list[list[list[int]]] | None:
+    ) -> MoETopKIndicesPayload:
         if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return {
                 "block_cache_key": self._get_moe_topk_indices_block_cache_key(
@@ -1882,10 +1884,37 @@ class OpenAIServingChat(OpenAIServing):
 
     @staticmethod
     def _normalize_moe_topk_indices_array(
-        routed_experts: Any, expected_len: int
+        routed_experts: Any,
+        expected_len: int,
+        field_name: str,
     ) -> np.ndarray | None:
         if routed_experts is None:
             return None
+
+        if isinstance(routed_experts, list):
+            if routed_experts and isinstance(routed_experts[0], list):
+                logger.warning_once(
+                    "%s uses nested Python lists for MoE top-k indices; "
+                    "list[np.ndarray] is preferred.",
+                    field_name,
+                )
+            elif routed_experts and not isinstance(routed_experts[0], np.ndarray):
+                elem_types = sorted(
+                    {type(item).__name__ for item in routed_experts}
+                )
+                logger.warning_once(
+                    "%s has MoE top-k indices list element types %s; expected "
+                    "list[np.ndarray]. Attempting numpy conversion.",
+                    field_name,
+                    elem_types,
+                )
+        elif not isinstance(routed_experts, np.ndarray):
+            logger.warning_once(
+                "%s has MoE top-k indices type %s; expected np.ndarray, "
+                "list[np.ndarray], or list[list]. Attempting numpy conversion.",
+                field_name,
+                type(routed_experts).__name__,
+            )
 
         routed_experts = np.asarray(routed_experts, dtype=np.int16)
         if routed_experts.ndim == 0:
@@ -1917,10 +1946,10 @@ class OpenAIServingChat(OpenAIServing):
             return
 
         prompt_array = self._normalize_moe_topk_indices_array(
-            prompt_routed_experts, num_prompt_tokens
+            prompt_routed_experts, num_prompt_tokens, "prompt_routed_experts"
         )
         completion_array = self._normalize_moe_topk_indices_array(
-            completion_routed_experts, num_completion_tokens
+            completion_routed_experts, num_completion_tokens, "routed_experts"
         )
         arrays = [
             array for array in (prompt_array, completion_array) if array is not None
