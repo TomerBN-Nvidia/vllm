@@ -96,7 +96,9 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
-    moe_topk_indices: MoETopKIndicesPayload = None
+    moe_topk_indices: MoETopKIndicesPayload = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -115,7 +117,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
-    prompt_moe_topk_indices: MoETopKIndicesPayload = None
+    prompt_moe_topk_indices: MoETopKIndicesPayload = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

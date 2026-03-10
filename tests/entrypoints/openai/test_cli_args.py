@@ -254,6 +254,22 @@ def test_enable_moe_topk_indices_nemo_rl_block_store(serve_parser):
     assert args.enable_moe_topk_indices_nemo_rl_block_store is True
 
 
+def test_enable_moe_topk_indices_json(serve_parser):
+    args = serve_parser.parse_args(args=["--enable-moe-topk-indices-json"])
+    assert args.enable_moe_topk_indices_json is True
+
+
+def test_moe_topk_indices_output_modes_are_mutually_exclusive(serve_parser):
+    args = serve_parser.parse_args(
+        args=[
+            "--enable-moe-topk-indices-nemo-rl-block-store",
+            "--enable-moe-topk-indices-json",
+        ]
+    )
+    with pytest.raises(TypeError):
+        validate_parsed_serve_args(args)
+
+
 def test_default_chat_template_kwargs_invalid_json(serve_parser):
     """Ensure invalid JSON raises an error"""
     with pytest.raises(SystemExit):

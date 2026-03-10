@@ -530,6 +530,7 @@ class MockModelConfig:
     generation_config: str = "auto"
     override_generation_config: dict[str, Any] = field(default_factory=dict)
     enable_moe_topk_indices_nemo_rl_block_store: bool = False
+    enable_moe_topk_indices_json: bool = False
     media_io_kwargs: dict[str, dict[str, Any]] = field(default_factory=dict)
     skip_tokenizer_init: bool = False
     is_encoder_decoder: bool = False
@@ -1049,7 +1050,7 @@ async def test_serving_chat_data_parallel_rank_extraction():
 async def test_serving_chat_returns_moe_topk_indices():
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig()
+    mock_engine.model_config = MockModelConfig(enable_moe_topk_indices_json=True)
     mock_engine.input_processor = MagicMock()
     mock_engine.io_processor = MagicMock()
     mock_engine.renderer = _build_renderer(mock_engine.model_config)
@@ -1094,6 +1095,60 @@ async def test_serving_chat_returns_moe_topk_indices():
     assert isinstance(response, ChatCompletionResponse)
     assert response.prompt_moe_topk_indices == [[[1, 2]], [[3, 4]]]
     assert response.choices[0].moe_topk_indices == [[[7, 8]]]
+
+
+@pytest.mark.asyncio
+async def test_serving_chat_omits_moe_topk_indices_without_output_flags():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "what is 1+1?"}],
+    )
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id=req.request_id,
+            prompt="what is 1+1?",
+            prompt_token_ids=[1, 2],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="2",
+                    token_ids=[3],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    routed_experts=np.array([[[7, 8]]], dtype=np.int16),
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+            prompt_routed_experts=np.array([[[1, 2]], [[3, 4]]], dtype=np.int16),
+        )
+
+    response = await serving_chat.chat_completion_full_generator(
+        request=req,
+        result_generator=result_generator(),
+        request_id="chatcmpl-test",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id=req.request_id),
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    assert response.prompt_moe_topk_indices is None
+    assert response.choices[0].moe_topk_indices is None
+    response_dict = response.model_dump()
+    assert "prompt_moe_topk_indices" not in response_dict
+    assert "moe_topk_indices" not in response_dict["choices"][0]
 
 
 @pytest.mark.asyncio
@@ -1225,8 +1280,8 @@ def test_normalize_moe_topk_indices_warns_on_other_types(monkeypatch):
         np.array([[[1, 2]]], dtype=np.int16),
     )
     assert warnings == [
-        "routed_experts has MoE top-k indices type tuple; expected np.ndarray or "
-        "list[np.ndarray]. Attempting numpy conversion."
+        "routed_experts has MoE top-k indices type tuple; expected np.ndarray, "
+        "list[np.ndarray], or list[list]. Attempting numpy conversion."
     ]
 
 

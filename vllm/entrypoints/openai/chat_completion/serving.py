@@ -1428,6 +1428,8 @@ class OpenAIServingChat(OpenAIServing):
         block_store_enabled = (
             self.model_config.enable_moe_topk_indices_nemo_rl_block_store
         )
+        json_enabled = self.model_config.enable_moe_topk_indices_json
+        return_moe_topk_indices = block_store_enabled or json_enabled
         has_routed_experts = (
             final_res.prompt_routed_experts is not None
             or any(output.routed_experts is not None for output in final_res.outputs)
@@ -1438,8 +1440,12 @@ class OpenAIServingChat(OpenAIServing):
                 "--enable-moe-topk-indices-nemo-rl-block-store"
             )
 
-        prompt_moe_topk_indices = self._get_moe_topk_indices_payload(
-            request_id, final_res.prompt_routed_experts
+        prompt_moe_topk_indices = (
+            self._get_moe_topk_indices_payload(
+                request_id, final_res.prompt_routed_experts
+            )
+            if return_moe_topk_indices
+            else None
         )
 
         choices: list[ChatCompletionResponseChoice] = []
@@ -1456,8 +1462,10 @@ class OpenAIServingChat(OpenAIServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
             tool_call_info = None
-            completion_moe_topk_indices = self._get_moe_topk_indices_payload(
-                request_id, output.routed_experts
+            completion_moe_topk_indices = (
+                self._get_moe_topk_indices_payload(request_id, output.routed_experts)
+                if return_moe_topk_indices
+                else None
             )
 
             if request.logprobs and request.top_logprobs is not None:
@@ -1843,7 +1851,9 @@ class OpenAIServingChat(OpenAIServing):
                     request_id
                 ),
             }
-        return self._format_moe_topk_indices(routed_experts)
+        if self.model_config.enable_moe_topk_indices_json:
+            return self._format_moe_topk_indices(routed_experts)
+        return None
 
     def _get_moe_topk_indices_block_cache_key(
         self, request_id: str
