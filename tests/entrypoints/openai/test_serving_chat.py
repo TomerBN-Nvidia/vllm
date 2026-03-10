@@ -1177,6 +1177,7 @@ async def test_serving_chat_stores_moe_topk_indices_in_block_store(monkeypatch):
             return "put-ref"
 
     fake_put_numpy = FakePutNumpy()
+    serving_chat.block_store_instance_rank = 7
     serving_chat.block_store_instance_id = "nemo_rl.block_store.node.127.0.0.1"
     serving_chat.block_store_instance = MagicMock()
     serving_chat.block_store_instance.put_numpy = fake_put_numpy
@@ -1218,6 +1219,7 @@ async def test_serving_chat_stores_moe_topk_indices_in_block_store(monkeypatch):
 
     assert isinstance(response, ChatCompletionResponse)
     block_cache_key = {
+        "instance_rank": 7,
         "instance_id": "nemo_rl.block_store.node.127.0.0.1",
         "req_id": "test",
         "key": "moe_topk_indices",
@@ -1233,6 +1235,49 @@ async def test_serving_chat_stores_moe_topk_indices_in_block_store(monkeypatch):
         fake_put_numpy.args[2],
         np.array([[[1, 2]], [[3, 4]], [[7, 8]]], dtype=np.int16),
     )
+
+
+def test_block_store_cache_key_loads_instance_rank(monkeypatch):
+    ray = pytest.importorskip("ray")
+
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig(
+        enable_moe_topk_indices_nemo_rl_block_store=True
+    )
+    mock_engine.input_processor = MagicMock()
+    mock_engine.io_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(mock_engine)
+
+    class FakeGetRuntimeMetadata:
+        def remote(self):
+            return "metadata-ref"
+
+    fake_actor = MagicMock()
+    fake_actor.get_runtime_metadata = FakeGetRuntimeMetadata()
+
+    monkeypatch.setattr(
+        ray._private.services,
+        "get_node_ip_address",
+        lambda: "127.0.0.1",
+    )
+    monkeypatch.setattr(ray, "get_actor", lambda instance_id: fake_actor)
+    monkeypatch.setattr(ray, "get", lambda ref: {"instance_rank": 5})
+
+    block_cache_key = serving_chat._get_moe_topk_indices_block_cache_key(
+        "chatcmpl-test"
+    )
+
+    assert block_cache_key == {
+        "instance_rank": 5,
+        "instance_id": "nemo_rl.block_store.node.127.0.0.1",
+        "req_id": "test",
+        "key": "moe_topk_indices",
+    }
+    assert serving_chat.block_store_instance is fake_actor
+    assert serving_chat.block_store_instance_rank == 5
 
 
 def test_normalize_moe_topk_indices_warns_on_nested_lists(monkeypatch):

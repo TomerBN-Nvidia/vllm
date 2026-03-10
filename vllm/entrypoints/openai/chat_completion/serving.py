@@ -177,6 +177,7 @@ class OpenAIServingChat(OpenAIServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
+        self.block_store_instance_rank: int | None = None
         self.block_store_instance_id: str | None = None
         self.block_store_instance = None
 
@@ -1857,7 +1858,7 @@ class OpenAIServingChat(OpenAIServing):
 
     def _get_moe_topk_indices_block_cache_key(
         self, request_id: str
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return None
 
@@ -1874,11 +1875,16 @@ class OpenAIServingChat(OpenAIServing):
             instance_id = f"nemo_rl.block_store.node.{node_ip}"
             try:
                 self.block_store_instance = ray.get_actor(instance_id)
+                runtime_metadata = ray.get(
+                    self.block_store_instance.get_runtime_metadata.remote()
+                )
+                self.block_store_instance_rank = runtime_metadata["instance_rank"]
                 self.block_store_instance_id = instance_id
             except ValueError:
                 logger.warning_once(
                     "MoE top-k block store actor %s is not available.", instance_id
                 )
+                self.block_store_instance_rank = None
                 self.block_store_instance = None
                 self.block_store_instance_id = None
                 return None
@@ -1887,6 +1893,7 @@ class OpenAIServingChat(OpenAIServing):
             return None
 
         return {
+            "instance_rank": self.block_store_instance_rank,
             "instance_id": self.block_store_instance_id,
             "req_id": self._base_chat_request_id(request_id),
             "key": "moe_topk_indices",
