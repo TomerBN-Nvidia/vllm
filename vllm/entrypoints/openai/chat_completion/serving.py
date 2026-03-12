@@ -11,6 +11,7 @@ from typing import Any, Final
 import jinja2
 import numpy as np
 import partial_json_parser
+import ray
 import regex as re
 from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
@@ -1863,14 +1864,6 @@ class OpenAIServingChat(OpenAIServing):
             return None
 
         if self.block_store_instance is None:
-            try:
-                import ray
-            except ImportError:
-                logger.warning_once(
-                    "ray is not available; disabling MoE top-k block store output."
-                )
-                return None
-
             node_ip = ray._private.services.get_node_ip_address()
             instance_id = f"nemo_rl.block_store.node.{node_ip}"
             try:
@@ -1977,15 +1970,6 @@ class OpenAIServingChat(OpenAIServing):
         moe_topk_indices = (
             arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
         )
-
-        try:
-            import ray
-        except ImportError:
-            logger.warning_once(
-                "ray is not available; skipping MoE top-k block store upload."
-            )
-            return
-
         ray.get(
             self.block_store_instance.put_numpy.remote(
                 self._base_chat_request_id(request_id),
