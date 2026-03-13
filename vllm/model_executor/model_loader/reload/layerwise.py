@@ -133,7 +133,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             # there's no way to reach `load_numel_total` without loading all
             # necessary weights. `weight_shape` is very small, so this is safe.
             # see Limitations(4)
-            logger.debug("%s: Excessive loading", layer.__class__.__name__)
+            logger.info("%s: Excessive loading", layer.__class__.__name__)
             return
 
         # Bind and normalize arguments
@@ -145,7 +145,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
 
-        logger.debug(
+        logger.info(
             "%s: %d / %d",
             layer.__class__.__name__,
             info.load_numel,

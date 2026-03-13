@@ -20,10 +20,17 @@ def get_layer_tensors(layer: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 def get_layer_params_buffers(layer: torch.nn.Module) -> LayerTensors:
     """Get all parameters and buffers of a module as a tuple of dicts."""
-    return (
+    params, buffers = (
         {name: param for name, param in layer._parameters.items() if param is not None},
         {name: buffer for name, buffer in layer._buffers.items() if buffer is not None},
     )
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    if isinstance(layer, FusedMoE) and "e_score_correction_bias" in params:
+        del params["e_score_correction_bias"]
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    if isinstance(layer, MambaMixer2) and "conv_weights" in buffers:
+        del buffers["conv_weights"]
+    return params, buffers
 
 
 def get_layer_size(layer: torch.nn.Module) -> int:
