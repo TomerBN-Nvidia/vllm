@@ -1428,10 +1428,14 @@ class OpenAIServingChat(OpenAIServing):
         assert final_res is not None
 
         rl_metadata = None
-        if isinstancde(request.metadata, dict):
+        if isinstance(request.metadata, dict):
             rl_metadata = request.metadata.get("rl_metadata")
         if isinstance(rl_metadata, str):
             rl_metadata = json.loads(rl_metadata)
+        if rl_metadata is not None:
+            logger.debug(f"chat_completion_full_generator: rl metadata = {rl_metadata}")
+        else:
+            logger.debug("chat_completion_full_generator: no rl metadata")
 
         block_store_enabled = (
             self.model_config.enable_moe_topk_indices_nemo_rl_block_store
@@ -1995,6 +1999,7 @@ class OpenAIServingChat(OpenAIServing):
                 req_id,
                 "moe_topk_indices",
                 moe_topk_indices,
+                rl_metadata=rl_metadata,
             )
         )
 
