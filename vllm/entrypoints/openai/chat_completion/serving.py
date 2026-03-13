@@ -1427,6 +1427,12 @@ class OpenAIServingChat(OpenAIServing):
 
         assert final_res is not None
 
+        rl_metadata = None
+        if isinstancde(request.metadata, dict):
+            rl_metadata = request.metadata.get("rl_metadata")
+        if isinstance(rl_metadata, str):
+            rl_metadata = json.loads(rl_metadata)
+
         block_store_enabled = (
             self.model_config.enable_moe_topk_indices_nemo_rl_block_store
         )
@@ -1444,7 +1450,9 @@ class OpenAIServingChat(OpenAIServing):
 
         prompt_moe_topk_indices = (
             self._get_moe_topk_indices_payload(
-                request_id, final_res.prompt_routed_experts
+                request_id,
+                final_res.prompt_routed_experts,
+                rl_metadata=rl_metadata,
             )
             if return_moe_topk_indices
             else None
@@ -1465,7 +1473,11 @@ class OpenAIServingChat(OpenAIServing):
             out_logprobs = output.logprobs
             tool_call_info = None
             completion_moe_topk_indices = (
-                self._get_moe_topk_indices_payload(request_id, output.routed_experts)
+                self._get_moe_topk_indices_payload(
+                    request_id,
+                    output.routed_experts,
+                    rl_metadata=rl_metadata,
+                )
                 if return_moe_topk_indices
                 else None
             )
@@ -1768,6 +1780,7 @@ class OpenAIServingChat(OpenAIServing):
                 completion_routed_experts=final_res.outputs[0].routed_experts,
                 num_prompt_tokens=len(final_res.prompt_token_ids),
                 num_completion_tokens=len(final_res.outputs[0].token_ids),
+                rl_metadata=rl_metadata,
             )
 
         num_prompt_tokens = len(final_res.prompt_token_ids)
@@ -1846,11 +1859,13 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request_id: str,
         routed_experts: Any,
+        rl_metadata: dict[str, Any] | None = None,
     ) -> MoETopKIndicesPayload:
         if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return {
                 "block_cache_key": self._get_moe_topk_indices_block_cache_key(
-                    request_id
+                    request_id,
+                    rl_metadata=rl_metadata,
                 ),
             }
         if self.model_config.enable_moe_topk_indices_json:
@@ -1858,7 +1873,9 @@ class OpenAIServingChat(OpenAIServing):
         return None
 
     def _get_moe_topk_indices_block_cache_key(
-        self, request_id: str
+        self,
+        request_id: str,
+        rl_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return None
@@ -1885,10 +1902,11 @@ class OpenAIServingChat(OpenAIServing):
         if self.block_store_instance_id is None:
             return None
 
+        req_id = self._base_chat_request_id(request_id)
         return {
             "instance_rank": self.block_store_instance_rank,
             "instance_id": self.block_store_instance_id,
-            "req_id": self._base_chat_request_id(request_id),
+            "req_id": req_id,
             "key": "moe_topk_indices",
         }
 
@@ -1951,6 +1969,7 @@ class OpenAIServingChat(OpenAIServing):
         completion_routed_experts: Any,
         num_prompt_tokens: int,
         num_completion_tokens: int,
+        rl_metadata: dict[str, Any] | None = None,
     ) -> None:
         if self.block_store_instance is None:
             return
@@ -1970,9 +1989,10 @@ class OpenAIServingChat(OpenAIServing):
         moe_topk_indices = (
             arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
         )
+        req_id = self._base_chat_request_id(request_id)
         ray.get(
             self.block_store_instance.put_numpy.remote(
-                self._base_chat_request_id(request_id),
+                req_id,
                 "moe_topk_indices",
                 moe_topk_indices,
             )

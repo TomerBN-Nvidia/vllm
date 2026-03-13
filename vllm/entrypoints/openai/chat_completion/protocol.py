@@ -12,6 +12,7 @@ from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
+from openai.types.shared import Metadata
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
@@ -172,6 +173,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "the max_completion_tokens field",
     )
     max_completion_tokens: int | None = None
+    metadata: Metadata | None = None
     n: int | None = 1
     presence_penalty: float | None = 0.0
     response_format: AnyResponseFormat | None = None
