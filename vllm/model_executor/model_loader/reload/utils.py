@@ -27,6 +27,8 @@ def get_layer_params_buffers(layer: torch.nn.Module) -> LayerTensors:
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
     if isinstance(layer, FusedMoE) and "e_score_correction_bias" in params:
         del params["e_score_correction_bias"]
+    if isinstance(layer, FusedMoE) and "_expert_map" in buffers:
+        del buffers["_expert_map"]
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
     if isinstance(layer, MambaMixer2) and "conv_weights" in buffers:
         del buffers["conv_weights"]
