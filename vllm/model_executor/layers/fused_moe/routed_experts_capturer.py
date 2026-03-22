@@ -571,7 +571,9 @@ def bind_routing_capture_to_model(model) -> None:
     bound = 0
     for module in model.modules():
         if isinstance(module, FusedMoE):
-            module.router.set_capture_buffer(buffer, module.moe_layer_id)
+            layer_id = module.moe_layer_id
+            module.router.set_capture_buffer(buffer, layer_id)
+            module._routing_replay_out = buffer[layer_id]  # (N_max, K)
             bound += 1
 
     logger.info(
