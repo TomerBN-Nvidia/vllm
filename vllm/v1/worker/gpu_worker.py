@@ -224,16 +224,16 @@ class Worker(WorkerBase):
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
-            # NCCL_ASYNC_ERROR_HANDLING enables detection of NCCL failures
+            # TORCH_NCCL_ASYNC_ERROR_HANDLING enables detection of NCCL failures
             # (hangs, timeouts, connection errors). Previously removed because
             # "it causes exceptions with graph building" — but without it,
             # NCCL errors go completely undetected, causing silent hangs.
             #
             # Set VLLM_DISABLE_NCCL_ASYNC_ERROR=1 to restore old behavior.
             if os.environ.get("VLLM_DISABLE_NCCL_ASYNC_ERROR") == "1":
-                os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+                os.environ.pop("TORCH_NCCL_ASYNC_ERROR_HANDLING", None)
             else:
-                os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+                os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
@@ -879,6 +879,14 @@ class Worker(WorkerBase):
 
     def get_load_progress(self) -> tuple[int, int]:
         """Return current weight loading progress (loaded, total)."""
+        if self._load_state == 'loading':
+            try:
+                from vllm.model_executor.model_loader.default_loader import get_current_load_progress
+                progress = get_current_load_progress()
+                if progress != (0, 0):
+                    return progress
+            except ImportError:
+                pass
         return self._load_progress
 
     def save_sharded_state(
