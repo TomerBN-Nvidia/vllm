@@ -148,10 +148,6 @@ class Worker(WorkerBase):
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
-        # Load progress tracking for health monitor
-        self._load_progress: tuple[int, int] = (0, 0)  # (loaded, total)
-        self._load_state: str = "idle"  # idle, loading, loaded, failed
-
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
@@ -877,17 +873,7 @@ class Worker(WorkerBase):
             # NCCL probe is best-effort during health check
             pass
 
-    def get_load_progress(self) -> tuple[int, int]:
-        """Return current weight loading progress (loaded, total)."""
-        if self._load_state == 'loading':
-            try:
-                from vllm.model_executor.model_loader.default_loader import get_current_load_progress
-                progress = get_current_load_progress()
-                if progress != (0, 0):
-                    return progress
-            except ImportError:
-                pass
-        return self._load_progress
+
 
     def save_sharded_state(
         self,

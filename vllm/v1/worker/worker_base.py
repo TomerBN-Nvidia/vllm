@@ -100,9 +100,6 @@ class WorkerBase:
         Raise an exception if the worker is unhealthy."""
         return  # base implementation assumes healthy
 
-    def get_load_progress(self) -> tuple[int, int]:
-        """Return (loaded_items, total_items). Override in subclass."""
-        return (0, 0)
 
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device

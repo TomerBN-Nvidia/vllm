@@ -14,7 +14,6 @@ import cloudpickle
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.v1.executor.health_monitor import LoadProgressMonitor
 from vllm.v1.executor.orphan_cleanup import cleanup_orphaned_gpu_workers
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
@@ -50,7 +49,6 @@ COMPLETED_NONE_FUTURE.set_result(None)
 
 # Configurable timeouts (seconds). Set to 0 or negative to disable.
 VLLM_RPC_TIMEOUT = int(os.environ.get("VLLM_RPC_TIMEOUT", "300"))
-VLLM_LOAD_STALL_TIMEOUT = int(os.environ.get("VLLM_LOAD_STALL_TIMEOUT", "120"))
 
 
 @dataclass
@@ -420,23 +418,17 @@ class RayDistributedExecutor(Executor):
                 self.shutdown()
                 raise
 
-            # load_model with progress-based stall detection
-            load_monitor = None
-            if VLLM_LOAD_STALL_TIMEOUT > 0:
-                load_monitor = LoadProgressMonitor(
-                    workers=self.workers,
-                    stall_timeout=VLLM_LOAD_STALL_TIMEOUT,
-                )
-                load_monitor.start()
+            # load_model with timeout
+            load_timeout = int(os.environ.get("VLLM_MODEL_LOAD_TIMEOUT", "600"))
             try:
-                self.collective_rpc("load_model", timeout=None)
+                self.collective_rpc(
+                    "load_model",
+                    timeout=load_timeout if load_timeout > 0 else None,
+                )
             except Exception as e:
-                logger.error("load_model failed: %s", e)
+                logger.error("load_model failed or timed out: %s", e)
                 self.shutdown()
                 raise
-            finally:
-                if load_monitor is not None:
-                    load_monitor.stop()
 
         for pp_rank in range(self.parallel_config.pipeline_parallel_size):
             self.pp_tp_workers.append([])
@@ -563,8 +555,7 @@ class RayDistributedExecutor(Executor):
         if effective_timeout is None and VLLM_RPC_TIMEOUT > 0:
             # Only apply default timeout for non-load operations
             # (load_model passes timeout=None explicitly and uses progress monitor)
-            if isinstance(sent_method, str) and sent_method not in ("load_model",):
-                effective_timeout = VLLM_RPC_TIMEOUT
+            effective_timeout = VLLM_RPC_TIMEOUT
 
         try:
             return ray.get(ray_worker_outputs, timeout=effective_timeout)
