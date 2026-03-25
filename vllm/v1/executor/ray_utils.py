@@ -50,6 +50,21 @@ try:
             # that thread.
             self.compiled_dag_cuda_device_set = False
 
+        def __ray_check_health__(self):
+            """Called periodically by Ray to verify actor health.
+
+            If this method raises, Ray marks the actor as dead and any
+            pending/future RPCs raise RayActorError.
+            """
+            if self.worker is not None:
+                try:
+                    self.worker.check_health()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Ray worker health check failed: {e}"
+                    ) from e
+            # If worker is None, we're still initializing — that's ok
+
         def get_node_ip(self) -> str:
             return get_ip()
 

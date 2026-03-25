@@ -304,3 +304,12 @@ class DefaultModelLoader(BaseModelLoader):
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
+
+
+# Global progress state — written by weight loader, read by health monitor
+_current_load_progress: tuple[int, int] = (0, 0)
+
+
+def get_current_load_progress() -> tuple[int, int]:
+    """Get current weight loading progress (files_loaded, total_files)."""
+    return _current_load_progress

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
 import os
+import signal
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -12,6 +14,8 @@ import cloudpickle
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.executor.health_monitor import LoadProgressMonitor
+from vllm.v1.executor.orphan_cleanup import cleanup_orphaned_gpu_workers
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils.network_utils import (
@@ -43,6 +47,10 @@ logger = init_logger(__name__)
 
 COMPLETED_NONE_FUTURE: Future[ModelRunnerOutput | None] = Future()
 COMPLETED_NONE_FUTURE.set_result(None)
+
+# Configurable timeouts (seconds). Set to 0 or negative to disable.
+VLLM_RPC_TIMEOUT = int(os.environ.get("VLLM_RPC_TIMEOUT", "300"))
+VLLM_LOAD_STALL_TIMEOUT = int(os.environ.get("VLLM_LOAD_STALL_TIMEOUT", "120"))
 
 
 @dataclass
@@ -92,8 +100,25 @@ class RayDistributedExecutor(Executor):
         if ray_usage != "1":
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
+        # Clean up orphaned workers from previous runs
+        cleanup_orphaned_gpu_workers()
+
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
+
+        # Register shutdown handlers for clean teardown
+        atexit.register(self.shutdown)
+
+        def _signal_handler(signum, frame):
+            logger.info("Received signal %d, shutting down executor...", signum)
+            try:
+                self.shutdown()
+            except Exception:
+                pass
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        signal.signal(signal.SIGTERM, _signal_handler)
 
         # KV connector setup
         self.has_connector = self.vllm_config.kv_transfer_config is not None
@@ -384,8 +409,34 @@ class RayDistributedExecutor(Executor):
 
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
         if not is_eep_new_worker:
-            self.collective_rpc("init_device")
-            self.collective_rpc("load_model")
+            # init_device with timeout
+            try:
+                self.collective_rpc(
+                    "init_device",
+                    timeout=VLLM_RPC_TIMEOUT if VLLM_RPC_TIMEOUT > 0 else None,
+                )
+            except Exception as e:
+                logger.error("init_device failed or timed out: %s", e)
+                self.shutdown()
+                raise
+
+            # load_model with progress-based stall detection
+            load_monitor = None
+            if VLLM_LOAD_STALL_TIMEOUT > 0:
+                load_monitor = LoadProgressMonitor(
+                    workers=self.workers,
+                    stall_timeout=VLLM_LOAD_STALL_TIMEOUT,
+                )
+                load_monitor.start()
+            try:
+                self.collective_rpc("load_model", timeout=None)
+            except Exception as e:
+                logger.error("load_model failed: %s", e)
+                self.shutdown()
+                raise
+            finally:
+                if load_monitor is not None:
+                    load_monitor.stop()
 
         for pp_rank in range(self.parallel_config.pipeline_parallel_size):
             self.pp_tp_workers.append([])
@@ -507,7 +558,30 @@ class RayDistributedExecutor(Executor):
         if non_block:
             return FutureWrapper(ray_worker_outputs)
 
-        return ray.get(ray_worker_outputs, timeout=timeout)
+        # Apply default timeout if none specified
+        effective_timeout = timeout
+        if effective_timeout is None and VLLM_RPC_TIMEOUT > 0:
+            # Only apply default timeout for non-load operations
+            # (load_model passes timeout=None explicitly and uses progress monitor)
+            if isinstance(sent_method, str) and sent_method not in ("load_model",):
+                effective_timeout = VLLM_RPC_TIMEOUT
+
+        try:
+            return ray.get(ray_worker_outputs, timeout=effective_timeout)
+        except ray.exceptions.GetTimeoutError:
+            # Identify which workers are still running
+            ready, not_ready = ray.wait(ray_worker_outputs, timeout=0)
+            hung_ranks = [
+                i for i, ref in enumerate(ray_worker_outputs) if ref not in ready
+            ]
+            method_name = sent_method if isinstance(sent_method, str) else "<serialized>"
+            raise TimeoutError(
+                f"collective_rpc('{method_name}') timed out after "
+                f"{effective_timeout}s. Hung worker ranks: {hung_ranks}. "
+                f"This may indicate workers stalled due to Ray GCS overload, "
+                f"NCCL hang, or resource contention. "
+                f"Set VLLM_RPC_TIMEOUT to adjust (current: {VLLM_RPC_TIMEOUT}s)."
+            ) from None
 
     def _check_ray_cgraph_installation(self):
         import importlib.metadata
@@ -638,6 +712,11 @@ class RayDistributedExecutor(Executor):
         self.shutdown()
 
     def check_health(self) -> None:
-        # Assume that the Ray workers are healthy.
-        # TODO: check the health of the Ray workers
-        return
+        """Check health of all Ray workers. Raises on failure."""
+        timeout = int(os.environ.get("VLLM_HEALTH_CHECK_TIMEOUT", "60"))
+        try:
+            self.collective_rpc(
+                "check_health", timeout=timeout if timeout > 0 else None
+            )
+        except Exception as e:
+            raise RuntimeError(f"Health check failed: {e}") from e
