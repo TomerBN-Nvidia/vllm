@@ -705,6 +705,25 @@ class RayDistributedExecutor(Executor):
     def check_health(self) -> None:
         """Check health of all Ray workers. Raises on failure."""
         timeout = int(os.environ.get("VLLM_HEALTH_CHECK_TIMEOUT", "60"))
+
+        # First: check if Ray actors are still alive (catches killed workers)
+        for i, worker in enumerate(self.workers):
+            try:
+                ray.get(worker.get_node_ip.remote(), timeout=5)
+            except ray.exceptions.RayActorError as e:
+                raise RuntimeError(
+                    f"Health check failed: Ray worker {i} is dead. {e}"
+                ) from e
+            except ray.exceptions.GetTimeoutError:
+                raise RuntimeError(
+                    f"Health check failed: Ray worker {i} unresponsive (5s timeout)"
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Health check failed: Ray worker {i} error: {e}"
+                ) from e
+
+        # Second: run the actual health check on each worker
         try:
             self.collective_rpc(
                 "check_health", timeout=timeout if timeout > 0 else None
