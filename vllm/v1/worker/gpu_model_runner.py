@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    bind_routing_capture_to_model,
     get_global_experts_capturer,
 )
 from vllm.compilation.counter import compilation_counter
@@ -891,11 +892,11 @@ class GPUModelRunner(
         else:
             num_fused_shared_experts = 0
 
-        # Use the rank-aware initializer: only rank 0 creates a real capturer
-        # (with GPU device cache + host cache).  Non-rank-0 workers get a Noop
-        # capturer so they don't allocate buffers, run D2H copies, or add
-        # capture_fn overhead to the forward pass.  All TP ranks see the same
-        # routing decisions, so only rank 0 needs to capture.
+        # Use the rank-aware initializer: rank 0 gets a full capturer (GPU
+        # device cache + host cache + D2H pipeline).  Non-rank-0 workers get
+        # a device-only capturer (GPU buffer but no host cache or D2H) so
+        # that ALL ranks call the custom op identically, ensuring symmetric
+        # CUDA graph structure across TP ranks.
         tp_group = get_tp_group()
         init_routed_experts_capturer_with_shared_cache(
             enable=self.vllm_config.cache_config.return_routed_experts,
@@ -3921,6 +3922,58 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        score_only_req_ids = [
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if (
+                req_state := self.requests.get(req_id)
+            ) is not None
+            and req_state.sampling_params is not None
+            and req_state.sampling_params.score_only
+        ]
+        if score_only_req_ids:
+            assert len(score_only_req_ids) == len(scheduler_output.num_scheduled_tokens), (
+                "score_only requests must not share a batch with generation requests"
+            )
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
+            self.input_batch.prev_sampled_token_ids = None
+            self.input_batch.prev_req_id_to_index = {}
+
+            with record_function_or_nullcontext(
+                "gpu_model_runner: score_only_bookkeep"
+            ):
+                prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                    hidden_states[: scheduler_output.total_num_scheduled_tokens],
+                    scheduler_output.num_scheduled_tokens,
+                )
+
+            if self.speculative_config is not None:
+                self.clear_kv_connector_metadata()
+
+            with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                self.eplb_step()
+
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+            return ModelRunnerOutput(
+                req_ids=req_ids_output_copy,
+                req_id_to_index=req_id_to_index_output_copy,
+                sampled_token_ids=[[] for _ in req_ids_output_copy],
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output
+                if self.supports_mm_inputs
+                else None,
+                num_nans_in_logits=self._get_nans_in_logits(logits)
+                if envs.VLLM_COMPUTE_NANS_IN_LOGITS
+                else None,
+                cudagraph_stats=cudagraph_stats,
+            )
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4751,7 +4804,13 @@ class GPUModelRunner(
             start_idx = request.num_computed_tokens
             start_tok = start_idx + 1
             num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
+            score_only_request = bool(
+                request.sampling_params is not None
+                and request.sampling_params.score_only
+            )
+            if num_tokens < num_remaining_tokens or (
+                num_tokens == num_remaining_tokens and not score_only_request
+            ):
                 # This is a chunk, more tokens remain.
                 # In the == case, there are no more prompt logprobs to produce
                 # but we want to defer returning them to the next step where we
@@ -5498,6 +5557,7 @@ class GPUModelRunner(
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             self.init_routed_experts_capturer()
+            bind_routing_capture_to_model(self.model)
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
@@ -5531,6 +5591,7 @@ class GPUModelRunner(
         # first mode write to the old (dead) buffer while the active capturer
         # reads from the new one, causing prefill tokens to have stale data.
         self.init_routed_experts_capturer()
+        bind_routing_capture_to_model(self.model)
         with freeze_gc(), graph_capture(device=self.device):
             start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 

@@ -326,16 +326,29 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        score_only_batch: bool | None = None
 
         # For logging.
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
 
+        def matches_score_only_batch(request: Request) -> bool:
+            return score_only_batch is None or request.score_only == score_only_batch
+
+        def set_score_only_batch(request: Request) -> None:
+            nonlocal score_only_batch
+            if score_only_batch is None:
+                score_only_batch = request.score_only
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if not matches_score_only_batch(request):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -439,6 +452,8 @@ class Scheduler(SchedulerInterface):
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
+                            if not num_scheduled_tokens:
+                                score_only_batch = None
                             if preempted_encoder_inputs:
                                 # Restore encoder compute budget if the preempted
                                 # request had encoder inputs scheduled in this step.
@@ -463,6 +478,7 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            set_score_only_batch(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -571,6 +587,11 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                if not matches_score_only_batch(request):
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -763,6 +784,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
+                set_score_only_batch(request)
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
@@ -1336,6 +1358,15 @@ class Scheduler(SchedulerInterface):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
+            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            has_prompt_logprobs = req_id in prompt_logprobs_dict
+            score_only_request = bool(
+                request.score_only
+                or (
+                    request.sampling_params is not None
+                    and request.sampling_params.score_only
+                )
+            )
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -1347,6 +1378,17 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            if score_only_request:
+                assert not new_token_ids, (
+                    "score_only requests must not generate new tokens"
+                )
+                if has_prompt_logprobs or request.num_computed_tokens >= (
+                    request.num_tokens + request.num_output_placeholders
+                ):
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                    stopped = True
+
+            routed_experts = None
             finish_reason = None
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -1384,8 +1426,6 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
-            # Get prompt logprobs for this request.
-            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
                 new_token_ids
                 or pooler_output is not None

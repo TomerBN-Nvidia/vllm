@@ -48,6 +48,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
+    log_quant_method_call,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -180,6 +181,7 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         return False
 
+    @log_quant_method_call
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -721,6 +723,8 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
+
     """MoE method for ModelOpt FP8.
     Supports loading FP8 checkpoints with static weight scale and
     activation scale.
@@ -932,6 +936,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -948,6 +953,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
+            routing_replay_out=routing_replay_out,
         )
 
     def apply(
@@ -1182,6 +1188,8 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
 
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
+
     """
     MoE Method for FP4 Quantization.
     Args:
@@ -1415,6 +1423,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -1431,6 +1440,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
+            routing_replay_out=routing_replay_out,
         )
 
     def apply(
@@ -1636,10 +1646,12 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
-        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
-        layer.weight_scale = Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
-        )
+        if hasattr(layer, "weight_scale_for_apply"):
+            layer.weight_scale_for_apply.copy_(weight_scale_swizzled.contiguous())
+        else:
+            layer.weight_scale_for_apply = torch.nn.Parameter(
+                weight_scale_swizzled.contiguous(), requires_grad=False
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Validate weight tensor
@@ -1693,13 +1705,15 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         return self.mxfp8_linear_op.apply(
             input=x,
             weight=layer.weight,
-            weight_scale=layer.weight_scale,
+            weight_scale=layer.weight_scale_for_apply,
             out_dtype=x.dtype,
             bias=bias,
         )
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
+
     """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
 
     def __init__(
@@ -1889,31 +1903,37 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             w2_scale_shuffled.append(
                 w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
             )
+        
+        if hasattr(layer, "w13_scale_for_apply"):
+            layer.w13_scale_for_apply.copy_(torch.stack(w13_scale_shuffled).contiguous())
+            layer.w2_scale_for_apply.copy_(torch.stack(w2_scale_shuffled).contiguous())
+        else:
+            layer.w13_scale_for_apply = torch.nn.Parameter(torch.stack(w13_scale_shuffled).contiguous(), requires_grad=False)
+            layer.w2_scale_for_apply = torch.nn.Parameter(torch.stack(w2_scale_shuffled).contiguous(), requires_grad=False)
+        layer.w13_weight.copy_(torch.stack(w13_weight_shuffled).contiguous())
+        layer.w2_weight.copy_(torch.stack(w2_weight_shuffled).contiguous())
 
-        replace_parameter(
-            layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
-        )
-        replace_parameter(
-            layer, "w2_weight", torch.stack(w2_weight_shuffled).contiguous()
-        )
-        replace_parameter(
-            layer,
-            "w13_weight_scale",
-            torch.stack(w13_scale_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_scale",
-            torch.stack(w2_scale_shuffled).contiguous(),
-        )
+        # replace_parameter(
+        #     layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
+        # )
+        # replace_parameter(
+        #     layer, "w2_weight", torch.stack(w2_weight_shuffled).contiguous()
+        # )
+        # replace_parameter(
+        #     layer,
+        #     "w13_weight_scale",
+        #     torch.stack(w13_scale_shuffled).contiguous(),
+        # )
+        # replace_parameter(
+        #     layer,
+        #     "w2_weight_scale",
+        #     torch.stack(w2_scale_shuffled).contiguous(),
+        # )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
 
         self._check_weight_dtypes(layer)
         self._shuffle_weights_for_trtllm(layer)
-        layer._already_called_process_weights_after_loading = True
 
     def maybe_make_prepare_finalize(
         self,
@@ -1949,6 +1969,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.fused_moe.core import (
             ActivationType,
@@ -1994,15 +2015,19 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             is_sf_swizzled_layout=False,
         )
 
+        # Slice routing_replay_out to match num_tokens (FlashInfer validates)
+        if routing_replay_out is not None:
+            routing_replay_out = routing_replay_out[:x.shape[0]]
+
         kwargs: dict = dict(
             routing_logits=router_logits,
             routing_bias=layer.e_score_correction_bias,
             hidden_states=hidden_states_mxfp8,
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=layer.w13_weight,
-            gemm1_weights_scale=layer.w13_weight_scale,
+            gemm1_weights_scale=layer.w13_scale_for_apply,
             gemm2_weights=layer.w2_weight,
-            gemm2_weights_scale=layer.w2_weight_scale,
+            gemm2_weights_scale=layer.w2_scale_for_apply,
             num_experts=layer.global_num_experts,
             top_k=layer.top_k,
             # Keep Optional semantics: FlashInfer expects None for non-grouped
@@ -2018,6 +2043,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             weight_layout=0,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
             activation_type=fi_activation_type,
+            routing_replay_out=routing_replay_out,
         )
 
         return flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
@@ -2180,6 +2206,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return None
 
+    @log_quant_method_call
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
