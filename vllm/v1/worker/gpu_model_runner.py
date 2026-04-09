@@ -3619,6 +3619,24 @@ class GPUModelRunner(
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
+                    # FIX: When MTP/Eagle spec decode is active, the
+                    # drafter propose() calls coordinate_batch_across_dp
+                    # N additional times. Idle engines running dummy
+                    # batches must issue matching dummy allreduces so
+                    # all DP ranks stay in sync. Without this, idle
+                    # engines exchange garbled data with busy engines
+                    # drafter allreduces, corrupting batch coordination
+                    # and causing worker crashes -> NCCL timeout.
+                    if self.speculative_config is not None:
+                        n = self._get_num_drafter_dp_allreduces()
+                        for _ in range(n):
+                            coordinate_batch_across_dp(
+                                num_tokens_unpadded=0,
+                                parallel_config=self.parallel_config,
+                                allow_microbatching=False,
+                                num_tokens_padded=0,
+                                cudagraph_mode=0,
+                            )
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
@@ -4962,6 +4980,31 @@ class GPUModelRunner(
         )
 
     @torch.inference_mode()
+    def _get_num_drafter_dp_allreduces(self) -> int:
+        """Number of coordinate_batch_across_dp calls in drafter propose().
+
+        When an engine is idle and runs _dummy_run(), it must issue this
+        many additional dummy allreduces to match what busy engines do
+        in the drafter's propose() method. Without this, DP allreduces
+        get cross-matched (idle engine's main-model allreduce pairs with
+        busy engine's drafter allreduce), corrupting batch coordination
+        data and causing worker crashes.
+        """
+        spec = self.speculative_config
+        if spec is None:
+            return 0
+        if not (spec.use_eagle()
+                or spec.uses_draft_model()
+                or spec.uses_extract_hidden_states()):
+            return 0
+        # propose() always does 1 allreduce for the first pass.
+        # If num_speculative_tokens > 1 and not parallel_drafting,
+        # it does a 2nd allreduce for the multi-step setup.
+        if (spec.num_speculative_tokens > 1
+                and not getattr(spec, "parallel_drafting", False)):
+            return 2
+        return 1
+
     def _dummy_run(
         self,
         num_tokens: int,
