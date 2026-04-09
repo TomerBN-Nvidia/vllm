@@ -95,7 +95,15 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     If any rank has NONE (0), all ranks use NONE.
     This ensures all ranks send consistent values (all padded or all unpadded).
     """
-    return int(tensor[3, :].min().item())
+    mode = int(tensor[3, :].min().item())
+    # When DP ranks have different batch sizes (idle vs busy engines),
+    # disable CUDA graphs for this step. TP collectives in the graph
+    # hang when replayed with DP-padded dummy tokens.
+    if mode != 0:
+        padded_tokens = tensor[1, :]
+        if int(padded_tokens.max().item()) != int(padded_tokens.min().item()):
+            mode = 0
+    return mode
 
 
 def _synchronize_dp_ranks(
