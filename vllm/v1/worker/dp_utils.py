@@ -94,8 +94,22 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     Synchronize cudagraph_mode across DP ranks by taking the minimum.
     If any rank has NONE (0), all ranks use NONE.
     This ensures all ranks send consistent values (all padded or all unpadded).
+
+    Additionally, if DP ranks have different padded batch sizes (indicating
+    some ranks need DP padding, e.g. idle vs busy engines), downgrade FULL
+    to PIECEWISE. FULL mode captures attention inside the CUDA graph, but
+    DP-padded dummy tokens cause incorrect attention computation during
+    graph replay, leading to TP allgather hangs. PIECEWISE keeps MLP in
+    the graph while computing attention eagerly (correctly handling padding).
     """
-    return int(tensor[3, :].min().item())
+    mode = int(tensor[3, :].min().item())
+    # FULL=2, PIECEWISE=1. Downgrade FULL to PIECEWISE when batch sizes
+    # differ across DP ranks (some engines need padding).
+    if mode == 2:
+        padded_tokens = tensor[1, :]
+        if int(padded_tokens.max().item()) != int(padded_tokens.min().item()):
+            mode = 1
+    return mode
 
 
 def _synchronize_dp_ranks(
