@@ -103,12 +103,15 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     the graph while computing attention eagerly (correctly handling padding).
     """
     mode = int(tensor[3, :].min().item())
-    # FULL=2, PIECEWISE=1. Downgrade FULL to PIECEWISE when batch sizes
-    # differ across DP ranks (some engines need padding).
-    if mode == 2:
+    # When DP ranks have different batch sizes (idle vs busy engines),
+    # disable CUDA graphs entirely for this step. Both FULL and PIECEWISE
+    # modes capture TP collectives in the graph, which hang when replayed
+    # with DP-padded dummy tokens. Only affects drain phase when engines
+    # have uneven batch sizes, not steady-state.
+    if mode != 0:
         padded_tokens = tensor[1, :]
         if int(padded_tokens.max().item()) != int(padded_tokens.min().item()):
-            mode = 1
+            mode = 0
     return mode
 
 
