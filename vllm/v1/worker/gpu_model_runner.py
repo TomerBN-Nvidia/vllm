@@ -3393,6 +3393,9 @@ class GPUModelRunner(
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
+        import os
+        _force_piecewise = os.environ.get("VLLM_DIAG_FORCE_PIECEWISE", "0") == "1"
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
@@ -3400,13 +3403,22 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL} if (disable_full or _force_piecewise) else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
         num_tokens_padded = batch_descriptor.num_tokens
+        # --- DIAG: log initial dispatch ---
+        logger.warning(
+            "DIAG dispatch [main] dp_rank=%d num_tokens_unpadded=%d "
+            "num_tokens_padded=%d cudagraph_mode=%s batch_desc_tokens=%d",
+            self.parallel_config.data_parallel_rank,
+            num_tokens, num_tokens_padded, cudagraph_mode,
+            batch_descriptor.num_tokens,
+        )
+        # --- END DIAG ---
         if self.compilation_config.pass_config.enable_sp:
             assert (
                 batch_descriptor.num_tokens
@@ -3445,6 +3457,16 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+                # --- DIAG: log post-DP-sync state ---
+                logger.warning(
+                    "DIAG dp_sync [main] dp_rank=%d synced_mode=%s "
+                    "num_tokens_padded=%d num_tokens_across_dp=%s",
+                    self.parallel_config.data_parallel_rank,
+                    CUDAGraphMode(synced_cudagraph_mode),
+                    num_tokens_padded,
+                    num_tokens_across_dp.tolist() if num_tokens_across_dp is not None else None,
+                )
+                # --- END DIAG ---
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -5086,6 +5108,17 @@ class GPUModelRunner(
                 force_num_active_loras=num_active_loras,
             )
         )
+
+        # --- DIAG: log graph capture decisions ---
+        if is_graph_capturing:
+            logger.warning(
+                "DIAG capture [main] dp_rank=%d num_tokens=%d "
+                "cudagraph_mode=%s batch_desc_tokens=%d uniform_decode=%s",
+                self.parallel_config.data_parallel_rank,
+                num_tokens, _cudagraph_mode, batch_desc.num_tokens,
+                uniform_decode,
+            )
+        # --- END DIAG ---
 
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode

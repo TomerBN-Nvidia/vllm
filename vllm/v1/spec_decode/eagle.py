@@ -1504,6 +1504,15 @@ class SpecDecodeBaseProposer:
                         num_tokens, use_cudagraphs=use_cudagraphs
                     )
                 )
+                # --- DIAG: log drafter capture ---
+                if is_graph_capturing:
+                    logger.warning(
+                        "DIAG capture [drafter] dp_rank=%d fwd_idx=%d "
+                        "num_tokens=%d cudagraph_mode=%s num_input_tokens=%d",
+                        self.dp_rank, fwd_idx, num_tokens,
+                        cudagraph_runtime_mode, num_input_tokens,
+                    )
+                # --- END DIAG ---
 
             # Make sure to use EAGLE's own buffer during cudagraph capture.
             if (
@@ -1650,6 +1659,14 @@ class SpecDecodeBaseProposer:
             valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
         )
         num_tokens_padded = batch_desc.num_tokens
+        # --- DIAG: log drafter dispatch ---
+        logger.warning(
+            "DIAG dispatch [drafter] dp_rank=%d num_tokens=%d "
+            "num_tokens_padded=%d cudagraph_mode=%s use_cudagraphs=%s",
+            self.dp_rank, num_tokens, num_tokens_padded,
+            cudagraph_mode, use_cudagraphs,
+        )
+        # --- END DIAG ---
 
         # Extra coordination when running data-parallel since we need to
         # coordinate across ranks
@@ -1681,6 +1698,15 @@ class SpecDecodeBaseProposer:
                 # otherwise num_tokens_across_dp will no-longer be valid
                 assert batch_desc.num_tokens == num_tokens_padded
                 num_tokens_across_dp[dp_rank] = num_tokens_padded
+                # --- DIAG: log drafter post-DP-sync ---
+                logger.warning(
+                    "DIAG dp_sync [drafter] dp_rank=%d synced_mode=%s "
+                    "num_tokens_padded=%d num_tokens_across_dp=%s",
+                    self.dp_rank, CUDAGraphMode(synced_cudagraph_mode),
+                    num_tokens_padded,
+                    num_tokens_across_dp.tolist() if num_tokens_across_dp is not None else None,
+                )
+                # --- END DIAG ---
 
         return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
 
