@@ -3779,6 +3779,12 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # FIX: Synchronize GPU before CUDA graph replay when MTP + DP > 2.
+        # Prevents DP allreduce from interfering with graph-mode TP allgather.
+        if (self.speculative_config is not None
+                and self.parallel_config.data_parallel_size > 1
+                and cudagraph_mode != CUDAGraphMode.NONE):
+            torch.cuda.synchronize()
         # When spec decode is enabled, delay clearing connector metadata
         # until after draft model runs in sample_tokens.
         clear_kv_metadata = self.speculative_config is None

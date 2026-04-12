@@ -453,6 +453,10 @@ class SpecDecodeBaseProposer:
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
 
+        # FIX: Sync before drafter graph replay with MTP + DP
+        if (self.vllm_config.parallel_config.data_parallel_size > 1
+                and cudagraph_runtime_mode != CUDAGraphMode.NONE):
+            torch.cuda.synchronize()
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
