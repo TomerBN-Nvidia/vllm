@@ -204,7 +204,9 @@ logger = init_logger(__name__)
 # --- DIAG: Force-enable NCCL FlightRecorder in all workers ---
 import os as _os
 _os.environ.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", "1000")
+_os.environ.setdefault("TORCH_FR_BUFFER_SIZE", "1000")
 _os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
+_os.environ.setdefault("TORCH_FR_DUMP_ON_TIMEOUT", "1")
 # --- END DIAG ---
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
