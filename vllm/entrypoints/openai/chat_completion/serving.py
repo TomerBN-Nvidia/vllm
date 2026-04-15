@@ -357,8 +357,10 @@ class OpenAIServingChat(OpenAIServing):
 
         conversation, engine_prompts = result
 
+        base_request_id = self._base_request_id(raw_request, request.request_id)
+        assert base_request_id is not None
         request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+            f"vllm_chat_cmpl_{self._base_chat_request_id(base_request_id)}"
         )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -1427,6 +1429,8 @@ class OpenAIServingChat(OpenAIServing):
 
         assert final_res is not None
 
+        logger.debug(f"chat_completion_full_generator: request id = {repr(request_id)}")
+
         rl_metadata = None
         if isinstance(request.metadata, dict):
             rl_metadata = request.metadata.get("rl_metadata")
@@ -1855,8 +1859,20 @@ class OpenAIServingChat(OpenAIServing):
 
     @staticmethod
     def _base_chat_request_id(request_id: str) -> str:
-        if request_id.startswith("chatcmpl-") or request_id.startswith("chatcmpl_"):
-            return request_id[9:]
+        known_prefixes = (
+            "vllm_chat_cmpl_",
+            "chatcmpl-",
+            "chatcmpl_",
+            "chat_cmpl_",
+            "chat_cmpl-",
+            "chat-cmpl_",
+            "chat-cmpl-",
+            "chat_",
+            "chat-",
+        )
+        for prefix in known_prefixes:
+            if request_id.startswith(prefix):
+                return request_id[len(prefix) :]
         return request_id
 
     def _get_moe_topk_indices_payload(
@@ -1906,11 +1922,10 @@ class OpenAIServingChat(OpenAIServing):
         if self.block_store_instance_id is None:
             return None
 
-        req_id = self._base_chat_request_id(request_id)
         return {
             "instance_rank": self.block_store_instance_rank,
             "instance_id": self.block_store_instance_id,
-            "req_id": req_id,
+            "req_id": request_id,
             "key": "moe_topk_indices",
         }
 
@@ -1993,10 +2008,9 @@ class OpenAIServingChat(OpenAIServing):
         moe_topk_indices = (
             arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
         )
-        req_id = self._base_chat_request_id(request_id)
         ray.get(
             self.block_store_instance.put_numpy.remote(
-                req_id,
+                request_id,
                 "moe_topk_indices",
                 moe_topk_indices,
                 rl_metadata=rl_metadata,

@@ -103,7 +103,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    id: str = Field(default_factory=lambda: f"vllm_chat_cmpl_{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
@@ -134,7 +134,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    id: str = Field(default_factory=lambda: f"vllm_chat_cmpl_{random_uuid()}")
     object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
