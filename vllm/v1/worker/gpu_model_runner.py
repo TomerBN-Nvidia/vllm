@@ -57,6 +57,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     extract_routed_experts_for_current_batch,
     get_global_experts_capturer,
     init_routed_experts_capturer_with_shared_cache,
+    issue_routing_d2h_copy,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -4282,24 +4283,13 @@ class GPUModelRunner(
                 spec_decode_metadata,
             )
 
-        # Issue async D2H copy of routed experts EARLY so that the copy
-        # overlaps with eplb, kv_connector finalization, and draft work.
-        # finalize_pending_copy() + get_routed_experts() happen later in
-        # extract_routed_experts_for_current_batch().
         if self.routed_experts_initialized:
-            capturer = get_global_experts_capturer()
-            if capturer is not None:
-                ordered_num_scheduled = {
-                    req_id: scheduler_output.num_scheduled_tokens[req_id]
-                    for req_id in self.input_batch.req_ids
-                    if req_id in scheduler_output.num_scheduled_tokens
-                }
-                n = sum(ordered_num_scheduled.values())
-                self._positions_cpu[:n].copy_(self.positions[:n])
-                capturer.sync_fwd_experts_buffer_DtoH(
-                    positions=self._positions_cpu[:n],
-                    num_scheduled_tokens=ordered_num_scheduled,
-                )
+            issue_routing_d2h_copy(
+                input_batch_req_ids=self.input_batch.req_ids,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                positions=self.positions,
+                positions_cpu=self._positions_cpu,
+            )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled

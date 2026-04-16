@@ -563,6 +563,36 @@ def extract_routed_experts_for_current_batch(
     return result if result else None
 
 
+def issue_routing_d2h_copy(
+    input_batch_req_ids: list[str],
+    num_scheduled_tokens: dict[str, int],
+    positions: torch.Tensor,
+    positions_cpu: torch.Tensor,
+) -> None:
+    """Issue async D2H copy of routed experts after the forward pass.
+
+    Called EARLY in the execute_model epilogue so the copy overlaps with
+    eplb, kv_connector finalization, and draft work.
+    finalize_pending_copy() + get_routed_experts() happen later in
+    extract_routed_experts_for_current_batch().
+    """
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return
+
+    ordered = {
+        req_id: num_scheduled_tokens[req_id]
+        for req_id in input_batch_req_ids
+        if req_id in num_scheduled_tokens
+    }
+    n = sum(ordered.values())
+    positions_cpu[:n].copy_(positions[:n])
+    capturer.sync_fwd_experts_buffer_DtoH(
+        positions=positions_cpu[:n],
+        num_scheduled_tokens=ordered,
+    )
+
+
 def split_routed_experts(
     routed_experts: np.ndarray,
     prompt_len: int,
