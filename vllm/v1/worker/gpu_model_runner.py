@@ -54,6 +54,7 @@ from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    extract_routed_experts_for_current_batch,
     get_global_experts_capturer,
     init_routed_experts_capturer_with_shared_cache,
 )
@@ -3005,86 +3006,6 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
-    def _extract_routed_experts_for_current_batch(
-        self,
-        req_ids: list[str],
-    ) -> dict[str, tuple] | None:
-        """Extract routed experts for requests predicted to finish this step.
-
-        Checks all stop conditions the scheduler will check (max_tokens,
-        EOS token, stop tokens, max_model_len) so that every finished
-        request gets its routing data attached to the ModelRunnerOutput.
-
-        Note: We don't free buffers here -- that happens in
-        ``_update_states`` for requests that finished in the PREVIOUS step.
-        """
-        capturer = get_global_experts_capturer()
-        if capturer is None:
-            return None
-        host_cache = capturer.get_host_cache()
-        if host_cache is None:
-            return None
-
-        finishing_req_ids: list[str] = []
-        for req_id in req_ids:
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            sp = req_state.sampling_params
-            if sp is None:
-                continue
-            output_ids = req_state.output_token_ids
-            if not output_ids:
-                continue
-            if len(output_ids) < sp.min_tokens:
-                continue
-
-            finishing = False
-            last_token = output_ids[-1]
-
-            # EOS token (mirrors check_stop: eos_token_id is None
-            # when ignore_eos=True, so this naturally respects that)
-            if last_token == sp.eos_token_id:
-                finishing = True
-
-            # Explicit stop token IDs
-            if not finishing and sp.stop_token_ids and last_token in sp.stop_token_ids:
-                finishing = True
-
-            # max_tokens / max_model_len length cap
-            if not finishing:
-                if sp.max_tokens is not None and len(output_ids) >= sp.max_tokens:
-                    finishing = True
-                else:
-                    req_idx = self.input_batch.req_id_to_index.get(req_id)
-                    if req_idx is not None:
-                        total = self.input_batch.num_tokens_no_spec[req_idx]
-                        if total >= self.max_model_len:
-                            finishing = True
-
-            if finishing:
-                finishing_req_ids.append(req_id)
-
-        if not finishing_req_ids:
-            return None
-
-        # At least one request is finishing: ensure the latest async D2H
-        # copy has been scattered into the host cache.
-        capturer.finalize_pending_copy()
-
-        result: dict[str, tuple] = {}
-        for req_id in finishing_req_ids:
-            seqlen = host_cache.get_filled_len(req_id)
-            if seqlen <= 0:
-                continue
-            experts = capturer.get_routed_experts(
-                req_id, seqlen=seqlen, free_slot=False
-            )
-            if experts is not None:
-                result[req_id] = (experts.shape, experts.tobytes())
-
-        return result if result else None
-
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -4364,7 +4285,7 @@ class GPUModelRunner(
         # Issue async D2H copy of routed experts EARLY so that the copy
         # overlaps with eplb, kv_connector finalization, and draft work.
         # finalize_pending_copy() + get_routed_experts() happen later in
-        # _extract_routed_experts_for_current_batch().
+        # extract_routed_experts_for_current_batch().
         if self.routed_experts_initialized:
             capturer = get_global_experts_capturer()
             if capturer is not None:
@@ -4377,7 +4298,7 @@ class GPUModelRunner(
                 self._positions_cpu[:n].copy_(self.positions[:n])
                 capturer.sync_fwd_experts_buffer_DtoH(
                     positions=self._positions_cpu[:n],
-                    num_scheduled_tokes=ordered_num_scheduled,
+                    num_scheduled_tokens=ordered_num_scheduled,
                 )
 
         if propose_drafts_after_bookkeeping:
@@ -4402,8 +4323,13 @@ class GPUModelRunner(
             routed_experts_dict = None
             if self.routed_experts_initialized:
                 routed_experts_dict = (
-                    self._extract_routed_experts_for_current_batch(
-                        req_ids_output_copy))
+                    extract_routed_experts_for_current_batch(
+                        req_ids=req_ids_output_copy,
+                        requests=self.requests,
+                        req_id_to_index=self.input_batch.req_id_to_index,
+                        num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                        max_model_len=self.max_model_len,
+                    ))
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -6895,13 +6821,6 @@ class GPUModelRunner(
         )
         from vllm.distributed import get_tp_group
 
-        max_running_requests = (
-            self.max_num_tokens // 2
-            if self.max_num_reqs is None
-            else self.max_num_reqs
-            // self.vllm_config.parallel_config.data_parallel_size
-        )
-
         if hasattr(self.model_config.hf_text_config, "n_shared_experts"):
             num_fused_shared_experts = 1
         else:
@@ -6913,7 +6832,6 @@ class GPUModelRunner(
             model_config=self.model_config,
             num_fused_shared_experts=num_fused_shared_experts,
             num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            max_running_requests=max_running_requests,
             max_model_len=self.max_model_len,
             device=self.device,
             rank=tp_group.rank_in_group,

@@ -559,11 +559,10 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         request_metadata.final_usage_info = usage
-        if final_res_batch:
-            kv_transfer_params = final_res_batch[0].kv_transfer_params
         prompt_routed_experts = None
         if final_res_batch:
-            pre = getattr(final_res_batch[0], "prompt_routed_experts", None)
+            kv_transfer_params = final_res_batch[0].kv_transfer_params
+            pre = final_res_batch[0].prompt_routed_experts
             if pre is not None:
                 prompt_routed_experts = pre.tolist()
 

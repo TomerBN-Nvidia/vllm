@@ -27,7 +27,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-# RoutedExpertsReader removed - routing data flows through ModelRunnerOutput
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.v1.core.encoder_cache_manager import (
@@ -254,7 +253,6 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
-                # Routed experts init removed - data flows through ModelRunnerOutput
         self._pause_state: PauseState = PauseState.UNPAUSED
 
     def _mamba_block_aligned_split(
@@ -1393,8 +1391,6 @@ class Scheduler(SchedulerInterface):
                 routed_experts = model_runner_output.routed_experts_dict[req_id]
             finish_reason = None
             if stopped:
-                pass  # routing data already extracted above
-
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
@@ -1568,12 +1564,6 @@ class Scheduler(SchedulerInterface):
 
         self._enqueue_waiting_request(request)
         return False
-
-    def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.model_config.enable_return_routed_experts:
-            return None
-        # Routing data stored per-request from ModelRunnerOutput
-        return getattr(request, '_routed_experts_data', None)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

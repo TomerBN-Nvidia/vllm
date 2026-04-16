@@ -1532,9 +1532,8 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata.final_usage_info = usage
 
         prompt_routed_experts = None
-        pre = getattr(final_res, "prompt_routed_experts", None)
-        if pre is not None:
-            prompt_routed_experts = pre.tolist()
+        if final_res.prompt_routed_experts is not None:
+            prompt_routed_experts = final_res.prompt_routed_experts.tolist()
 
         response = ChatCompletionResponse(
             id=request_id,

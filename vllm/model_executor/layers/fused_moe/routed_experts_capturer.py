@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import logging
 from abc import ABC
-from typing import Optional
 
 import numpy as np
 import torch
@@ -43,12 +44,7 @@ def _capture_routing_op_fake(
     pass
 
 
-_GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
-
-
-def get_tensor_size_bytes(t: torch.Tensor):
-    return np.prod(t.shape) * t.dtype.itemsize
 
 
 class _RoutedExpertsDeviceCache:
@@ -64,7 +60,6 @@ class _RoutedExpertsDeviceCache:
         num_batched_tokens: int,
         num_hidden_layers: int,
         num_experts_per_tok: int,
-        num_fused_shared_experts: int,
         device: str,
     ) -> None:
         # Layout: (L, N, K) so that buffer[layer_id] is a contiguous (N, K)
@@ -79,7 +74,7 @@ class _RoutedExpertsDeviceCache:
         self._finalize_allocation_log()
 
     def get_buffer_size_bytes(self):
-        return get_tensor_size_bytes(self.buffer)
+        return self.buffer.nbytes
 
     def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
         assert layer_id is not None, "capturing routing experts but get layer_id None"
@@ -89,8 +84,10 @@ class _RoutedExpertsDeviceCache:
     def _finalize_allocation_log(self):
         buf_mb = self.get_buffer_size_bytes() / _MB
         logger.info(
-            f"Routing experts device buffer allocated. "
-            f"shape={tuple(self.buffer.shape)}, size={buf_mb:.2f} MB"
+            "Routing experts device buffer allocated. "
+            "shape=%s, size=%.2f MB",
+            tuple(self.buffer.shape),
+            buf_mb,
         )
 
 
@@ -107,15 +104,11 @@ class _RoutedExpertsHostCache:
         self,
         num_hidden_layers: int,
         num_experts_per_tok: int,
-        max_running_requests: int,
         max_model_len: int,
-        use_shared_memory: bool = True,
     ) -> None:
         self.max_model_len = max_model_len
-        self.max_running_requests = max_running_requests
         self.num_hidden_layers = num_hidden_layers
         self.num_experts_per_tok = num_experts_per_tok
-        self._use_shared_memory = use_shared_memory
 
         self._req_buffers: dict[str, np.ndarray] = {}
         self._filled_len: dict[str, int] = {}
@@ -169,10 +162,11 @@ class _RoutedExpertsHostCache:
 
     def _finalize_allocation_log(self):
         logger.info(
-            f"Routing experts host cache initialized (lazy allocation). "
-            f"max_model_len={self.max_model_len}, "
-            f"layers={self.num_hidden_layers}, "
-            f"experts_per_tok={self.num_experts_per_tok}"
+            "Routing experts host cache initialized (lazy allocation). "
+            "max_model_len=%s, layers=%s, experts_per_tok=%s",
+            self.max_model_len,
+            self.num_hidden_layers,
+            self.num_experts_per_tok,
         )
 
 
@@ -183,17 +177,15 @@ class RoutedExpertsCapturer(ABC):
         model_config: ModelConfig,
         num_fused_shared_experts: int,
         num_batched_tokens: int,
-        max_running_requests: int,
         max_model_len: int,
         device: str,
-        shared_host_cache: Optional[_RoutedExpertsHostCache] = None,
+        shared_host_cache: _RoutedExpertsHostCache | None = None,
         skip_host_cache: bool = False,
     ):
         if enable:
             return _RoutedExpertsCapturerReal(
                 model_config,
                 num_batched_tokens=num_batched_tokens,
-                max_running_requests=max_running_requests,
                 num_fused_shared_experts=num_fused_shared_experts,
                 max_model_len=max_model_len,
                 device=device,
@@ -206,14 +198,14 @@ class RoutedExpertsCapturer(ABC):
         raise NotImplementedError
 
     def get_routed_experts(
-        self, req_id: str, seqlen: Optional[int] = None, free_slot: bool = True
+        self, req_id: str, seqlen: int | None = None, free_slot: bool = True
     ):
         raise NotImplementedError
 
     def sync_fwd_experts_buffer_DtoH(
         self,
         positions: torch.Tensor,
-        num_scheduled_tokes: dict[str, int],
+        num_scheduled_tokens: dict[str, int],
     ):
         raise NotImplementedError
 
@@ -246,14 +238,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         model_config: ModelConfig,
         num_batched_tokens: int,
-        max_running_requests: int,
         num_fused_shared_experts: int,
         max_model_len: int,
         device: str,
-        shared_host_cache: Optional[_RoutedExpertsHostCache] = None,
+        shared_host_cache: _RoutedExpertsHostCache | None = None,
         skip_host_cache: bool = False,
     ):
-        self.forward_batch = None
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.layers_block_type.count(
             "moe"
@@ -265,23 +255,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
         if skip_host_cache:
             self.host_cache = None
-            logger.info(f"Skipping host cache for device {device} (non-rank-0)")
+            logger.info("Skipping host cache for device %s (non-rank-0)", device)
         elif shared_host_cache is not None:
             self.host_cache = shared_host_cache
         else:
             self.host_cache = _RoutedExpertsHostCache(
-                max_running_requests=max_running_requests,
                 num_hidden_layers=self.num_hidden_layers,
                 num_experts_per_tok=self.num_experts_per_tok,
                 max_model_len=self.max_model_len,
-                use_shared_memory=False,
             )
 
         self.device_cache = _RoutedExpertsDeviceCache(
             num_batched_tokens=self.num_batched_tokens,
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             device=device,
         )
 
@@ -303,19 +290,21 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             self._copy_stream = torch.cuda.Stream(device=device)
             self._copy_event = torch.cuda.Event()
 
-            pinned_mb = get_tensor_size_bytes(self._pinned_staging) / _MB
+            pinned_mb = self._pinned_staging.nbytes / _MB
             logger.info(
-                f"Routing experts pinned staging buffer allocated. "
-                f"shape={tuple(self._pinned_staging.shape)}, "
-                f"size={pinned_mb:.2f} MB"
+                "Routing experts pinned staging buffer allocated. "
+                "shape=%s, size=%.2f MB",
+                tuple(self._pinned_staging.shape),
+                pinned_mb,
             )
         else:
             self._pinned_staging = None
             self._copy_stream = None
             self._copy_event = None
             logger.info(
-                f"Routing experts device-only capturer (rank != 0). "
-                f"Device buffer shape={tuple(self.device_cache.buffer.shape)}"
+                "Routing experts device-only capturer (rank != 0). "
+                "Device buffer shape=%s",
+                tuple(self.device_cache.buffer.shape),
             )
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
@@ -328,7 +317,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def sync_fwd_experts_buffer_DtoH(
         self,
         positions: torch.Tensor,
-        num_scheduled_tokes: dict[str, int],
+        num_scheduled_tokens: dict[str, int],
     ):
         if self.host_cache is None:
             return
@@ -340,7 +329,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             self._scatter_to_host()
             self._has_pending_copy = False
 
-        total_tokens = sum(num_scheduled_tokes.values())
+        total_tokens = sum(num_scheduled_tokens.values())
         if total_tokens == 0:
             return
 
@@ -357,7 +346,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
         # 3. Save metadata for deferred scatter.
         self._pending_positions = positions.numpy().copy()
-        self._pending_num_scheduled = num_scheduled_tokes
+        self._pending_num_scheduled = num_scheduled_tokens
         self._pending_total_tokens = total_tokens
         self._has_pending_copy = True
 
@@ -459,7 +448,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def get_routed_experts(self, req_id: str, seqlen=None, free_slot=True):
         return None
 
-    def sync_fwd_experts_buffer_DtoH(self, positions, num_scheduled_tokes):
+    def sync_fwd_experts_buffer_DtoH(self, positions, num_scheduled_tokens):
         pass
 
     def finalize_pending_copy(self):
@@ -473,8 +462,8 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
 
 
 # Global capturer instance (per-process)
-_global_expert_capturer: Optional[RoutedExpertsCapturer] = _RoutedExpertsCapturerNoop()
-_shared_host_cache: Optional[_RoutedExpertsHostCache] = None
+_global_expert_capturer: RoutedExpertsCapturer | None = _RoutedExpertsCapturerNoop()
+_shared_host_cache: _RoutedExpertsHostCache | None = None
 
 
 def get_global_experts_capturer():
@@ -486,24 +475,109 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     _global_expert_capturer = capturer
 
 
-def get_shared_host_cache() -> Optional[_RoutedExpertsHostCache]:
+def extract_routed_experts_for_current_batch(
+    req_ids: list[str],
+    requests: dict,
+    req_id_to_index: dict[str, int],
+    num_tokens_no_spec: np.ndarray,
+    max_model_len: int,
+) -> dict[str, tuple] | None:
+    """Extract routed experts for requests predicted to finish this step.
+
+    Checks all stop conditions the scheduler will check (max_tokens,
+    EOS token, stop tokens, max_model_len) so that every finished
+    request gets its routing data attached to the ModelRunnerOutput.
+
+    Args:
+        req_ids: Ordered request IDs for the current batch.
+        requests: Map of req_id to CachedRequestState (read-only).
+        req_id_to_index: Map of req_id to input batch index.
+        num_tokens_no_spec: Array of total token counts per request index.
+        max_model_len: Maximum model sequence length.
+    """
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return None
+    host_cache = capturer.get_host_cache()
+    if host_cache is None:
+        return None
+
+    finishing_req_ids: list[str] = []
+    for req_id in req_ids:
+        req_state = requests.get(req_id)
+        if req_state is None:
+            continue
+        sp = req_state.sampling_params
+        if sp is None:
+            continue
+        output_ids = req_state.output_token_ids
+        if not output_ids:
+            continue
+        if len(output_ids) < sp.min_tokens:
+            continue
+
+        finishing = False
+        last_token = output_ids[-1]
+
+        # EOS token (mirrors check_stop: eos_token_id is None
+        # when ignore_eos=True, so this naturally respects that)
+        if last_token == sp.eos_token_id:
+            finishing = True
+
+        # Explicit stop token IDs
+        if not finishing and sp.stop_token_ids and last_token in sp.stop_token_ids:
+            finishing = True
+
+        # max_tokens / max_model_len length cap
+        if not finishing:
+            if sp.max_tokens is not None and len(output_ids) >= sp.max_tokens:
+                finishing = True
+            else:
+                req_idx = req_id_to_index.get(req_id)
+                if req_idx is not None:
+                    total = num_tokens_no_spec[req_idx]
+                    if total >= max_model_len:
+                        finishing = True
+
+        if finishing:
+            finishing_req_ids.append(req_id)
+
+    if not finishing_req_ids:
+        return None
+
+    # At least one request is finishing: ensure the latest async D2H
+    # copy has been scattered into the host cache.
+    capturer.finalize_pending_copy()
+
+    result: dict[str, tuple] = {}
+    for req_id in finishing_req_ids:
+        seqlen = host_cache.get_filled_len(req_id)
+        if seqlen <= 0:
+            continue
+        experts = capturer.get_routed_experts(
+            req_id, seqlen=seqlen, free_slot=False
+        )
+        if experts is not None:
+            result[req_id] = (experts.shape, experts.tobytes())
+
+    return result if result else None
+
+
+def get_shared_host_cache() -> _RoutedExpertsHostCache | None:
     return _shared_host_cache
 
 
 def create_shared_host_cache(
     model_config: ModelConfig,
-    max_running_requests: int,
     max_model_len: int,
 ) -> _RoutedExpertsHostCache:
     global _shared_host_cache
     num_hidden_layers = model_config.hf_text_config.layers_block_type.count("moe")
     num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
     _shared_host_cache = _RoutedExpertsHostCache(
-        max_running_requests=max_running_requests,
         num_hidden_layers=num_hidden_layers,
         num_experts_per_tok=num_experts_per_tok,
         max_model_len=max_model_len,
-        use_shared_memory=False,
     )
     return _shared_host_cache
 
@@ -513,7 +587,6 @@ def init_routed_experts_capturer_with_shared_cache(
     model_config: ModelConfig,
     num_fused_shared_experts: int,
     num_batched_tokens: int,
-    max_running_requests: int,
     max_model_len: int,
     device: str,
     rank: int = 0,
@@ -530,13 +603,14 @@ def init_routed_experts_capturer_with_shared_cache(
         # no D2H pipeline) so that ALL ranks have a real device buffer.
         # This ensures the custom op call in every MoE layer produces
         # identical CUDA graph structure across TP ranks.
-        logger.info(f"Creating device-only routed experts capturer for rank {rank}")
+        logger.info(
+            "Creating device-only routed experts capturer for rank %s", rank
+        )
         capturer = RoutedExpertsCapturer.create(
             enable=True,
             model_config=model_config,
             num_fused_shared_experts=num_fused_shared_experts,
             num_batched_tokens=num_batched_tokens,
-            max_running_requests=max_running_requests,
             max_model_len=max_model_len,
             device=device,
             skip_host_cache=True,
@@ -549,7 +623,6 @@ def init_routed_experts_capturer_with_shared_cache(
         model_config=model_config,
         num_fused_shared_experts=num_fused_shared_experts,
         num_batched_tokens=num_batched_tokens,
-        max_running_requests=max_running_requests,
         max_model_len=max_model_len,
         device=device,
         skip_host_cache=False,
@@ -601,6 +674,8 @@ def bind_routing_capture_to_model(model) -> None:
             bound += 1
 
     logger.info(
-        f"Bound routing capture buffer to {bound} FusedMoE layers. "
-        f"Buffer shape={tuple(buffer.shape)}"
+        "Bound routing capture buffer to %s FusedMoE layers. "
+        "Buffer shape=%s",
+        bound,
+        tuple(buffer.shape),
     )
