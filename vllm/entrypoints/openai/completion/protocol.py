@@ -468,6 +468,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    routed_experts: list[list[list[int]]] | None = None  # [seq_len, num_layers, top_k]
 
 
 class CompletionResponse(OpenAIBaseModel):

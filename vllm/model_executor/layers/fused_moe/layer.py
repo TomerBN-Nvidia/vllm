@@ -215,6 +215,8 @@ def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
 # --8<-- [start:fused_moe]
 @PluggableLayer.register("fused_moe")
 class FusedMoE(PluggableLayer):
+    # Auto-incrementing layer ID for routing replay buffer binding.
+    _next_moe_layer_id: int = 0
     """FusedMoE layer for MoE models.
 
     This layer contains both MergedColumnParallel weights (gate_up_proj /
@@ -279,6 +281,10 @@ class FusedMoE(PluggableLayer):
         super().__init__()
 
         self._routed_input_transform = routed_input_transform
+
+        # Assign unique layer ID for routing replay buffer binding.
+        self.moe_layer_id = FusedMoE._next_moe_layer_id
+        FusedMoE._next_moe_layer_id += 1
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
