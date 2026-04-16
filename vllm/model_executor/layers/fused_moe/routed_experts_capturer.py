@@ -563,6 +563,43 @@ def extract_routed_experts_for_current_batch(
     return result if result else None
 
 
+def split_routed_experts(
+    routed_experts: np.ndarray,
+    prompt_len: int,
+    num_output_tokens: int | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Split routing data into prompt and generation portions.
+
+    Args:
+        routed_experts: Full routing array of shape (seq_len, L, K).
+        prompt_len: Number of prompt tokens for the request.
+        num_output_tokens: Actual number of generated tokens (from
+            detokenizer).  When provided, the generation portion is
+            clipped to this length — necessary with MTP where the model
+            runner may capture routing for more tokens than the final
+            output contains.
+
+    Returns:
+        (prompt_routed_experts, gen_routed_experts) numpy arrays, either
+        of which may be None if the corresponding portion is empty.
+    """
+    prompt_routed_experts = routed_experts[:prompt_len]
+    gen_routed_experts = routed_experts[prompt_len:]
+
+    # Clip generation routing to match actual output tokens.
+    if (num_output_tokens is not None
+            and gen_routed_experts.shape[0] > num_output_tokens
+            and num_output_tokens > 0):
+        gen_routed_experts = gen_routed_experts[:num_output_tokens]
+
+    if prompt_routed_experts.size == 0:
+        prompt_routed_experts = None
+    if gen_routed_experts.size == 0:
+        gen_routed_experts = None
+
+    return prompt_routed_experts, gen_routed_experts
+
+
 def get_shared_host_cache() -> _RoutedExpertsHostCache | None:
     return _shared_host_cache
 

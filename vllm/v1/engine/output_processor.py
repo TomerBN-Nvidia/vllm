@@ -26,6 +26,9 @@ from vllm.tracing import (
     extract_trace_context,
     instrument_manual,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    split_routed_experts,
+)
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
@@ -322,18 +325,10 @@ class RequestState:
         if routed_experts is not None:
             prompt_len = (len(self.prompt_token_ids)
                           if self.prompt_token_ids else 0)
-            prompt_routed_experts = routed_experts[:prompt_len]
-            gen_routed_experts = routed_experts[prompt_len:]
-            # Trim generation routing to match actual output tokens.
-            # With MTP, the model runner captures routing for ALL
-            # accepted tokens, but the output may be shorter when a
-            # stop condition is hit. Clip to avoid trailing rows.
-            if self.detokenizer is not None:
-                num_gen = self.detokenizer.num_output_tokens()
-                if (gen_routed_experts is not None
-                        and gen_routed_experts.shape[0] > num_gen
-                        and num_gen > 0):
-                    gen_routed_experts = gen_routed_experts[:num_gen]
+            num_gen = (self.detokenizer.num_output_tokens()
+                       if self.detokenizer is not None else None)
+            prompt_routed_experts, gen_routed_experts = split_routed_experts(
+                routed_experts, prompt_len, num_gen)
 
         output = self._new_completion_output(
             new_token_ids, finish_reason, stop_reason, gen_routed_experts
