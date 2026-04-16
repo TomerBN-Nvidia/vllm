@@ -987,6 +987,7 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Same as apply(), except uses router_logits as opposed
