@@ -185,59 +185,88 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     assert len(capturer.calls) == 1
 
 
-def test_routed_experts_capturer_single_dp_no_metadata():
-    """dp_metadata is None: capture writes the full topk_ids rows."""
-    capturer = _capturer_with_buffer(dp_rank=0)
-    topk = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
-    ctx = SimpleNamespace(dp_metadata=None)
-    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
-        capturer.capture(layer_id=0, topk_ids=topk)
-    assert torch.equal(capturer._device_buffer[:3, 0, :], topk)
-    assert capturer._device_buffer[3, 0, 0].item() == -1
+# =========================================================================
+# Tests for device-cache routing replay architecture
+# =========================================================================
 
 
-def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
-    """n == sum(num_tokens_dp): slice this rank's segment from concatenated topk."""
-    capturer = _capturer_with_buffer(dp_rank=1)
-    num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
-    )
-    # Concatenated order: rank0 rows then rank1 rows.
-    topk = torch.tensor(
-        [[0, 1], [2, 3], [10, 11], [12, 13], [14, 15]], dtype=torch.int32
-    )
-    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
-        capturer.capture(layer_id=0, topk_ids=topk)
-    want = topk[2:5]
-    assert torch.equal(capturer._device_buffer[:3, 0, :], want)
+class TestRoutedExpertsDeviceCache:
+    """Tests for _RoutedExpertsDeviceCache (GPU buffer for routing data)."""
+
+    def test_allocation_shape_and_dtype(self):
+        """Device cache allocates (L, N, K) int16 buffer."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDeviceCache,
+        )
+
+        cache = _RoutedExpertsDeviceCache(
+            num_hidden_layers=40,
+            max_num_batched_tokens=8192,
+            num_experts_per_tok=8,
+        )
+        assert cache.buffer.shape == (40, 8192, 8)
+        assert cache.buffer.dtype == torch.int16
+
+    def test_per_layer_view_is_contiguous(self):
+        """buffer[layer_id] gives contiguous (N, K) view for FlashInfer."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsDeviceCache,
+        )
+
+        cache = _RoutedExpertsDeviceCache(
+            num_hidden_layers=40,
+            max_num_batched_tokens=8192,
+            num_experts_per_tok=8,
+        )
+        layer_view = cache.buffer[0]
+        assert layer_view.is_contiguous()
+        assert layer_view.shape == (8192, 8)
 
 
-def test_routed_experts_capturer_dp_modular_local_tokens():
-    """n == token_num_per_dp: topk is already local to this DP rank."""
-    capturer = _capturer_with_buffer(dp_rank=1)
-    num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
-    )
-    topk = torch.tensor([[10, 11], [12, 13], [14, 15]], dtype=torch.int32)
-    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
-        capturer.capture(layer_id=0, topk_ids=topk)
-    assert torch.equal(capturer._device_buffer[:3, 0, :], topk)
+class TestRoutedExpertsHostCache:
+    """Tests for _RoutedExpertsHostCache (per-request numpy buffer)."""
 
+    def test_sentinel_initialization(self):
+        """Host cache initializes with zeros by default."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsHostCache,
+        )
+        import numpy as np
 
-def test_routed_experts_capturer_dp_unexpected_batch_raises():
-    """Mismatch between topk batch dim and DP layout: fail fast."""
-    capturer = _capturer_with_buffer(dp_rank=0)
-    num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
-    )
-    # total=5, local=2: n=1 matches neither naive (5) nor modular (2).
-    topk = torch.tensor([[1, 2]], dtype=torch.int32)
-    with (
-        patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx),
-        pytest.raises(AssertionError, match="unexpected topk_ids batch dim"),
-    ):
-        capturer.capture(layer_id=0, topk_ids=topk)
-    assert capturer._device_buffer[0, 0, 0].item() == -1
+        cache = _RoutedExpertsHostCache(
+            num_hidden_layers=40,
+            num_experts_per_tok=8,
+        )
+        buf = cache.get_or_grow_buffer("req1", max_pos=100)
+        assert buf.dtype == np.int16
+        assert (buf == 0).all(), "Host cache must initialize with zeros"
+
+    def test_grow_preserves_existing_data(self):
+        """Growing the buffer preserves previously written data."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsHostCache,
+        )
+
+        cache = _RoutedExpertsHostCache(
+            num_hidden_layers=40,
+            num_experts_per_tok=8,
+        )
+        buf = cache.get_or_grow_buffer("req1", max_pos=50)
+        buf[0, 0, 0] = 42
+        buf2 = cache.get_or_grow_buffer("req1", max_pos=200)
+        assert buf2[0, 0, 0] == 42, "Data lost during buffer grow"
+
+    def test_free_request_removes_buffer(self):
+        """Freeing a request removes its buffer."""
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+            _RoutedExpertsHostCache,
+        )
+
+        cache = _RoutedExpertsHostCache(
+            num_hidden_layers=40,
+            num_experts_per_tok=8,
+        )
+        cache.get_or_grow_buffer("req1", max_pos=50)
+        cache.free_request("req1")
+        assert cache.get_buffer("req1") is None
+

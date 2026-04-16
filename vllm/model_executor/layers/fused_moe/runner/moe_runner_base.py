@@ -395,6 +395,10 @@ class MoERunnerBase(MoERunner):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        # Get routing replay buffer from persistent layer attribute
+        # (set by bind_routing_capture_to_model during capturer init)
+        routing_replay_out = getattr(layer, "_routing_replay_out", None)
+
         if self.quant_method.is_monolithic:
             fused_out = self.quant_method.apply_monolithic(
                 layer=layer,
@@ -406,6 +410,12 @@ class MoERunnerBase(MoERunner):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+
+            # Write routing data for non-monolithic path (Triton, etc.)
+            if routing_replay_out is not None:
+                routing_replay_out[: topk_ids.shape[0]].copy_(
+                    topk_ids.to(torch.int16)
+                )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # NO_OVERLAP or MK_INTERNAL_OVERLAPPED.

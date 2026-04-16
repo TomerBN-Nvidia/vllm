@@ -314,8 +314,29 @@ class RequestState:
                 finished,
             )
 
+        # Split routing data into prompt and generation portions.
+        # Prompt routing lives on RequestOutput (shared across n>1
+        # completions); generation routing lives on each CompletionOutput.
+        prompt_routed_experts = None
+        gen_routed_experts = None
+        if routed_experts is not None:
+            prompt_len = (len(self.prompt_token_ids)
+                          if self.prompt_token_ids else 0)
+            prompt_routed_experts = routed_experts[:prompt_len]
+            gen_routed_experts = routed_experts[prompt_len:]
+            # Trim generation routing to match actual output tokens.
+            # With MTP, the model runner captures routing for ALL
+            # accepted tokens, but the output may be shorter when a
+            # stop condition is hit. Clip to avoid trailing rows.
+            if self.detokenizer is not None:
+                num_gen = self.detokenizer.num_output_tokens()
+                if (gen_routed_experts is not None
+                        and gen_routed_experts.shape[0] > num_gen
+                        and num_gen > 0):
+                    gen_routed_experts = gen_routed_experts[:num_gen]
+
         output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason, routed_experts
+            new_token_ids, finish_reason, stop_reason, gen_routed_experts
         )
 
         if self.parent_req is None:
@@ -327,7 +348,8 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params
+            external_req_id, outputs, finished, kv_transfer_params,
+            prompt_routed_experts,
         )
 
     def _new_request_output(
@@ -336,6 +358,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        prompt_routed_experts: "np.ndarray | None" = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -371,6 +394,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            prompt_routed_experts=prompt_routed_experts,
         )
 
     def _new_completion_output(
@@ -617,6 +641,11 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
+
+            if routed_experts is not None:
+                shape, data = routed_experts
+                routed_experts = np.frombuffer(data, dtype=np.int16).reshape(
+                    shape)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
