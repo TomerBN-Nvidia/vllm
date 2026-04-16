@@ -737,6 +737,7 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
     """MoE method for ModelOpt FP8.
     Supports loading FP8 checkpoints with static weight scale and
     activation scale.
@@ -948,6 +949,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -964,6 +966,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
+            routing_replay_out=routing_replay_out,
         )
 
     def apply(
@@ -1206,6 +1209,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
 
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
     """
     MoE Method for FP4 Quantization.
     Args:
@@ -1440,6 +1444,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -1456,6 +1461,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             topk_group=layer.topk_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
+            routing_replay_out=routing_replay_out,
         )
 
     def apply(
@@ -1670,6 +1676,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
+    _monolithic_writes_routing_replay = True
     """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
 
     def __init__(
@@ -1918,6 +1925,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.fused_moe.core import (
             ActivationType,
@@ -1986,6 +1994,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             use_shuffled_weight=True,
             weight_layout=0,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            routing_replay_out=routing_replay_out,
         )
 
         if fi_activation_type != ActivationType.Swiglu:

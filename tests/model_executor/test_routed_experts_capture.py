@@ -227,7 +227,11 @@ class TestRoutedExpertsHostCache:
     """Tests for _RoutedExpertsHostCache (per-request numpy buffer)."""
 
     def test_sentinel_initialization(self):
-        """Host cache initializes with zeros by default."""
+        """Host cache initializes with -1 sentinel (not zeros).
+
+        This is critical: expert ID 0 is valid, so we use -1 to mark
+        positions with no routing data (e.g., prefix-cached tokens).
+        """
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
             _RoutedExpertsHostCache,
         )
@@ -239,7 +243,7 @@ class TestRoutedExpertsHostCache:
         )
         buf = cache.get_or_grow_buffer("req1", max_pos=100)
         assert buf.dtype == np.int16
-        assert (buf == 0).all(), "Host cache must initialize with zeros"
+        assert (buf == -1).all(), "Host cache must initialize with -1, not zeros"
 
     def test_grow_preserves_existing_data(self):
         """Growing the buffer preserves previously written data."""
@@ -270,3 +274,20 @@ class TestRoutedExpertsHostCache:
         cache.free_request("req1")
         assert cache.get_buffer("req1") is None
 
+
+class TestMonolithicWritesFlag:
+    """Test that quant methods correctly declare routing replay capability."""
+
+    def test_fp8_has_flag(self):
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+
+        assert getattr(Fp8MoEMethod, "_monolithic_writes_routing_replay", False)
+
+    def test_base_class_no_flag(self):
+        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+            FusedMoEMethodBase,
+        )
+
+        assert not getattr(
+            FusedMoEMethodBase, "_monolithic_writes_routing_replay", False
+        )
