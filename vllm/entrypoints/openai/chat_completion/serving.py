@@ -1511,10 +1511,15 @@ class OpenAIServingChat(OpenAIServing):
                         "grpo.weight_version": weight_version,
                     }
 
+        assert final_res.prompt_token_ids is not None
+        num_prompt_tokens = len(final_res.prompt_token_ids)
+
         prompt_moe_topk_indices = (
             self._get_moe_topk_indices_payload(
                 request_id,
                 final_res.prompt_routed_experts,
+                start_pos=0,
+                end_pos=num_prompt_tokens,
                 rl_metadata=rl_metadata,
             )
             if return_moe_topk_indices
@@ -1539,6 +1544,8 @@ class OpenAIServingChat(OpenAIServing):
                 self._get_moe_topk_indices_payload(
                     request_id,
                     output.routed_experts,
+                    start_pos=num_prompt_tokens,
+                    end_pos=num_prompt_tokens + len(token_ids),
                     rl_metadata=rl_metadata,
                 )
                 if return_moe_topk_indices
@@ -1835,13 +1842,12 @@ class OpenAIServingChat(OpenAIServing):
                 full_message = last_msg_content + (choice.message.content or "")
                 choice.message.content = full_message
 
-        assert final_res.prompt_token_ids is not None
         if block_store_enabled and final_res.outputs:
             self._maybe_store_moe_topk_indices(
                 request_id=request_id,
                 prompt_routed_experts=final_res.prompt_routed_experts,
                 completion_routed_experts=final_res.outputs[0].routed_experts,
-                num_prompt_tokens=len(final_res.prompt_token_ids),
+                num_prompt_tokens=num_prompt_tokens,
                 num_completion_tokens=len(final_res.outputs[0].token_ids),
                 rl_metadata=rl_metadata,
             )
@@ -1934,12 +1940,16 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request_id: str,
         routed_experts: Any,
+        start_pos: int,
+        end_pos: int,
         rl_metadata: dict[str, Any] | None = None,
     ) -> MoETopKIndicesPayload:
         if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return {
                 "block_cache_key": self._get_moe_topk_indices_block_cache_key(
                     request_id,
+                    start_pos=start_pos,
+                    end_pos=end_pos,
                     rl_metadata=rl_metadata,
                 ),
             }
@@ -1950,6 +1960,8 @@ class OpenAIServingChat(OpenAIServing):
     def _get_moe_topk_indices_block_cache_key(
         self,
         request_id: str,
+        start_pos: int,
+        end_pos: int,
         rl_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
@@ -1961,6 +1973,8 @@ class OpenAIServingChat(OpenAIServing):
             "instance_id": self.block_store_instance_id,
             "req_id": request_id,
             "key": "moe_topk_indices",
+            "start": start_pos,
+            "end": end_pos,
         }
 
     @staticmethod
