@@ -178,9 +178,44 @@ class OpenAIServingChat(OpenAIServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
+        self.metadata_store_instance = None
         self.block_store_instance_rank: int | None = None
         self.block_store_instance_id: str | None = None
         self.block_store_instance = None
+
+    def _get_metadata_store_instance(self) -> Any:
+        if self.metadata_store_instance is None:
+            instance_id = "nemo_rl.metadata_store"
+            try:
+                self.metadata_store_instance = ray.get_actor(instance_id)
+            except ValueError:
+                logger.warning_once(
+                    "NeMo RL metadata store actor %s is not available.", instance_id
+                )
+                self.metadata_store_instance = None
+                return None
+        return self.metadata_store_instance
+
+    def _get_block_store_instance(self) -> Any:
+        if self.block_store_instance is None:
+            node_ip = ray._private.services.get_node_ip_address()
+            instance_id = f"nemo_rl.block_store.node.{node_ip}"
+            try:
+                self.block_store_instance = ray.get_actor(instance_id)
+                runtime_metadata = ray.get(
+                    self.block_store_instance.get_runtime_metadata.remote()
+                )
+                self.block_store_instance_rank = runtime_metadata["instance_rank"]
+                self.block_store_instance_id = instance_id
+            except ValueError:
+                logger.warning_once(
+                    "NeMo RL MoE top-k block store actor %s is not available.", instance_id
+                )
+                self.block_store_instance_rank = None
+                self.block_store_instance = None
+                self.block_store_instance_id = None
+                return None
+        return self.block_store_instance
 
     async def warmup(self) -> None:
         """
@@ -1431,15 +1466,16 @@ class OpenAIServingChat(OpenAIServing):
 
         logger.debug(f"chat_completion_full_generator: request id = {repr(request_id)}")
 
-        rl_metadata = None
-        if isinstance(request.metadata, dict):
-            rl_metadata = request.metadata.get("rl_metadata")
-        if isinstance(rl_metadata, str):
-            rl_metadata = json.loads(rl_metadata)
-        if rl_metadata is not None:
-            logger.debug(f"chat_completion_full_generator: rl metadata = {rl_metadata}")
-        else:
-            logger.debug("chat_completion_full_generator: no rl metadata")
+        if False:
+            rl_metadata = None
+            if isinstance(request.metadata, dict):
+                rl_metadata = request.metadata.get("rl_metadata")
+            if isinstance(rl_metadata, str):
+                rl_metadata = json.loads(rl_metadata)
+            if rl_metadata is not None:
+                logger.debug(f"chat_completion_full_generator: rl metadata = {rl_metadata}")
+            else:
+                logger.debug("chat_completion_full_generator: no rl metadata")
 
         block_store_enabled = (
             self.model_config.enable_moe_topk_indices_nemo_rl_block_store
@@ -1455,6 +1491,25 @@ class OpenAIServingChat(OpenAIServing):
                 "multiple response outputs not supported with "
                 "--enable-moe-topk-indices-nemo-rl-block-store"
             )
+
+        rl_metadata = None
+        if return_moe_topk_indices:
+            if self._get_metadata_store_instance() is not None:
+                weight_version_next = ray.get(self.metadata_store_instance.get.remote("grpo.weight_version.next"))
+                weight_version_curr = ray.get(self.metadata_store_instance.get.remote("grpo.weight_version.curr"))
+                # TODO: report weight update skew.
+                if weight_version_next is not None and weight_version_curr is not None:
+                    weight_version = max(weight_version_next, weight_version_curr)
+                elif weight_version_next is not None:
+                    weight_version = weight_version_next
+                elif weight_version_curr is not None:
+                    weight_version = weight_version_curr
+                else:
+                    weight_version = None
+                if weight_version is not None:
+                    rl_metadata = {
+                        "grpo.weight_version": weight_version,
+                    }
 
         prompt_moe_topk_indices = (
             self._get_moe_topk_indices_payload(
@@ -1899,29 +1954,8 @@ class OpenAIServingChat(OpenAIServing):
     ) -> dict[str, Any] | None:
         if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return None
-
-        if self.block_store_instance is None:
-            node_ip = ray._private.services.get_node_ip_address()
-            instance_id = f"nemo_rl.block_store.node.{node_ip}"
-            try:
-                self.block_store_instance = ray.get_actor(instance_id)
-                runtime_metadata = ray.get(
-                    self.block_store_instance.get_runtime_metadata.remote()
-                )
-                self.block_store_instance_rank = runtime_metadata["instance_rank"]
-                self.block_store_instance_id = instance_id
-            except ValueError:
-                logger.warning_once(
-                    "MoE top-k block store actor %s is not available.", instance_id
-                )
-                self.block_store_instance_rank = None
-                self.block_store_instance = None
-                self.block_store_instance_id = None
-                return None
-
-        if self.block_store_instance_id is None:
+        if self._get_block_store_instance() is None:
             return None
-
         return {
             "instance_rank": self.block_store_instance_rank,
             "instance_id": self.block_store_instance_id,
