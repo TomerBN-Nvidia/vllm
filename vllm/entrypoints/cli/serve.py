@@ -259,6 +259,9 @@ def run_multi_api_server(args: argparse.Namespace):
     with launch_core_engines(
         vllm_config, executor_class, log_stats, addresses, num_api_servers
     ) as (local_engine_manager, coordinator, addresses):
+        # Release pre-bound TCP sockets so API server processes can bind.
+        addresses.release_held_ports()
+
         # Construct common args for the APIServerProcessManager up-front.
         api_server_manager_kwargs = dict(
             target_server_fn=run_api_server_worker_proc,

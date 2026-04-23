@@ -21,10 +21,6 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    bind_routing_capture_to_model,
-    get_global_experts_capturer,
-)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -55,6 +51,10 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    bind_routing_capture_to_model,
+    get_global_experts_capturer,
+)
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -873,7 +873,6 @@ class GPUModelRunner(
                 self._make_buffer,
             )
         return self._mamba_copy_bufs
-
 
     def init_routed_experts_capturer(self):
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -2768,14 +2767,12 @@ class GPUModelRunner(
                 finishing = True
 
             # Explicit stop token IDs
-            if not finishing and sp.stop_token_ids \
-                    and last_token in sp.stop_token_ids:
+            if not finishing and sp.stop_token_ids and last_token in sp.stop_token_ids:
                 finishing = True
 
             # max_tokens / max_model_len length cap
             if not finishing:
-                if sp.max_tokens is not None \
-                        and len(output_ids) >= sp.max_tokens:
+                if sp.max_tokens is not None and len(output_ids) >= sp.max_tokens:
                     finishing = True
                 else:
                     req_idx = self.input_batch.req_id_to_index.get(req_id)
@@ -3270,9 +3267,9 @@ class GPUModelRunner(
             }
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
                 positions=self.positions.cpu[:num_scheduled_tokens],
-                num_scheduled_tokes=ordered_num_scheduled
+                num_scheduled_tokes=ordered_num_scheduled,
             )
-        
+
         return (
             num_nans_in_logits,
             logprobs_lists,
@@ -3925,16 +3922,14 @@ class GPUModelRunner(
         score_only_req_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
-            if (
-                req_state := self.requests.get(req_id)
-            ) is not None
+            if (req_state := self.requests.get(req_id)) is not None
             and req_state.sampling_params is not None
             and req_state.sampling_params.score_only
         ]
         if score_only_req_ids:
-            assert len(score_only_req_ids) == len(scheduler_output.num_scheduled_tokens), (
-                "score_only requests must not share a batch with generation requests"
-            )
+            assert len(score_only_req_ids) == len(
+                scheduler_output.num_scheduled_tokens
+            ), "score_only requests must not share a batch with generation requests"
             self._draft_token_ids = None
             self._draft_token_req_ids = None
             self.input_batch.prev_sampled_token_ids = None
@@ -4052,6 +4047,8 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+
+                if not input_fits_in_drafter:
                     # Since we couldn't run the drafter,
                     # just use zeros for the draft tokens.
                     self._draft_token_ids = torch.zeros(
@@ -6360,7 +6357,6 @@ class GPUModelRunner(
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
-
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

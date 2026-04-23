@@ -131,8 +131,9 @@ class _RoutedExpertsHostCache:
         required_len = max_pos + 1
 
         if req_id not in self._req_buffers:
-            buf = np.zeros(
+            buf = np.full(
                 (required_len, self.num_hidden_layers, self.num_experts_per_tok),
+                -1,
                 dtype=self.DTYPE,
             )
             self._req_buffers[req_id] = buf
@@ -144,8 +145,9 @@ class _RoutedExpertsHostCache:
             return buf
 
         new_len = min(max(required_len, buf.shape[0] * 2), self.max_model_len)
-        new_buf = np.zeros(
+        new_buf = np.full(
             (new_len, self.num_hidden_layers, self.num_experts_per_tok),
+            -1,
             dtype=self.DTYPE,
         )
         new_buf[: buf.shape[0]] = buf

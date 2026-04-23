@@ -559,6 +559,8 @@ class MPClient(EngineCoreClient):
             else:
                 # Engines are managed by this client.
                 addresses = get_engine_zmq_addresses(vllm_config)
+                # Release pre-bound TCP sockets before ZMQ bind.
+                addresses.release_held_ports()
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx, addresses.inputs[0], zmq.ROUTER, bind=True
                 )

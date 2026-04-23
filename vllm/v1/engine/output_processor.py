@@ -320,6 +320,18 @@ class RequestState:
             prompt_len = len(self.prompt_token_ids) if self.prompt_token_ids else 0
             prompt_routed_experts = routed_experts[:prompt_len]
             gen_routed_experts = routed_experts[prompt_len:]
+            # Trim completion routing to match actual output tokens.
+            # With MTP, the model runner captures routing for ALL
+            # accepted tokens, but the scheduler may trim tokens
+            # when a stop condition is hit mid-batch. The routing
+            # data can have 1+ extra rows beyond what the output
+            # processor sees as output tokens.
+            if self.detokenizer is not None:
+                num_gen = self.detokenizer.num_output_tokens()
+                if (gen_routed_experts is not None
+                        and gen_routed_experts.shape[0] > num_gen
+                        and num_gen > 0):
+                    gen_routed_experts = gen_routed_experts[:num_gen]
 
         output = self._new_completion_output(
             new_token_ids, finish_reason, stop_reason, gen_routed_experts
