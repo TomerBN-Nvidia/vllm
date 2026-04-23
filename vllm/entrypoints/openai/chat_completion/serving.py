@@ -1942,6 +1942,7 @@ class OpenAIServingChat(OpenAIServing):
         routed_experts: Any,
         start_pos: int,
         end_pos: int,
+        vllm_metadata: dict[str, Any] | None = None,
         rl_metadata: dict[str, Any] | None = None,
     ) -> MoETopKIndicesPayload:
         if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
@@ -1950,6 +1951,7 @@ class OpenAIServingChat(OpenAIServing):
                     request_id,
                     start_pos=start_pos,
                     end_pos=end_pos,
+                    vllm_metadata=vllm_metadata,
                     rl_metadata=rl_metadata,
                 ),
             }
@@ -1962,27 +1964,33 @@ class OpenAIServingChat(OpenAIServing):
         request_id: str,
         start_pos: int,
         end_pos: int,
+        vllm_metadata: dict[str, Any] | None = None,
         rl_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return None
         if self._get_block_store_instance() is None:
             return None
-        return {
+        tag = {
             "instance_rank": self.block_store_instance_rank,
             "instance_id": self.block_store_instance_id,
             "req_id": request_id,
             "key": "moe_topk_indices",
             "start": start_pos,
             "end": end_pos,
-            "rl_metadata": rl_metadata,
         }
+        if vllm_metadata is not None:
+            tag["vllm_metadata"] = vllm_metadata
+        if rl_metadata is not None:
+            tag["rl_metadata"] = rl_metadata
+        return tag
 
     @staticmethod
     def _normalize_moe_topk_indices_array(
         routed_experts: Any,
         expected_len: int,
         field_name: str,
+        vllm_metadata: dict,
     ) -> np.ndarray | None:
         if routed_experts is None:
             return None
@@ -2031,17 +2039,27 @@ class OpenAIServingChat(OpenAIServing):
         if routed_experts.size == 0:
             return routed_experts
 
+        # num_moe_layers = int(routed_experts.shape[-2])
         topk = int(routed_experts.shape[-1])
+        # rows = routed_experts.reshape(-1, num_moe_layers * topk)
         rows = routed_experts.reshape(-1, topk)
+        row_count = int(rows.shape[0])
         invalid_row_count = 0
-        for row in rows:
+        for row_idx in range(row_count):
+            row = rows[row_idx]
             all_zeros = np.all(row == 0)
             non_negative_unique = np.all(row >= 0) and (
                 np.unique(row).size == row.size
             )
             if not (all_zeros or non_negative_unique):
-                row.fill(0)
+                # TODO(pjin): re-enable.
+                # row.fill(0)
                 invalid_row_count += 1
+
+        vllm_metadata[field_name] = {
+            "row_count": row_count,
+            "invalid_row_count": invalid_row_count,
+        }
 
         if False and invalid_row_count > 0:
             logger.warning(
@@ -2053,7 +2071,7 @@ class OpenAIServingChat(OpenAIServing):
             )
         if invalid_row_count > 0:
             print(
-                "DEBUG: vllm.entrypoints.openai.chat_completion.serving: _normalize_moe_topk_indices_array: {field_name} has {invalid_row_count} invalid MoE top-k row(s); expected unique "
+                "DEBUG: vllm.entrypoints.openai.chat_completion.serving: _normalize_moe_topk_indices_array: {field_name} has {invalid_row_count}/{row_count} invalid MoE top-k row(s); expected unique "
                 "non-negative integers or all zeros. Rewriting invalid rows to "
                 "all zeros.",
                 flush=True,
@@ -2073,11 +2091,12 @@ class OpenAIServingChat(OpenAIServing):
         if self.block_store_instance is None:
             return
 
+        vllm_metadata = {}
         prompt_array = self._normalize_moe_topk_indices_array(
-            prompt_routed_experts, num_prompt_tokens, "prompt_routed_experts"
+            prompt_routed_experts, num_prompt_tokens, "prompt_routed_experts", vllm_metadata
         )
         completion_array = self._normalize_moe_topk_indices_array(
-            completion_routed_experts, num_completion_tokens, "routed_experts"
+            completion_routed_experts, num_completion_tokens, "routed_experts", vllm_metadata
         )
         arrays = [
             array for array in (prompt_array, completion_array) if array is not None
@@ -2093,6 +2112,7 @@ class OpenAIServingChat(OpenAIServing):
                 request_id,
                 "moe_topk_indices",
                 moe_topk_indices,
+                vllm_metadata=vllm_metadata,
                 rl_metadata=rl_metadata,
             )
         )
