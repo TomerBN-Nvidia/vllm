@@ -1946,7 +1946,7 @@ class OpenAIServingChat(OpenAIServing):
     ) -> MoETopKIndicesPayload:
         if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
             return {
-                "block_cache_key": self._get_moe_topk_indices_block_cache_key(
+                "data_tag": self._get_moe_topk_indices_data_tag(
                     request_id,
                     start_pos=start_pos,
                     end_pos=end_pos,
@@ -1957,7 +1957,7 @@ class OpenAIServingChat(OpenAIServing):
             return self._format_moe_topk_indices(routed_experts)
         return None
 
-    def _get_moe_topk_indices_block_cache_key(
+    def _get_moe_topk_indices_data_tag(
         self,
         request_id: str,
         start_pos: int,
@@ -1975,6 +1975,7 @@ class OpenAIServingChat(OpenAIServing):
             "key": "moe_topk_indices",
             "start": start_pos,
             "end": end_pos,
+            "rl_metadata": rl_metadata,
         }
 
     @staticmethod
@@ -2025,6 +2026,37 @@ class OpenAIServingChat(OpenAIServing):
             routed_experts = np.concatenate(
                 (routed_experts, np.zeros(pad_shape, dtype=routed_experts.dtype)),
                 axis=0,
+            )
+
+        if routed_experts.size == 0:
+            return routed_experts
+
+        topk = int(routed_experts.shape[-1])
+        rows = routed_experts.reshape(-1, topk)
+        invalid_row_count = 0
+        for row in rows:
+            all_zeros = np.all(row == 0)
+            non_negative_unique = np.all(row >= 0) and (
+                np.unique(row).size == row.size
+            )
+            if not (all_zeros or non_negative_unique):
+                row.fill(0)
+                invalid_row_count += 1
+
+        if False and invalid_row_count > 0:
+            logger.warning(
+                "%s has %d invalid MoE top-k row(s); expected unique "
+                "non-negative integers or all zeros. Rewriting invalid rows to "
+                "all zeros.",
+                field_name,
+                invalid_row_count,
+            )
+        if invalid_row_count > 0:
+            print(
+                "DEBUG: vllm.entrypoints.openai.chat_completion.serving: _normalize_moe_topk_indices_array: {field_name} has {invalid_row_count} invalid MoE top-k row(s); expected unique "
+                "non-negative integers or all zeros. Rewriting invalid rows to "
+                "all zeros.",
+                flush=True,
             )
 
         return routed_experts
