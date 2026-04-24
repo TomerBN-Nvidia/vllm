@@ -265,6 +265,14 @@ class RoutedExpertsCapturer(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def get_num_available_prefix_tokens(
+        self,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> int:
+        raise NotImplementedError
+
     def finalize_pending_copy(self):
         raise NotImplementedError
 
@@ -469,6 +477,33 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if hydrated_max_pos >= 0:
             self.host_cache.update_filled_len(req_id, hydrated_max_pos)
 
+    def get_num_available_prefix_tokens(
+        self,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> int:
+        if self.block_cache is None:
+            return 0
+        self.finalize_pending_copy()
+        if num_cached_tokens <= 0 or block_size <= 0:
+            return 0
+
+        num_blocks = min(num_cached_tokens // block_size, len(block_hashes))
+        if num_blocks <= 0:
+            return 0
+
+        expected_shape = (
+            block_size,
+            self.num_hidden_layers,
+            self.num_experts_per_tok,
+        )
+        for block_idx in range(num_blocks):
+            cached_block = self.block_cache.get(block_hashes[block_idx])
+            if cached_block is None or cached_block.shape != expected_shape:
+                return block_idx * block_size
+        return num_blocks * block_size
+
     def _publish_complete_blocks(
         self,
         req_id: str,
@@ -615,6 +650,14 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         block_size: int,
     ) -> None:
         pass
+
+    def get_num_available_prefix_tokens(
+        self,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> int:
+        return 0
 
     def finalize_pending_copy(self):
         pass
