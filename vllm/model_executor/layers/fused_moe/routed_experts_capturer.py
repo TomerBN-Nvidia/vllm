@@ -1,5 +1,7 @@
 import logging
 from abc import ABC
+from collections import OrderedDict
+from collections.abc import Sequence
 from typing import Optional
 
 import numpy as np
@@ -44,6 +46,7 @@ def _capture_routing_op_fake(
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
+_MAX_ROUTED_EXPERT_BLOCK_CACHE_BLOCKS = 4096
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
@@ -179,6 +182,35 @@ class _RoutedExpertsHostCache:
         )
 
 
+class _RoutedExpertsBlockCache:
+    """Content-addressed routing cache for prefix-cache block reuse."""
+
+    def __init__(self, max_blocks: int) -> None:
+        self.max_blocks = max(1, max_blocks)
+        self._blocks: OrderedDict[bytes, np.ndarray] = OrderedDict()
+
+    def get(self, block_hash: bytes) -> np.ndarray | None:
+        key = bytes(block_hash)
+        block = self._blocks.get(key)
+        if block is not None:
+            self._blocks.move_to_end(key)
+        return block
+
+    def put(self, block_hash: bytes, routed_experts: np.ndarray) -> None:
+        key = bytes(block_hash)
+        if key in self._blocks:
+            self._blocks.move_to_end(key)
+        self._blocks[key] = routed_experts.copy()
+        while len(self._blocks) > self.max_blocks:
+            self._blocks.popitem(last=False)
+
+    def clear(self) -> None:
+        self._blocks.clear()
+
+    def __len__(self) -> int:
+        return len(self._blocks)
+
+
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
@@ -189,6 +221,7 @@ class RoutedExpertsCapturer(ABC):
         max_running_requests: int,
         max_model_len: int,
         device: str,
+        block_size: int = 0,
         shared_host_cache: Optional[_RoutedExpertsHostCache] = None,
         skip_host_cache: bool = False,
     ):
@@ -200,6 +233,7 @@ class RoutedExpertsCapturer(ABC):
                 num_fused_shared_experts=num_fused_shared_experts,
                 max_model_len=max_model_len,
                 device=device,
+                block_size=block_size,
                 shared_host_cache=shared_host_cache,
                 skip_host_cache=skip_host_cache,
             )
@@ -214,8 +248,21 @@ class RoutedExpertsCapturer(ABC):
         raise NotImplementedError
 
     def sync_fwd_experts_buffer_DtoH(
-        self, positions: torch.Tensor, num_scheduled_tokes: dict[str, int],
+        self,
+        positions: torch.Tensor,
+        num_scheduled_tokes: dict[str, int],
+        block_hashes: dict[str, Sequence[bytes]] | None = None,
+        block_size: int = 0,
     ):
+        raise NotImplementedError
+
+    def hydrate_cached_prefix(
+        self,
+        req_id: str,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> None:
         raise NotImplementedError
 
     def finalize_pending_copy(self):
@@ -251,6 +298,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         num_fused_shared_experts: int,
         max_model_len: int,
         device: str,
+        block_size: int = 0,
         shared_host_cache: Optional[_RoutedExpertsHostCache] = None,
         skip_host_cache: bool = False,
     ):
@@ -260,6 +308,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
         self.num_batched_tokens = num_batched_tokens
         self.max_model_len = max_model_len
+        self.block_size = block_size
         self._skip_host_cache = skip_host_cache
 
         if skip_host_cache:
@@ -290,9 +339,21 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._has_pending_copy = False
         self._pending_positions: np.ndarray | None = None
         self._pending_num_scheduled: dict[str, int] | None = None
+        self._pending_block_hashes: dict[str, Sequence[bytes]] | None = None
+        self._pending_block_size = block_size
         self._pending_total_tokens: int = 0
 
         if not skip_host_cache:
+            max_blocks = 1
+            if block_size > 0:
+                max_blocks = max_running_requests * (
+                    (max_model_len + block_size - 1) // block_size
+                )
+                max_blocks = min(
+                    max_blocks, _MAX_ROUTED_EXPERT_BLOCK_CACHE_BLOCKS
+                )
+            self.block_cache = _RoutedExpertsBlockCache(max_blocks=max_blocks)
+
             # Same (L, N, K) layout as device_cache.buffer.
             self._pinned_staging = torch.zeros(
                 (self.num_hidden_layers, num_batched_tokens,
@@ -307,9 +368,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             logger.info(
                 f"Routing experts pinned staging buffer allocated. "
                 f"shape={tuple(self._pinned_staging.shape)}, "
-                f"size={pinned_mb:.2f} MB"
+                f"size={pinned_mb:.2f} MB, "
+                f"block_cache_max_blocks={self.block_cache.max_blocks}"
             )
         else:
+            self.block_cache = None
             self._pinned_staging = None
             self._copy_stream = None
             self._copy_event = None
@@ -329,6 +392,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         positions: torch.Tensor,
         num_scheduled_tokes: dict[str, int],
+        block_hashes: dict[str, Sequence[bytes]] | None = None,
+        block_size: int = 0,
     ):
         if self.host_cache is None:
             return
@@ -358,12 +423,86 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         # 3. Save metadata for deferred scatter.
         self._pending_positions = positions.numpy().copy()
         self._pending_num_scheduled = num_scheduled_tokes
+        self._pending_block_hashes = block_hashes
+        self._pending_block_size = block_size or self.block_size
         self._pending_total_tokens = total_tokens
         self._has_pending_copy = True
 
     # ------------------------------------------------------------------
     # Optimized scatter into pre-allocated host-cache buffers
     # ------------------------------------------------------------------
+
+    def hydrate_cached_prefix(
+        self,
+        req_id: str,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> None:
+        if self.host_cache is None or self.block_cache is None:
+            return
+        if num_cached_tokens <= 0 or block_size <= 0:
+            return
+
+        num_blocks = min(num_cached_tokens // block_size, len(block_hashes))
+        if num_blocks <= 0:
+            return
+
+        max_pos = num_blocks * block_size - 1
+        buf = self.host_cache.get_or_grow_buffer(req_id, max_pos)
+        hydrated_max_pos = -1
+        for block_idx in range(num_blocks):
+            cached_block = self.block_cache.get(block_hashes[block_idx])
+            if cached_block is None:
+                continue
+            if cached_block.shape != (
+                block_size,
+                self.num_hidden_layers,
+                self.num_experts_per_tok,
+            ):
+                continue
+            start = block_idx * block_size
+            end = start + block_size
+            buf[start:end] = cached_block
+            hydrated_max_pos = max(hydrated_max_pos, end - 1)
+
+        if hydrated_max_pos >= 0:
+            self.host_cache.update_filled_len(req_id, hydrated_max_pos)
+
+    def _publish_complete_blocks(
+        self,
+        req_id: str,
+        buf: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        if self.block_cache is None or self._pending_block_hashes is None:
+            return
+        block_size = self._pending_block_size
+        if block_size <= 0 or positions.size == 0:
+            return
+
+        block_hashes = self._pending_block_hashes.get(req_id)
+        if not block_hashes:
+            return
+
+        # A block can become hashable one scheduler step after its routing
+        # rows are filled when the block is completed by a sampled token.
+        first_block = max(int(positions.min()) // block_size - 1, 0)
+        last_block = min(int(positions.max()) // block_size + 1, len(block_hashes))
+        for block_idx in range(first_block, last_block):
+            start = block_idx * block_size
+            end = start + block_size
+            if end > buf.shape[0]:
+                continue
+            block = buf[start:end]
+            if block.shape[0] != block_size or np.any(block < 0):
+                continue
+            rows = block.reshape(-1, block.shape[-1])
+            if rows.shape[-1] > 1:
+                sorted_rows = np.sort(rows, axis=-1)
+                if np.any(np.diff(sorted_rows, axis=-1) == 0):
+                    continue
+            self.block_cache.put(block_hashes[block_idx], block)
 
     def _scatter_to_host(self):
         """Scatter D2H data into per-request host cache buffers.
@@ -389,6 +528,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 buf = host_cache.get_or_grow_buffer(req_id, pos_val)
                 buf[pos_val] = host_values[offset]
                 host_cache.update_filled_len(req_id, pos_val)
+                self._publish_complete_blocks(
+                    req_id, buf, positions_np[offset:offset + 1]
+                )
             else:
                 pos = positions_np[offset:offset + n_tokens]
                 max_pos = int(pos[-1]) if n_tokens > 0 else 0
@@ -397,11 +539,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 buf = host_cache.get_or_grow_buffer(req_id, max_pos)
                 buf[pos] = host_values[offset:offset + n_tokens]
                 host_cache.update_filled_len(req_id, max_pos)
+                self._publish_complete_blocks(req_id, buf, pos)
 
             offset += n_tokens
 
         self._pending_positions = None
         self._pending_num_scheduled = None
+        self._pending_block_hashes = None
         self._pending_total_tokens = 0
 
     # ------------------------------------------------------------------
@@ -454,7 +598,22 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def get_routed_experts(self, req_id: str, seqlen=None, free_slot=True):
         return None
 
-    def sync_fwd_experts_buffer_DtoH(self, positions, num_scheduled_tokes):
+    def sync_fwd_experts_buffer_DtoH(
+        self,
+        positions,
+        num_scheduled_tokes,
+        block_hashes=None,
+        block_size: int = 0,
+    ):
+        pass
+
+    def hydrate_cached_prefix(
+        self,
+        req_id: str,
+        block_hashes: Sequence[bytes],
+        num_cached_tokens: int,
+        block_size: int,
+    ) -> None:
         pass
 
     def finalize_pending_copy(self):
@@ -511,6 +670,7 @@ def init_routed_experts_capturer_with_shared_cache(
     max_running_requests: int,
     max_model_len: int,
     device: str,
+    block_size: int = 0,
     rank: int = 0,
     world_size: int = 1,
 ) -> RoutedExpertsCapturer:
@@ -536,6 +696,7 @@ def init_routed_experts_capturer_with_shared_cache(
             max_running_requests=max_running_requests,
             max_model_len=max_model_len,
             device=device,
+            block_size=block_size,
             skip_host_cache=True,
         )
         set_global_experts_capturer(capturer)
@@ -549,6 +710,7 @@ def init_routed_experts_capturer_with_shared_cache(
         max_running_requests=max_running_requests,
         max_model_len=max_model_len,
         device=device,
+        block_size=block_size,
         skip_host_cache=False,
     )
     set_global_experts_capturer(capturer)

@@ -244,6 +244,13 @@ class Scheduler(SchedulerInterface):
                 "return_routed_experts does not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
+            if self.cache_config.enable_prefix_caching:
+                logger.warning_once(
+                    "return_routed_experts is enabled with prefix caching. "
+                    "Routed experts for cache-hit prefix tokens are hydrated "
+                    "from a block-hash routing cache when available; missing "
+                    "routing blocks remain -1 sentinel rows."
+                )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -1029,6 +1036,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        block_hashes: list[list[bytes]] = []
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1064,6 +1072,7 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            block_hashes.append(list(req.block_hashes))
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1073,6 +1082,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            block_hashes=block_hashes,
         )
 
     def _try_schedule_encoder_inputs(
