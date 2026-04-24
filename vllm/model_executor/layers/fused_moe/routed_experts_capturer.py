@@ -46,7 +46,7 @@ def _capture_routing_op_fake(
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
-_MAX_ROUTED_EXPERT_BLOCK_CACHE_BLOCKS = 4096
+_MAX_ROUTED_EXPERT_BLOCK_CACHE_BLOCKS = 262144
 
 
 def get_tensor_size_bytes(t: torch.Tensor):
