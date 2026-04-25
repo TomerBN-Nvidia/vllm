@@ -196,13 +196,16 @@ class _RoutedExpertsBlockCache:
             self._blocks.move_to_end(key)
         return block
 
-    def put(self, block_hash: bytes, routed_experts: np.ndarray) -> None:
+    def put(self, block_hash: bytes, routed_experts: np.ndarray) -> list[bytes]:
         key = bytes(block_hash)
         if key in self._blocks:
             self._blocks.move_to_end(key)
         self._blocks[key] = routed_experts.copy()
+        evicted: list[bytes] = []
         while len(self._blocks) > self.max_blocks:
-            self._blocks.popitem(last=False)
+            evicted_key, _ = self._blocks.popitem(last=False)
+            evicted.append(evicted_key)
+        return evicted
 
     def clear(self) -> None:
         self._blocks.clear()
@@ -271,6 +274,9 @@ class RoutedExpertsCapturer(ABC):
         num_cached_tokens: int,
         block_size: int,
     ) -> int:
+        raise NotImplementedError
+
+    def take_routing_replay_block_hash_updates(self) -> tuple[list[bytes], list[bytes]]:
         raise NotImplementedError
 
     def finalize_pending_copy(self):
@@ -350,6 +356,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._pending_block_hashes: dict[str, Sequence[bytes]] | None = None
         self._pending_block_size = block_size
         self._pending_total_tokens: int = 0
+        self._added_routing_replay_block_hashes: list[bytes] = []
+        self._removed_routing_replay_block_hashes: list[bytes] = []
 
         if not skip_host_cache:
             max_blocks = 1
@@ -537,7 +545,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 sorted_rows = np.sort(rows, axis=-1)
                 if np.any(np.diff(sorted_rows, axis=-1) == 0):
                     continue
-            self.block_cache.put(block_hashes[block_idx], block)
+            block_hash = bytes(block_hashes[block_idx])
+            evicted_hashes = self.block_cache.put(block_hash, block)
+            self._added_routing_replay_block_hashes.append(block_hash)
+            self._removed_routing_replay_block_hashes.extend(evicted_hashes)
 
     def _scatter_to_host(self):
         """Scatter D2H data into per-request host cache buffers.
@@ -622,6 +633,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def get_device_cache(self):
         return self.device_cache
 
+    def take_routing_replay_block_hash_updates(self) -> tuple[list[bytes], list[bytes]]:
+        added = self._added_routing_replay_block_hashes
+        removed = self._removed_routing_replay_block_hashes
+        self._added_routing_replay_block_hashes = []
+        self._removed_routing_replay_block_hashes = []
+        return added, removed
+
 
 class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def __init__(self):
@@ -658,6 +676,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         block_size: int,
     ) -> int:
         return 0
+
+    def take_routing_replay_block_hash_updates(self) -> tuple[list[bytes], list[bytes]]:
+        return [], []
 
     def finalize_pending_copy(self):
         pass

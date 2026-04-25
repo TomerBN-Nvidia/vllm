@@ -4133,12 +4133,19 @@ class GPUModelRunner(
             # In async scheduling mode, valid_sampled_token_ids is empty at this point,
             # so we extract for all requests and let the scheduler filter.
             routed_experts_dict = None
+            routing_replay_added_block_hashes: list[bytes] = []
+            routing_replay_removed_block_hashes: list[bytes] = []
             if self.cache_config.return_routed_experts:
+                capturer = get_global_experts_capturer()
                 # Use req_ids_output_copy (all requests in batch) since
                 # valid_sampled_token_ids may be empty in async scheduling mode.
                 routed_experts_dict = self._extract_routed_experts_for_current_batch(
                     req_ids_output_copy
                 )
+                (
+                    routing_replay_added_block_hashes,
+                    routing_replay_removed_block_hashes,
+                ) = capturer.take_routing_replay_block_hash_updates()
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4153,6 +4160,12 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts_dict=routed_experts_dict,
+                routing_replay_added_block_hashes=(
+                    routing_replay_added_block_hashes
+                ),
+                routing_replay_removed_block_hashes=(
+                    routing_replay_removed_block_hashes
+                ),
             )
 
         if not self.use_async_scheduling:
