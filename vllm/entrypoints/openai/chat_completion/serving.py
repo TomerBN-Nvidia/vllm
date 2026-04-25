@@ -2044,24 +2044,32 @@ class OpenAIServingChat(OpenAIServing):
         # rows = routed_experts.reshape(-1, num_moe_layers * topk)
         rows = routed_experts.reshape(-1, topk)
         row_count = int(rows.shape[0])
-        invalid_row_count = 0
-        for row_idx in range(row_count):
-            row = rows[row_idx]
-            all_zeros = np.all(row == 0)
-            non_negative_unique = np.all(row >= 0) and (
-                np.unique(row).size == row.size
-            )
-            if not (all_zeros or non_negative_unique):
-                # TODO(pjin): re-enable.
-                # row.fill(0)
-                invalid_row_count += 1
+        all_zero_rows = np.all(rows == 0, axis=-1)
+        non_negative_rows = np.all(rows >= 0, axis=-1)
+        negative_rows = np.any(rows < 0, axis=-1)
+        if topk > 1:
+            sorted_rows = np.sort(rows, axis=-1)
+            unique_rows = np.all(np.diff(sorted_rows, axis=-1) != 0, axis=-1)
+        else:
+            unique_rows = np.ones(row_count, dtype=bool)
+        valid_rows = all_zero_rows | (non_negative_rows & unique_rows)
+        invalid_rows = ~valid_rows
+        invalid_row_count = int(np.count_nonzero(invalid_rows))
+        negative_row_count = int(np.count_nonzero(invalid_rows & negative_rows))
+
+        if invalid_row_count:
+            # rows[invalid_rows] = 0
+            # routed_experts[...] = rows.reshape(routed_experts.shape)
+            pass
 
         vllm_metadata[field_name] = {
             "row_count": row_count,
             "invalid_row_count": invalid_row_count,
+            "negative_row_count": negative_row_count,
+            # "sanitized_row_count": invalid_row_count,
         }
 
-        if False and invalid_row_count > 0:
+        if invalid_row_count > 0:
             logger.warning(
                 "%s has %d invalid MoE top-k row(s); expected unique "
                 "non-negative integers or all zeros. Rewriting invalid rows to "
@@ -2069,7 +2077,7 @@ class OpenAIServingChat(OpenAIServing):
                 field_name,
                 invalid_row_count,
             )
-        if invalid_row_count > 0:
+        if False and invalid_row_count > 0:
             print(
                 "DEBUG: vllm.entrypoints.openai.chat_completion.serving: _normalize_moe_topk_indices_array: {field_name} has {invalid_row_count}/{row_count} invalid MoE top-k row(s); expected unique "
                 "non-negative integers or all zeros. Rewriting invalid rows to "
