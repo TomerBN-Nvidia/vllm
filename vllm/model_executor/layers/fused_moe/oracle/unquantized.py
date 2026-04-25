@@ -199,8 +199,14 @@ def convert_to_unquantized_kernel_format(
         )
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
-        # Swap halves to arrange as [w3; w1] (kernel expectation)
-        w13_weight = swap_w13_to_w31(layer.w13_weight.data)
+        # Swap halves to arrange as [w3; w1] (kernel expectation).
+        # Only meaningful for gated MoE; non-gated layouts have a single
+        # contiguous w1 (no halves to swap), and applying the swap there
+        # corrupts the weights.
+        if layer.moe_config.is_act_and_mul:
+            w13_weight = swap_w13_to_w31(layer.w13_weight.data)
+        else:
+            w13_weight = layer.w13_weight.data
 
     return w13_weight, w2_weight
 
