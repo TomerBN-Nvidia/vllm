@@ -196,6 +196,25 @@ class OpenAIServingChat(OpenAIServing):
                 return None
         return self.metadata_store_instance
 
+    def _get_grpo_weight_version_snapshot(self) -> int | None:
+        metadata_store = self._get_metadata_store_instance()
+        if metadata_store is None:
+            return None
+        weight_version_curr = ray.get(
+            metadata_store.get.remote("grpo.weight_version.curr")
+        )
+        weight_version_next = ray.get(
+            metadata_store.get.remote("grpo.weight_version.next")
+        )
+        # TODO: report weight update skew.
+        if weight_version_next is not None and weight_version_curr is not None:
+            return max(weight_version_next, weight_version_curr)
+        if weight_version_next is not None:
+            return weight_version_next
+        if weight_version_curr is not None:
+            return weight_version_curr
+        return None
+
     def _get_block_store_instance(self) -> Any:
         if self.block_store_instance is None:
             node_ip = ray._private.services.get_node_ip_address()
@@ -415,6 +434,16 @@ class OpenAIServingChat(OpenAIServing):
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
+        return_moe_topk_indices = (
+            self.model_config.enable_moe_topk_indices_nemo_rl_block_store
+            or self.model_config.enable_moe_topk_indices_json
+        )
+        pre_generation_weight_version = (
+            self._get_grpo_weight_version_snapshot()
+            if return_moe_topk_indices and not request.stream
+            else None
+        )
+
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -507,6 +536,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                pre_generation_weight_version=pre_generation_weight_version,
             )
 
         try:
@@ -1448,6 +1478,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        pre_generation_weight_version: int | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1493,23 +1524,19 @@ class OpenAIServingChat(OpenAIServing):
             )
 
         rl_metadata = None
-        if return_moe_topk_indices:
-            if self._get_metadata_store_instance() is not None:
-                weight_version_next = ray.get(self.metadata_store_instance.get.remote("grpo.weight_version.next"))
-                weight_version_curr = ray.get(self.metadata_store_instance.get.remote("grpo.weight_version.curr"))
-                # TODO: report weight update skew.
-                if weight_version_next is not None and weight_version_curr is not None:
-                    weight_version = max(weight_version_next, weight_version_curr)
-                elif weight_version_next is not None:
-                    weight_version = weight_version_next
-                elif weight_version_curr is not None:
-                    weight_version = weight_version_curr
-                else:
-                    weight_version = None
-                if weight_version is not None:
-                    rl_metadata = {
-                        "grpo.weight_version": weight_version,
-                    }
+        weight_version = (
+            self._get_grpo_weight_version_snapshot()
+            if return_moe_topk_indices and not request.stream
+            else None
+        )
+        if pre_generation_weight_version is None:
+            if rl_metadata is None:
+                rl_metadata = {}
+            rl_metadata["grpo.weight_version.pre"] = pre_generation_weight_version
+        if weight_version is not None:
+            if rl_metadata is None:
+                rl_metadata = {}
+            rl_metadata["grpo.weight_version"] = weight_version
 
         assert final_res.prompt_token_ids is not None
         num_prompt_tokens = len(final_res.prompt_token_ids)
