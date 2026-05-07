@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU unit tests for the _pad_tensor_dim helper used by the FP4 Marlin
-n-dim padding fix on H100 (NVFP4 MoE).
+"""CPU unit tests for the _pad_tensor_dim and _pad_w13_for_marlin_tile
+helpers used by the FP4 Marlin n-dim padding fix on H100 (NVFP4 MoE).
 
 Run `pytest tests/kernels/quantization/test_marlin_utils_fp4_padding.py`.
 """
@@ -12,6 +12,7 @@ import torch
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     FP4_MARLIN_TILE_N_SIZE,
     _pad_tensor_dim,
+    _pad_w13_for_marlin_tile,
 )
 
 
@@ -79,3 +80,35 @@ def test_pad_to_tile_alignment_matches_design_table(intermediate: int):
     out = _pad_tensor_dim(t, dim=1, padded_size=padded)
     assert out.shape[1] == padded
     assert out.shape[1] % FP4_MARLIN_TILE_N_SIZE == 0
+
+
+def test_pad_w13_helper_aligned_returns_input_identity():
+    """Aligned input must return the same tensor objects unchanged.
+    The in-place ``prepare_moe_fp4_layer_for_marlin`` caller relies on
+    ``is`` identity to skip the nn.Parameter rewrap when no padding occurred.
+    """
+    w13 = torch.ones(4, 128, 16)
+    w13_scale = torch.ones(4, 128, 4)
+    out_w13, out_scale, padded_n = _pad_w13_for_marlin_tile(
+        w13, w13_scale, unpadded_w13_size_n=128
+    )
+    assert out_w13 is w13
+    assert out_scale is w13_scale
+    assert padded_n == 128
+
+
+def test_pad_w13_helper_misaligned_pads_both_to_tile():
+    """Misaligned input must pad both w13 and w13_scale to the same
+    tile-aligned size_n on dim 1."""
+    e, unpadded, half_k = 4, 50, 16
+    w13 = torch.ones(e, unpadded, half_k)
+    w13_scale = torch.ones(e, unpadded, 4)
+    out_w13, out_scale, padded_n = _pad_w13_for_marlin_tile(
+        w13, w13_scale, unpadded_w13_size_n=unpadded
+    )
+    assert padded_n == 64
+    assert out_w13.shape == (e, 64, half_k)
+    assert out_scale.shape == (e, 64, 4)
+    # Padded rows are zero.
+    assert torch.equal(out_w13[:, unpadded:, :], torch.zeros(e, 14, half_k))
+    assert torch.equal(out_scale[:, unpadded:, :], torch.zeros(e, 14, 4))

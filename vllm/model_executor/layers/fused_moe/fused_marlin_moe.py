@@ -289,6 +289,11 @@ def fused_marlin_moe(
     - w1_zeros (torch.Tensor|None): Optional zero points to be used for w1.
     - w2_zeros (torch.Tensor|None): Optional zero points to be used for w2.
     - num_bits (bool): The number of bits in expert weights quantization.
+    - padded_w13_size_n (int|None): FP4 Marlin only. When the per-rank w13
+        size_n was padded to satisfy the kernel's tile-alignment constraint
+        (set by ``prepare_*_moe_layer_for_marlin``), pass the padded size
+        here so the gemm output is correctly sized and the unpadded portion
+        is sliced back before activation. Leave as None for other backends.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
