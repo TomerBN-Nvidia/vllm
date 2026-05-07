@@ -163,7 +163,9 @@ def _fused_marlin_moe(
         is_zp_float=False,
     )
     if padded_w13_size_n != unpadded_w13_size_n:
-        intermediate_cache1 = intermediate_cache1[:, :unpadded_w13_size_n]
+        # Slicing produces a non-contiguous tensor; the activation kernels
+        # below require contiguous storage, so materialize a copy.
+        intermediate_cache1 = intermediate_cache1[:, :unpadded_w13_size_n].contiguous()
     if clamp_limit is not None and activation == MoEActivation.SILU:
         swiglu_limit_func(
             intermediate_cache2,
@@ -948,7 +950,15 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         num_dispatchers = self.num_dispatchers
         num_experts = local_num_experts
         max_num_tokens = self.max_num_tokens
-        workspace13 = (num_experts * max_num_tokens * num_dispatchers, max(K, N * 2))
+        # Use marlin_padded_w13_n when set (round_up(2*N, tile_n_size) for the
+        # gated case BatchedMarlinExperts targets); fall back to 2*N otherwise.
+        w13_size_n = (
+            self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
+        )
+        workspace13 = (
+            num_experts * max_num_tokens * num_dispatchers,
+            max(K, w13_size_n),
+        )
         workspace2 = (num_experts * max_num_tokens * num_dispatchers, N)
         output = (num_experts, max_num_tokens * num_dispatchers, K)
         return (workspace13, workspace2, output)
