@@ -48,6 +48,33 @@ def _pad_tensor_dim(
     return torch.cat((tensor, pad), dim=dim)
 
 
+def _pad_w13_for_marlin_tile(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    unpadded_w13_size_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad w13 weight + scale along size_n (dim=1) to FP4_MARLIN_TILE_N_SIZE.
+
+    Marlin requires the w13 size_n (= w13_num_shards * N) to be tile-aligned.
+    When the per-rank N (after TP/EP slicing) doesn't divide tile_n_size=64,
+    we pad along size_n with zeros so the repack kernel accepts it. Zero-padded
+    rows produce zero gemm contributions and are sliced back out before the
+    activation in ``_fused_marlin_moe``. Mirrors the linear-path fix in #41232.
+
+    Returns the (possibly unchanged) tensors and the post-padding size_n.
+    """
+    padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
+    if padded_w13_size_n != unpadded_w13_size_n:
+        logger.warning_once(
+            "Padding is required for Marlin FP4 MoE w13 (n=%d -> %d).",
+            unpadded_w13_size_n,
+            padded_w13_size_n,
+        )
+        w13 = _pad_tensor_dim(w13, dim=1, padded_size=padded_w13_size_n)
+        w13_scale = _pad_tensor_dim(w13_scale, dim=1, padded_size=padded_w13_size_n)
+    return w13, w13_scale, padded_w13_size_n
+
+
 def is_fp4_marlin_supported():
     return current_platform.is_cuda() and current_platform.has_device_capability(75)
 
@@ -339,24 +366,9 @@ def prepare_nvfp4_moe_layer_for_marlin(
     N = layer.intermediate_size_per_partition
     w13_num_shards = 2 if is_act_and_mul else 1
 
-    # Marlin requires the w13 size_n (= w13_num_shards * N) to be tile-aligned.
-    # When the per-rank N (after TP/EP slicing) doesn't divide tile_n_size=64,
-    # pad along the size_n axis with zeros so the repack kernel accepts it.
-    # The padding is sliced back out in _fused_marlin_moe at apply time. This
-    # mirrors the linear-path fix in vllm-project/vllm#41232.
-    unpadded_w13_size_n = w13_num_shards * N
-    padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
-    padding_n_required = padded_w13_size_n != unpadded_w13_size_n
-
-    if padding_n_required:
-        logger.warning_once(
-            "Padding is required for Marlin FP4 MoE w13 (n=%d -> %d).",
-            unpadded_w13_size_n,
-            padded_w13_size_n,
-        )
-        w13 = _pad_tensor_dim(w13, dim=1, padded_size=padded_w13_size_n)
-        w13_scale = _pad_tensor_dim(w13_scale, dim=1, padded_size=padded_w13_size_n)
-
+    w13, w13_scale, padded_w13_size_n = _pad_w13_for_marlin_tile(
+        w13, w13_scale, w13_num_shards * N
+    )
     layer.marlin_padded_w13_n = padded_w13_size_n
 
     device = w13.device
@@ -454,32 +466,16 @@ def prepare_moe_fp4_layer_for_marlin(
     k = layer.moe_config.hidden_dim
     n = layer.moe_config.intermediate_size_per_partition
 
-    # Marlin FP4 requires w13 size_n (= 2*n in this in-place variant, which
-    # assumes gated MoE) to be tile-aligned. Pad along size_n when not.
-    # Mirrors the pure-fn NVFP4 prepare and PR #41232 (linear path).
-    unpadded_w13_size_n = n * 2
-    padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
-    padding_n_required = padded_w13_size_n != unpadded_w13_size_n
-
-    if padding_n_required:
-        logger.warning_once(
-            "Padding is required for Marlin FP4 MoE w13 (n=%d -> %d).",
-            unpadded_w13_size_n,
-            padded_w13_size_n,
-        )
-        layer.w13_weight = torch.nn.Parameter(
-            _pad_tensor_dim(
-                layer.w13_weight.data, dim=1, padded_size=padded_w13_size_n
-            ),
-            requires_grad=False,
-        )
+    # In-place gated-MoE variant: pad and re-wrap as nn.Parameter only when
+    # padding actually changed the tensors.
+    w13_padded, w13_scale_padded, padded_w13_size_n = _pad_w13_for_marlin_tile(
+        layer.w13_weight.data, layer.w13_weight_scale.data, n * 2
+    )
+    if w13_padded is not layer.w13_weight.data:
+        layer.w13_weight = torch.nn.Parameter(w13_padded, requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(
-            _pad_tensor_dim(
-                layer.w13_weight_scale.data, dim=1, padded_size=padded_w13_size_n
-            ),
-            requires_grad=False,
+            w13_scale_padded, requires_grad=False
         )
-
     layer.marlin_padded_w13_n = padded_w13_size_n
 
     # WORKSPACE
@@ -634,21 +630,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
     perm = torch.empty(0, dtype=torch.int, device=device)
 
-    # Marlin FP4 requires w13 size_n (= 2*n in this gated-MoE variant) to be
-    # tile-aligned. Pad along size_n when not. Mirrors PR #41232 (linear).
-    unpadded_w13_size_n = n * 2
-    padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
-    padding_n_required = padded_w13_size_n != unpadded_w13_size_n
-
-    if padding_n_required:
-        logger.warning_once(
-            "Padding is required for Marlin FP4 MoE w13 (n=%d -> %d).",
-            unpadded_w13_size_n,
-            padded_w13_size_n,
-        )
-        w13 = _pad_tensor_dim(w13, dim=1, padded_size=padded_w13_size_n)
-        w13_scale = _pad_tensor_dim(w13_scale, dim=1, padded_size=padded_w13_size_n)
-
+    w13, w13_scale, padded_w13_size_n = _pad_w13_for_marlin_tile(w13, w13_scale, n * 2)
     layer.marlin_padded_w13_n = padded_w13_size_n
 
     # WEIGHT: Repack weights to marlin format
