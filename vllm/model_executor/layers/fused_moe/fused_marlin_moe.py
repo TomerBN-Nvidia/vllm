@@ -91,17 +91,21 @@ def _fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
     clamp_limit: float | None = None,
+    padded_w13_size_n: int | None = None,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
+    unpadded_w13_size_n = w13_num_shards * N
+    if padded_w13_size_n is None:
+        padded_w13_size_n = unpadded_w13_size_n
     if workspace is None:
         workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
     if intermediate_cache13 is None:
         intermediate_cache13 = torch.empty(
-            (M * num_topk * max(w13_num_shards * N, K),),
+            (M * num_topk * max(padded_w13_size_n, K),),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -114,7 +118,7 @@ def _fused_marlin_moe(
         )
 
     intermediate_cache1 = _resize_cache(
-        intermediate_cache13, (M * num_topk, w13_num_shards * N)
+        intermediate_cache13, (M * num_topk, padded_w13_size_n)
     )
 
     intermediate_cache3 = _resize_cache(intermediate_cache13, (M * num_topk, K))
@@ -151,13 +155,15 @@ def _fused_marlin_moe(
         mul_topk_weights=apply_router_weight_on_input,
         b_q_type=quant_type,
         size_m=M,
-        size_n=w13_num_shards * N,
+        size_n=padded_w13_size_n,
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+    if padded_w13_size_n != unpadded_w13_size_n:
+        intermediate_cache1 = intermediate_cache1[:, :unpadded_w13_size_n]
     if clamp_limit is not None and activation == MoEActivation.SILU:
         swiglu_limit_func(
             intermediate_cache2,
@@ -258,6 +264,7 @@ def fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     inplace: bool = False,
     clamp_limit: float | None = None,
+    padded_w13_size_n: int | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -375,6 +382,7 @@ def fused_marlin_moe(
         input_dtype=input_dtype,
         is_k_full=is_k_full,
         clamp_limit=clamp_limit,
+        padded_w13_size_n=padded_w13_size_n,
     ).view(-1, topk, K)
 
     if output is None:
@@ -414,6 +422,7 @@ def batched_fused_marlin_moe(
     is_k_full: bool = True,
     output: torch.Tensor | None = None,
     inplace: bool = False,
+    padded_w13_size_n: int | None = None,
 ) -> torch.Tensor:
     """
     This function massages the inputs so the batched hidden_states can be
@@ -536,6 +545,7 @@ def batched_fused_marlin_moe(
         intermediate_cache2=intermediate_cache2,
         output=output.view(-1, K) if output is not None else output,
         is_k_full=is_k_full,
+        padded_w13_size_n=padded_w13_size_n,
     )
 
     output = output.view(B, BATCH_TOKENS_MAX, K)
@@ -570,6 +580,12 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        # Set by prepare_*_moe_layer_for_marlin when w13 size_n needed padding
+        # to satisfy the kernel's tile-alignment constraint. Read here so the
+        # apply path and workspace_shapes can size the gemm output correctly.
+        self.marlin_padded_w13_n: int | None = getattr(
+            quant_config, "marlin_padded_w13_n", None
+        )
 
         super().__init__(
             moe_config=moe_config,
@@ -709,9 +725,14 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         # workspace2 = (M * topk, N)
 
         # Workspace/IntermediateCache allocation accounting for output buffer
-        # provisioning
+        # provisioning. Use marlin_padded_w13_n when set (it is round_up(2*N,
+        # tile_n_size) for gated and round_up(N, tile_n_size) for non-gated);
+        # fall back to the gated 2*N when not set.
+        w13_size_n = (
+            self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
+        )
         workspace1 = (M * topk, max(N, K))
-        workspace2 = (M * topk * max(2 * N, K),)
+        workspace2 = (M * topk * max(w13_size_n, K),)
         output = (M, K)
 
         return (workspace1, workspace2, output)
@@ -769,6 +790,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 sort_indices2=self.w2_g_idx_sort_indices,
                 is_k_full=self.is_k_full,
                 input_dtype=self.input_dtype,
+                padded_w13_size_n=self.marlin_padded_w13_n,
             )
             return
 
@@ -866,6 +888,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
             clamp_limit=self.gemm1_clamp_limit,
+            padded_w13_size_n=self.marlin_padded_w13_n,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
@@ -971,4 +994,5 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             sort_indices1=self.w13_g_idx_sort_indices,
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
+            padded_w13_size_n=self.marlin_padded_w13_n,
         )

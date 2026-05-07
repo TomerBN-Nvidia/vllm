@@ -258,6 +258,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            marlin_padded_w13_n=getattr(layer, "marlin_padded_w13_n", None),
         )
 
     def apply_monolithic(
