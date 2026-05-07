@@ -430,6 +430,7 @@ def make_nvfp4_moe_quant_config(
     a13_scale: torch.Tensor,
     a2_scale: torch.Tensor,
     marlin_padded_w13_n: int | None = None,
+    marlin_padded_w2_k: int | None = None,
 ) -> FusedMoEQuantConfig:
     if backend == NvFp4MoeBackend.MARLIN:
         return nvfp4_w4a16_moe_quant_config(
@@ -438,6 +439,7 @@ def make_nvfp4_moe_quant_config(
             w1_scale=w13_scale,
             w2_scale=w2_scale,
             marlin_padded_w13_n=marlin_padded_w13_n,
+            marlin_padded_w2_k=marlin_padded_w2_k,
         )
     elif backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(

@@ -259,6 +259,12 @@ class FusedMoEQuantConfig:
     # functions; read by MarlinExpertsBase to size the gemm output and slice
     # the unpadded portion in _fused_marlin_moe.
     marlin_padded_w13_n: int | None = None
+    # FP4 Marlin MoE: padded w2 size_k (= intermediate dim) when the per-rank
+    # value didn't divide tile_n_size=64 (the kernel's thread-config selector
+    # rejects unaligned prob_k since available thread_k values are {64,128}).
+    # Set by prepare; read by MarlinExpertsBase; activation output is padded
+    # along K before the down-projection gemm in _fused_marlin_moe.
+    marlin_padded_w2_k: int | None = None
 
     mx_alignment: int = 0
 
@@ -513,6 +519,7 @@ class FusedMoEQuantConfig:
         gemm1_beta: float | None = None,
         gemm1_clamp_limit: float | None = None,
         marlin_padded_w13_n: int | None = None,
+        marlin_padded_w2_k: int | None = None,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -583,6 +590,7 @@ class FusedMoEQuantConfig:
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=gemm1_clamp_limit,
             marlin_padded_w13_n=marlin_padded_w13_n,
+            marlin_padded_w2_k=marlin_padded_w2_k,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -851,6 +859,7 @@ def nvfp4_w4a16_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     marlin_padded_w13_n: int | None = None,
+    marlin_padded_w2_k: int | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-but activations and nvp4 weights.
@@ -863,6 +872,7 @@ def nvfp4_w4a16_moe_quant_config(
         g2_alphas=g2_alphas,
         weight_dtype="nvfp4",
         marlin_padded_w13_n=marlin_padded_w13_n,
+        marlin_padded_w2_k=marlin_padded_w2_k,
     )
 
 
