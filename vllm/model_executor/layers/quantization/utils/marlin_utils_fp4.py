@@ -81,7 +81,7 @@ def _pad_w2_for_marlin_tile(
     unpadded_w2_size_k: int,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pad w2 weight + scale along size_k (dim=2, intermediate axis) to FP4_MARLIN_TILE_N_SIZE.
+    """Pad w2 weight + scale along size_k (intermediate axis) to FP4_MARLIN_TILE_N_SIZE.
 
     Marlin's apply-time thread-config selector requires ``prob_k % thread_k == 0``
     and the available ``thread_k`` values are {64, 128} (see
