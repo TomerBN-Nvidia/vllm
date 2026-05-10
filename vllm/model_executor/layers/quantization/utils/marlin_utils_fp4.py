@@ -53,9 +53,8 @@ def _pad_w13_for_marlin_tile(
     w13_scale: torch.Tensor,
     unpadded_w13_size_n: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pad w13 along size_n to FP4_MARLIN_TILE_N_SIZE; mirrors the linear-path
-    fix in #41232. Zero-padded rows are sliced back out before activation in
-    ``_fused_marlin_moe``."""
+    """Pad w13 along size_n to FP4_MARLIN_TILE_N_SIZE. Zero-padded rows are
+    sliced back out before activation in ``_fused_marlin_moe``."""
     padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
     if padded_w13_size_n != unpadded_w13_size_n:
         logger.warning_once(
