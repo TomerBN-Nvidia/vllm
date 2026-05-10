@@ -53,16 +53,9 @@ def _pad_w13_for_marlin_tile(
     w13_scale: torch.Tensor,
     unpadded_w13_size_n: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pad w13 weight + scale along size_n (dim=1) to FP4_MARLIN_TILE_N_SIZE.
-
-    Marlin requires the w13 size_n (= w13_num_shards * N) to be tile-aligned.
-    When the per-rank N (after TP/EP slicing) doesn't divide tile_n_size=64,
-    we pad along size_n with zeros so the repack kernel accepts it. Zero-padded
-    rows produce zero gemm contributions and are sliced back out before the
-    activation in ``_fused_marlin_moe``. Mirrors the linear-path fix in #41232.
-
-    Returns the (possibly unchanged) tensors and the post-padding size_n.
-    """
+    """Pad w13 along size_n to FP4_MARLIN_TILE_N_SIZE; mirrors the linear-path
+    fix in #41232. Zero-padded rows are sliced back out before activation in
+    ``_fused_marlin_moe``."""
     padded_w13_size_n = round_up(unpadded_w13_size_n, FP4_MARLIN_TILE_N_SIZE)
     if padded_w13_size_n != unpadded_w13_size_n:
         logger.warning_once(
@@ -81,24 +74,9 @@ def _pad_w2_for_marlin_tile(
     unpadded_w2_size_k: int,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Pad w2 weight + scale along size_k (intermediate axis) to FP4_MARLIN_TILE_N_SIZE.
-
-    Marlin's apply-time thread-config selector requires ``prob_k % thread_k == 0``
-    and the available ``thread_k`` values are {64, 128} (see
-    ``small_batch_thread_configs`` / ``large_batch_thread_configs`` in
-    ``csrc/moe/marlin_moe_wna16/ops.cu``). When the per-rank intermediate dim
-    (after TP/EP slicing) doesn't divide 64, no valid thread config exists and
-    the kernel rejects the gemm. Padding to round_up(K, 64) also satisfies the
-    prepare-time tile_k_size=16 constraint that triggers when intermediate is
-    not 16-aligned (e.g. 232 at TP=8).
-
-    Activation input (intermediate_cache2) must be similarly padded at apply
-    time in ``_fused_marlin_moe``. Zero-padded columns produce zero gemm
-    contributions; the down-projection output (size_n = hidden_size) is
-    untouched, so no slicing is needed at apply time.
-
-    Returns the (possibly unchanged) tensors and the post-padding size_k.
-    """
+    """Pad w2 along size_k to FP4_MARLIN_TILE_N_SIZE so the kernel's
+    thread-config selector (thread_k in {64, 128}) accepts the gemm. The
+    activation input is padded to match in ``_fused_marlin_moe``."""
     padded_w2_size_k = round_up(unpadded_w2_size_k, FP4_MARLIN_TILE_N_SIZE)
     if padded_w2_size_k != unpadded_w2_size_k:
         logger.warning_once(
@@ -106,9 +84,7 @@ def _pad_w2_for_marlin_tile(
             unpadded_w2_size_k,
             padded_w2_size_k,
         )
-        # weight: (E, size_n=hidden_size, size_k // 2)  -> pad dim 2.
         w2 = _pad_tensor_dim(w2, dim=2, padded_size=padded_w2_size_k // 2)
-        # scale:  (E, size_n=hidden_size, size_k // group_size) -> pad dim 2.
         w2_scale = _pad_tensor_dim(
             w2_scale, dim=2, padded_size=padded_w2_size_k // group_size
         )

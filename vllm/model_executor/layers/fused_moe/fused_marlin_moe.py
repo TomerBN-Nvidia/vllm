@@ -205,9 +205,6 @@ def _fused_marlin_moe(
         )
 
     if padded_w2_size_k != unpadded_w2_size_k:
-        # Match the prepare-time pad of w2 along size_k. Zero-padded columns
-        # produce zero gemm contributions; output (size_n = hidden_size) is
-        # untouched so no slicing is needed afterwards.
         intermediate_cache2 = _pad_tensor_dim(
             intermediate_cache2, dim=1, padded_size=padded_w2_size_k
         )
@@ -305,16 +302,10 @@ def fused_marlin_moe(
     - w1_zeros (torch.Tensor|None): Optional zero points to be used for w1.
     - w2_zeros (torch.Tensor|None): Optional zero points to be used for w2.
     - num_bits (bool): The number of bits in expert weights quantization.
-    - padded_w13_size_n (int|None): FP4 Marlin only. When the per-rank w13
-        size_n was padded to satisfy the kernel's tile-alignment constraint
-        (set by ``prepare_*_moe_layer_for_marlin``), pass the padded size
-        here so the gemm output is correctly sized and the unpadded portion
-        is sliced back before activation. Leave as None for other backends.
-    - padded_w2_size_k (int|None): FP4 Marlin only. When the per-rank w2
-        size_k (= intermediate dim) was padded to satisfy the kernel's
-        thread-config requirement (prob_k % 64 == 0), pass the padded size
-        here so the activation output is padded to match before the
-        down-projection gemm. Leave as None for other backends.
+    - padded_w13_size_n (int|None): FP4 Marlin only; padded w13 size_n set
+        by ``prepare_*_moe_layer_for_marlin``. None for other backends.
+    - padded_w2_size_k (int|None): FP4 Marlin only; padded w2 size_k
+        (= intermediate dim) set by prepare. None for other backends.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -611,9 +602,6 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
         self.is_k_full = is_k_full
         self.input_dtype = get_marlin_input_dtype()
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
-        # Set by prepare_*_moe_layer_for_marlin when w13 size_n needed padding
-        # to satisfy the kernel's tile-alignment constraint. Read here so the
-        # apply path and workspace_shapes can size the gemm output correctly.
         self.marlin_padded_w13_n: int | None = getattr(
             quant_config, "marlin_padded_w13_n", None
         )
@@ -758,10 +746,6 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         # workspace1 = (M * topk * max(2 * N, K),)
         # workspace2 = (M * topk, N)
 
-        # Workspace/IntermediateCache allocation accounting for output buffer
-        # provisioning. Use marlin_padded_w13_n when set (it is round_up(2*N,
-        # tile_n_size) for gated and round_up(N, tile_n_size) for non-gated);
-        # fall back to the gated 2*N when not set.
         w13_size_n = (
             self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
         )
@@ -984,8 +968,6 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         num_dispatchers = self.num_dispatchers
         num_experts = local_num_experts
         max_num_tokens = self.max_num_tokens
-        # Use marlin_padded_w13_n when set (round_up(2*N, tile_n_size) for the
-        # gated case BatchedMarlinExperts targets); fall back to 2*N otherwise.
         w13_size_n = (
             self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
         )

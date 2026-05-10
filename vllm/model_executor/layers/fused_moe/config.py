@@ -254,16 +254,10 @@ class FusedMoEQuantConfig:
     gemm1_beta: float | None = None
     gemm1_clamp_limit: float | None = None
 
-    # FP4 Marlin MoE: padded w13 size_n when the per-rank intermediate dim
-    # didn't divide tile_n_size=64. Set by the prepare_*_moe_layer_for_marlin
-    # functions; read by MarlinExpertsBase to size the gemm output and slice
-    # the unpadded portion in _fused_marlin_moe.
+    # FP4 Marlin MoE: padded w13 size_n / w2 size_k when the per-rank
+    # intermediate didn't divide tile_n_size=64. Set by the
+    # prepare_*_moe_layer_for_marlin functions; consumed by MarlinExpertsBase.
     marlin_padded_w13_n: int | None = None
-    # FP4 Marlin MoE: padded w2 size_k (= intermediate dim) when the per-rank
-    # value didn't divide tile_n_size=64 (the kernel's thread-config selector
-    # rejects unaligned prob_k since available thread_k values are {64,128}).
-    # Set by prepare; read by MarlinExpertsBase; activation output is padded
-    # along K before the down-projection gemm in _fused_marlin_moe.
     marlin_padded_w2_k: int | None = None
 
     mx_alignment: int = 0
