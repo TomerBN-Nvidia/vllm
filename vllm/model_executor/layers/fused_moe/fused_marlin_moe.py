@@ -36,9 +36,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_moe_intermediate_size,
     marlin_quant_input,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    _pad_tensor_dim,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Static128BlockSym,
@@ -101,12 +98,10 @@ def _fused_marlin_moe(
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
-    unpadded_w13_size_n = w13_num_shards * N
     if padded_w13_size_n is None:
-        padded_w13_size_n = unpadded_w13_size_n
-    unpadded_w2_size_k = N
+        padded_w13_size_n = w13_num_shards * N
     if padded_w2_size_k is None:
-        padded_w2_size_k = unpadded_w2_size_k
+        padded_w2_size_k = N
     if workspace is None:
         workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
@@ -119,7 +114,7 @@ def _fused_marlin_moe(
 
     if intermediate_cache2 is None:
         intermediate_cache2 = torch.empty(
-            (M * num_topk, N),
+            (M * num_topk, padded_w2_size_k),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -130,7 +125,9 @@ def _fused_marlin_moe(
 
     intermediate_cache3 = _resize_cache(intermediate_cache13, (M * num_topk, K))
 
-    intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
+    intermediate_cache2 = _resize_cache(
+        intermediate_cache2, (M * num_topk, padded_w2_size_k)
+    )
 
     a_scales1 = None
     gate_up_input = hidden_states
@@ -169,21 +166,20 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
-    if padded_w13_size_n != unpadded_w13_size_n:
-        # Slicing produces a non-contiguous tensor; the activation kernels
-        # below require contiguous storage, so materialize a copy.
-        intermediate_cache1 = intermediate_cache1[:, :unpadded_w13_size_n].contiguous()
+    # Per-shard padding ensures the activation can split the gemm output by
+    # padded_w2_size_k cleanly; padded slots are zero and produce zero through
+    # both element-wise and gated activations.
     if clamp_limit is not None and activation == MoEActivation.SILU:
         swiglu_limit_func(
             intermediate_cache2,
-            intermediate_cache1.view(-1, w13_num_shards * N),
+            intermediate_cache1,
             clamp_limit,
         )
     else:
         activation_func(
             activation,
             intermediate_cache2,
-            intermediate_cache1.view(-1, w13_num_shards * N),
+            intermediate_cache1,
         )
 
     if output is None:
@@ -202,11 +198,6 @@ def _fused_marlin_moe(
     elif input_dtype == torch.float8_e4m3fn:
         intermediate_cache2, a_scales2 = marlin_quant_input(
             intermediate_cache2, input_dtype
-        )
-
-    if padded_w2_size_k != unpadded_w2_size_k:
-        intermediate_cache2 = _pad_tensor_dim(
-            intermediate_cache2, dim=1, padded_size=padded_w2_size_k
         )
 
     output = ops.moe_wna16_marlin_gemm(
@@ -749,7 +740,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         w13_size_n = (
             self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
         )
-        workspace1 = (M * topk, max(N, K))
+        w2_size_k = (
+            self.marlin_padded_w2_k if self.marlin_padded_w2_k is not None else N
+        )
+        workspace1 = (M * topk, max(w2_size_k, K))
         workspace2 = (M * topk * max(w13_size_n, K),)
         output = (M, K)
 
@@ -971,11 +965,14 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         w13_size_n = (
             self.marlin_padded_w13_n if self.marlin_padded_w13_n is not None else 2 * N
         )
+        w2_size_k = (
+            self.marlin_padded_w2_k if self.marlin_padded_w2_k is not None else N
+        )
         workspace13 = (
             num_experts * max_num_tokens * num_dispatchers,
             max(K, w13_size_n),
         )
-        workspace2 = (num_experts * max_num_tokens * num_dispatchers, N)
+        workspace2 = (num_experts * max_num_tokens * num_dispatchers, w2_size_k)
         output = (num_experts, max_num_tokens * num_dispatchers, K)
         return (workspace13, workspace2, output)
 
