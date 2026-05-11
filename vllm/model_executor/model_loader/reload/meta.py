@@ -143,4 +143,7 @@ def get_numel_loaded(
     assert args.arguments["param"].device.type == "meta"
     with MetaCopyCounter() as counter:
         return_value = weight_loader(*args.args, **args.kwargs)
+    if weight_loader.__name__ == "composed_loader":
+        # ad-hoc way to remove the effect of composed_weight_loader
+        return counter.copied_numel // 2, return_value
     return counter.copied_numel, return_value
