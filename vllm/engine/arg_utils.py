@@ -460,6 +460,10 @@ class EngineArgs:
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
+    enable_moe_topk_indices_nemo_rl_block_store: bool = (
+        ModelConfig.enable_moe_topk_indices_nemo_rl_block_store
+    )
+    enable_moe_topk_indices_json: bool = ModelConfig.enable_moe_topk_indices_json
     disable_log_stats: bool = False
     aggregate_engine_logging: bool = False
     revision: str | None = ModelConfig.revision
@@ -696,6 +700,14 @@ class EngineArgs:
         model_group.add_argument("--enforce-eager", **model_kwargs["enforce_eager"])
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
+        model_group.add_argument(
+            "--enable-moe-topk-indices-nemo-rl-block-store",
+            **model_kwargs["enable_moe_topk_indices_nemo_rl_block_store"],
+        )
+        model_group.add_argument(
+            "--enable-moe-topk-indices-json",
+            **model_kwargs["enable_moe_topk_indices_json"],
+        )
         model_group.add_argument(
             "--disable-sliding-window", **model_kwargs["disable_sliding_window"]
         )
@@ -1317,6 +1329,15 @@ class EngineArgs:
         if is_gguf(self.model):
             self.quantization = self.load_format = "gguf"
 
+        if (
+            self.enable_moe_topk_indices_nemo_rl_block_store
+            and self.enable_moe_topk_indices_json
+        ):
+            raise ValueError(
+                "enable_moe_topk_indices_nemo_rl_block_store and "
+                "enable_moe_topk_indices_json are mutually exclusive"
+            )
+
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.warning(
                 "The global random seed is set to %d. Since "
@@ -1350,6 +1371,10 @@ class EngineArgs:
             enforce_eager=self.enforce_eager,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
+            enable_moe_topk_indices_nemo_rl_block_store=(
+                self.enable_moe_topk_indices_nemo_rl_block_store
+            ),
+            enable_moe_topk_indices_json=self.enable_moe_topk_indices_json,
             disable_sliding_window=self.disable_sliding_window,
             disable_cascade_attn=self.disable_cascade_attn,
             skip_tokenizer_init=self.skip_tokenizer_init,
