@@ -5,6 +5,12 @@ from unittest.mock import patch
 import pytest
 
 from tests.kernels.moe.utils import make_dummy_moe_config
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+    TrtLlmBf16Experts,
+)
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
     select_unquantized_moe_backend,
@@ -15,6 +21,33 @@ skipif_not_cuda_rocm = pytest.mark.skipif(
     not (current_platform.is_cuda() or current_platform.is_rocm()),
     reason="Only supported on CUDA/ROCm platforms.",
 )
+
+
+@pytest.mark.parametrize(
+    ("activation", "is_act_and_mul"),
+    [
+        (MoEActivation.SILU, True),
+        (MoEActivation.RELU2_NO_MUL, False),
+    ],
+)
+def test_trtllm_bf16_supports_gated_and_nongated_configs(
+    activation: MoEActivation,
+    is_act_and_mul: bool,
+):
+    moe_config = make_dummy_moe_config()
+    moe_config.activation = activation
+    moe_config.is_act_and_mul = is_act_and_mul
+    moe_config.routing_method = RoutingMethodType.Renormalize
+
+    with patch.object(TrtLlmBf16Experts, "_supports_current_device", return_value=True):
+        supported, reason = TrtLlmBf16Experts.is_supported_config(
+            moe_config,
+            weight_key=None,
+            activation_key=None,
+            activation_format=mk.FusedMoEActivationFormat.Standard,
+        )
+
+    assert supported, reason
 
 
 @pytest.mark.parametrize(

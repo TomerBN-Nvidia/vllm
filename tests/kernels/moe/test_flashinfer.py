@@ -395,15 +395,17 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
         (64, 4096, 4096),
     ],
 )
+@pytest.mark.parametrize("is_gated_act", [True, False])
 def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
-    num_experts, intermediate, hidden
+    num_experts, intermediate, hidden, is_gated_act
 ):
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         convert_moe_weights_to_flashinfer_trtllm_block_layout,
     )
 
+    w13_intermediate = 2 * intermediate if is_gated_act else intermediate
     w13 = torch.randn(
-        (num_experts, 2 * intermediate, hidden), dtype=torch.bfloat16, device="cuda"
+        (num_experts, w13_intermediate, hidden), dtype=torch.bfloat16, device="cuda"
     )
     w2 = torch.randn(
         (num_experts, hidden, intermediate), dtype=torch.bfloat16, device="cuda"
@@ -411,7 +413,7 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
 
     cache: dict[torch.Size, torch.Tensor] = {}
     w13_converted, w2_converted = convert_moe_weights_to_flashinfer_trtllm_block_layout(
-        cache, w13, w2
+        cache, w13, w2, is_gated_act=is_gated_act
     )
 
     assert w13_converted.ndim == 4, (
