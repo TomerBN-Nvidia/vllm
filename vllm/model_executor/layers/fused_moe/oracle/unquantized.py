@@ -309,13 +309,17 @@ def convert_to_unquantized_kernel_format(
             w13_weight = swap_w13_to_w31(w13_weight)
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
-        # Swap halves to arrange as [w3; w1] (kernel expectation)
-        w13_weight = swap_w13_to_w31(w13_weight)
+        is_gated = layer.moe_config.is_act_and_mul
+        if is_gated:
+            # Swap halves to arrange as [w3; w1] (kernel expectation).
+            # Non-gated MoE stores only one projection in w13.
+            w13_weight = swap_w13_to_w31(w13_weight)
         _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         w13_weight, w2_weight = convert_moe_weights_to_flashinfer_trtllm_block_layout(
             _cache_permute_indices,
             w13_weight,
             w2_weight,
+            is_gated_act=is_gated,
         )
 
     return w13_weight.contiguous(), w2_weight.contiguous()
