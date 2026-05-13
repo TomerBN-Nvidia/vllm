@@ -1864,30 +1864,23 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
             )
 
-        replace_parameter(
-            layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
-        )
-        replace_parameter(
-            layer, "w2_weight", torch.stack(w2_weight_shuffled).contiguous()
-        )
-        replace_parameter(
-            layer,
-            "w13_weight_scale",
-            torch.stack(w13_scale_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_scale",
-            torch.stack(w2_scale_shuffled).contiguous(),
-        )
+        layer.w13_weight.data.copy_(torch.stack(w13_weight_shuffled).contiguous())
+        layer.w2_weight.data.copy_(torch.stack(w2_weight_shuffled).contiguous())
+
+        w13_scale_for_apply = torch.stack(w13_scale_shuffled).contiguous()
+        w2_scale_for_apply = torch.stack(w2_scale_shuffled).contiguous()
+        if hasattr(layer, "w13_scale_for_apply"):
+            layer.w13_scale_for_apply.data.copy_(w13_scale_for_apply)
+            layer.w2_scale_for_apply.data.copy_(w2_scale_for_apply)
+        else:
+            layer.w13_scale_for_apply = Parameter(
+                w13_scale_for_apply, requires_grad=False
+            )
+            layer.w2_scale_for_apply = Parameter(w2_scale_for_apply, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-
         self._check_weight_dtypes(layer)
         self._shuffle_weights_for_trtllm(layer)
-        layer._already_called_process_weights_after_loading = True
 
     def maybe_make_prepare_finalize(
         self,
@@ -1967,9 +1960,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             hidden_states=hidden_states_mxfp8,
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=layer.w13_weight,
-            gemm1_weights_scale=layer.w13_weight_scale,
+            gemm1_weights_scale=layer.w13_scale_for_apply,
             gemm2_weights=layer.w2_weight,
-            gemm2_weights_scale=layer.w2_weight_scale,
+            gemm2_weights_scale=layer.w2_scale_for_apply,
             num_experts=layer.global_num_experts,
             top_k=layer.top_k,
             # Keep Optional semantics: FlashInfer expects None for non-grouped

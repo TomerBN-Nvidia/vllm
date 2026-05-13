@@ -38,10 +38,12 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
-        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
-        layer.weight_scale = Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
-        )
+        if hasattr(layer, "weight_scale_for_apply"):
+            layer.weight_scale_for_apply.data.copy_(weight_scale_swizzled.contiguous())
+        else:
+            layer.weight_scale_for_apply = Parameter(
+                weight_scale_swizzled.contiguous(), requires_grad=False
+            )
 
     def apply_weights(
         self,
@@ -50,7 +52,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = layer.weight
-        weight_scale = layer.weight_scale
+        weight_scale = layer.weight_scale_for_apply
         out_dtype = x.dtype
         N, K = weight.shape
 

@@ -7,10 +7,14 @@ from enum import Enum
 from types import SimpleNamespace
 
 import torch
+from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    FlashInferCutlassMxfp8LinearKernel,
+)
 from vllm.model_executor.layers.quantization import modelopt
 
 
@@ -80,3 +84,69 @@ def test_modelopt_mxfp8_trtllm_forwards_relu2_activation(monkeypatch):
     )
 
     assert captured_kwargs["activation_type"] == FakeActivationType.Relu2
+
+
+def test_flashinfer_mxfp8_linear_keeps_checkpoint_scale_for_refit():
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.ones((128, 4), dtype=torch.uint8), requires_grad=False
+    )
+
+    kernel = object.__new__(FlashInferCutlassMxfp8LinearKernel)
+    kernel.process_weights_after_loading(layer)
+
+    checkpoint_scale = layer.weight_scale
+    apply_scale = layer.weight_scale_for_apply
+    layer.weight_scale.data.fill_(2)
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.weight_scale is checkpoint_scale
+    assert layer.weight_scale_for_apply is apply_scale
+    assert torch.all(layer.weight_scale_for_apply == 2)
+
+
+def test_modelopt_mxfp8_moe_reuses_apply_scales_for_refit(monkeypatch):
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.reorder_rows_for_gated_act_gemm = lambda x: x
+    fake_flashinfer.shuffle_matrix_a = lambda x, epilogue_tile_m: x
+    fake_flashinfer.shuffle_matrix_sf_a = lambda x, epilogue_tile_m: x
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+
+    layer = torch.nn.Module()
+    layer.intermediate_size_per_partition = 32
+    layer.hidden_size = 32
+    layer.w13_weight = Parameter(
+        torch.empty((2, 32, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w2_weight = Parameter(
+        torch.empty((2, 32, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w13_weight_scale = Parameter(
+        torch.ones((2, 32, 1), dtype=torch.uint8), requires_grad=False
+    )
+    layer.w2_weight_scale = Parameter(
+        torch.ones((2, 32, 1), dtype=torch.uint8), requires_grad=False
+    )
+
+    method = object.__new__(modelopt.ModelOptMxFp8FusedMoE)
+    method.moe = SimpleNamespace(is_act_and_mul=False)
+
+    method.process_weights_after_loading(layer)
+
+    checkpoint_w13_scale = layer.w13_weight_scale
+    checkpoint_w2_scale = layer.w2_weight_scale
+    apply_w13_scale = layer.w13_scale_for_apply
+    apply_w2_scale = layer.w2_scale_for_apply
+    layer.w13_weight_scale.data.fill_(2)
+    layer.w2_weight_scale.data.fill_(2)
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight_scale is checkpoint_w13_scale
+    assert layer.w2_weight_scale is checkpoint_w2_scale
+    assert layer.w13_scale_for_apply is apply_w13_scale
+    assert layer.w2_scale_for_apply is apply_w2_scale
+    assert torch.all(layer.w13_scale_for_apply == 2)
+    assert torch.all(layer.w2_scale_for_apply == 2)
