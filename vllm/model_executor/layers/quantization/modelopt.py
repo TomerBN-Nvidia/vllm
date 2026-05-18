@@ -57,6 +57,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_type,
     swap_w13_to_w31,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -2095,10 +2096,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from flashinfer.fused_moe.core import (
-            ActivationType,
-            Fp8QuantizationType,
-        )
+        from flashinfer.fused_moe.core import Fp8QuantizationType
 
         assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
 
@@ -2107,19 +2105,15 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 "EPLB is not supported for FlashInfer TRTLLM MXFP8 MoE backend."
             )
 
-        supported_activations = [MoEActivation.SILU]
+        supported_activations = [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
         if layer.activation not in supported_activations:
+            supported_names = [a.value for a in supported_activations]
             raise NotImplementedError(
                 "FlashInfer TRTLLM MXFP8 MoE supports only "
-                f"{supported_activations}, got {layer.activation}."
+                f"{supported_names}, got {layer.activation.value}."
             )
 
-        # Map vLLM MoEActivation to FlashInfer ActivationType.
-        activation_map = {
-            MoEActivation.SILU: ActivationType.Swiglu,
-            MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
-        }
-        fi_activation_type: ActivationType = activation_map[layer.activation]
+        fi_activation_type = activation_to_flashinfer_type(layer.activation)
 
         # DeepSeekV3 routing requires float32 logits; others expect bfloat16.
         if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
@@ -2162,13 +2156,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             use_shuffled_weight=True,
             weight_layout=0,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=fi_activation_type,
         )
-
-        if fi_activation_type != ActivationType.Swiglu:
-            raise NotImplementedError(
-                "FlashInfer TRTLLM MXFP8 MoE supports only Swiglu activation, "
-                f"got {fi_activation_type}."
-            )
 
         return flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
 
