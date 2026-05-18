@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
+from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadata,
@@ -32,11 +33,19 @@ class _ConcreteMambaBuilder(
     metadata_cls = BaseMambaAttentionMetadata
 
 
-def _make_vllm_config(block_size, max_model_len, max_num_seqs):
+def _make_vllm_config(
+    max_model_len: int,
+    max_num_seqs: int,
+    num_speculative_tokens: int = 0,
+    block_size: int | None = None,
+):
     """Create a minimal mock VllmConfig with only the fields the builder
     accesses, avoiding any model download / HF config inspection."""
     return SimpleNamespace(
-        cache_config=SimpleNamespace(mamba_cache_mode="all"),
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            mamba_cache_mode="all",
+        ),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL,
             max_cudagraph_capture_size=None,
@@ -49,6 +58,42 @@ def _make_vllm_config(block_size, max_model_len, max_num_seqs):
     )
 
 
+def test_mamba_single_token_prompt_runs_as_prefill():
+    """A first-token one-token prefill has no prior Mamba state and must
+    remain a prefill after the PR #42430 short-extend reclassification."""
+
+    block_size = 16
+    seq_lens = [8, 9, 1]
+    query_lens = [1, 1, 1]
+    device = torch.device("cpu")
+    config = _make_vllm_config(
+        max_model_len=256,
+        max_num_seqs=len(seq_lens),
+        block_size=block_size,
+    )
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,), (1,)),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="all",
+    )
+    builder = _ConcreteMambaBuilder(spec, ["layer0"], config, device)
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
+        block_size=block_size,
+        device=device,
+        arange_block_indices=True,
+    )
+    common_metadata = common_metadata.replace(
+        is_prefilling=torch.tensor([False, False, True], dtype=torch.bool)
+    )
+
+    metadata = builder.build(0, common_metadata)
+    assert metadata.num_decodes == 2
+    assert metadata.num_prefills == 1
+    assert metadata.has_initial_states_p.tolist() == [False]
+
+
 def test_update_block_table_copies_block_idx_to_persistent_buffers():
     """update_block_table() must write block_idx tensors to the current
     builder's persistent buffers, not leave them pointing to a different
@@ -59,7 +104,11 @@ def test_update_block_table_copies_block_idx_to_persistent_buffers():
     num_reqs = 4
     device = torch.device("cpu")
 
-    vllm_config = _make_vllm_config(block_size, max_model_len, num_reqs)
+    vllm_config = _make_vllm_config(
+        max_model_len=max_model_len,
+        max_num_seqs=num_reqs,
+        block_size=block_size,
+    )
 
     spec = MambaSpec(
         block_size=block_size,
