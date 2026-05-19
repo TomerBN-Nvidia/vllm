@@ -192,6 +192,23 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         """The modular implementation supports all parallel configs."""
         return True
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """Handle FlashInfer TRTLLM's packed BF16 block-layout weights."""
+        if w1.dim() != 3 or w2.dim() != 3:
+            E = w1.shape[0]
+            M = a1.size(0) if a1.dim() == 2 else a1.size(1)
+            N = self.intermediate_size_per_partition
+            K = a1.size(-1)
+            topk = topk_ids.size(1)
+            return E, M, N, K, topk
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
+
     def workspace_shapes(
         self,
         M: int,
