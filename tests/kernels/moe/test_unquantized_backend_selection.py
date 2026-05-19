@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import dataclasses
 from unittest.mock import patch
 
 import pytest
 
-from tests.kernels.moe.utils import make_dummy_moe_config
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
-    TrtLlmBf16Experts,
+    TrtLlmBf16ExpertsModular,
+    TrtLlmBf16ExpertsMonolithic,
 )
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
@@ -39,8 +44,10 @@ def test_trtllm_bf16_supports_gated_and_nongated_configs(
     moe_config.is_act_and_mul = is_act_and_mul
     moe_config.routing_method = RoutingMethodType.Renormalize
 
-    with patch.object(TrtLlmBf16Experts, "_supports_current_device", return_value=True):
-        supported, reason = TrtLlmBf16Experts.is_supported_config(
+    with patch.object(
+        TrtLlmBf16ExpertsMonolithic, "_supports_current_device", return_value=True
+    ):
+        supported, reason = TrtLlmBf16ExpertsMonolithic.is_supported_config(
             moe_config,
             weight_key=None,
             activation_key=None,
@@ -150,7 +157,7 @@ def test_select_rocm_aiter_backend(mock_aiter_enabled, mock_has_flashinfer):
 
 
 @patch(
-    "vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe.TrtLlmBf16Experts.is_supported_config",
+    "vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe.TrtLlmBf16ExpertsMonolithic.is_supported_config",
     return_value=(True, None),
 )
 @pytest.mark.skipif(
@@ -187,7 +194,11 @@ def test_select_cuda_flashinfer_trtllm_backend(mock_is_supported_trtllm, monkeyp
     return_value=True,
 )
 @patch(
-    "vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe.TrtLlmBf16Experts.is_supported_config",
+    "vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe.TrtLlmBf16ExpertsMonolithic.is_supported_config",
+    return_value=(False, None),
+)
+@patch(
+    "vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe.TrtLlmBf16ExpertsModular.is_supported_config",
     return_value=(False, None),
 )
 @patch(
@@ -200,6 +211,7 @@ def test_select_cuda_flashinfer_trtllm_backend(mock_is_supported_trtllm, monkeyp
 def test_select_cuda_flashinfer_cutlass_backend(
     mock_has_flashinfer,
     mock_is_supported_trtllm,
+    mock_is_supported_trtllm_modular,
     mock_is_supported_cutlass,
     monkeypatch,
 ):
@@ -292,6 +304,32 @@ def test_select_explicit_triton_ignores_flashinfer_env(monkeypatch):
 
     assert selected_backend == UnquantizedMoeBackend.TRITON
     assert experts_cls is not None
+
+
+def test_trtllm_bf16_modular_accepts_eplb_monolithic_rejects():
+    """Monolithic blocks EPLB; Modular accepts all parallel configs."""
+    cfg = FusedMoEParallelConfig.make_no_parallel()
+    eplb_cfg = dataclasses.replace(cfg, enable_eplb=True)
+
+    assert TrtLlmBf16ExpertsModular._supports_parallel_config(eplb_cfg) is True
+    assert TrtLlmBf16ExpertsMonolithic._supports_parallel_config(eplb_cfg) is False
+
+
+def test_trtllm_bf16_modular_non_gated_only():
+    """Modular variant supports only non-gated activation (RELU2_NO_MUL).
+    Monolithic continues to support both gated SILU and non-gated RELU2_NO_MUL.
+    """
+    assert (
+        TrtLlmBf16ExpertsModular._supports_activation(MoEActivation.RELU2_NO_MUL)
+        is True
+    )
+    assert TrtLlmBf16ExpertsModular._supports_activation(MoEActivation.SILU) is False
+
+    assert (
+        TrtLlmBf16ExpertsMonolithic._supports_activation(MoEActivation.RELU2_NO_MUL)
+        is True
+    )
+    assert TrtLlmBf16ExpertsMonolithic._supports_activation(MoEActivation.SILU) is True
 
 
 @skipif_not_cuda_rocm
