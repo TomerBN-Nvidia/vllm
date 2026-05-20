@@ -84,49 +84,71 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     return _AVAILABLE_BACKENDS
 
 
-def backend_to_kernel_cls(
+def backend_to_kernel_clses(
     backend: UnquantizedMoeBackend,
-) -> type[mk.FusedMoEExperts]:
+) -> list[type[mk.FusedMoEExperts]]:
+    """Candidate experts classes for ``backend``, in priority order.
+
+    Mirrors the multi-candidate pattern used by the NVFP4/MXFP4 oracles so a
+    backend can expose more than one kernel implementation (e.g. monolithic
+    vs. modular variants of the trtllm-gen MoE).
+    """
     if backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
-            TrtLlmBf16Experts,
+            TrtLlmBf16ExpertsModular,
+            TrtLlmBf16ExpertsMonolithic,
         )
 
-        return TrtLlmBf16Experts
+        # Prefer the monolithic kernel (fused router + experts); fall back to
+        # the modular variant when the parallel config requires it (DP/EP or
+        # EPLB).
+        return [TrtLlmBf16ExpertsMonolithic, TrtLlmBf16ExpertsModular]
 
     elif backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
         from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (
             FlashInferExperts,
         )
 
-        return FlashInferExperts
+        return [FlashInferExperts]
 
     elif backend == UnquantizedMoeBackend.AITER:
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             AiterExperts,
         )
 
-        return AiterExperts
+        return [AiterExperts]
 
     elif backend == UnquantizedMoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
 
-        return TritonExperts
+        return [TritonExperts]
 
     elif backend == UnquantizedMoeBackend.BATCHED_TRITON:
         from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
             BatchedTritonExperts,
         )
 
-        return BatchedTritonExperts
+        return [BatchedTritonExperts]
 
     elif backend == UnquantizedMoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import XPUExperts
 
-        return XPUExperts
+        return [XPUExperts]
 
     else:
         raise ValueError(f"Unknown unquantized MoE backend: {backend.value}")
+
+
+def backend_to_kernel_cls(
+    backend: UnquantizedMoeBackend,
+) -> type[mk.FusedMoEExperts]:
+    """Primary experts class for ``backend``.
+
+    Kept for callers that only need the canonical class (e.g. weight-layout
+    conversion in ``convert_to_unquantized_kernel_format``). For selection,
+    use :func:`backend_to_kernel_clses` which exposes alternates.
+    """
+    return backend_to_kernel_clses(backend)[0]
 
 
 def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend:
@@ -205,13 +227,14 @@ def select_unquantized_moe_backend(
         config: FusedMoEConfig,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
-        k_cls = backend_to_kernel_cls(backend)
-        supported, reason = k_cls.is_supported_config(
-            k_cls, config, None, None, activation_format
-        )
-        if supported:
-            logger.info_once(_make_log_backend(backend))
-            return backend, k_cls
+        reason: str | None = None
+        for k_cls in backend_to_kernel_clses(backend):
+            supported, reason = k_cls.is_supported_config(
+                k_cls, config, None, None, activation_format
+            )
+            if supported:
+                logger.info_once(_make_log_backend(backend))
+                return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
 
     runner_backend = moe_config.moe_backend
@@ -253,15 +276,15 @@ def select_unquantized_moe_backend(
                 UnquantizedMoeBackend.FLASHINFER_TRTLLM,
                 UnquantizedMoeBackend.FLASHINFER_CUTLASS,
             ]:
-                k_cls = backend_to_kernel_cls(backend)
-                supported, reason = k_cls.is_supported_config(
-                    k_cls, moe_config, None, None, activation_format
-                )
-                if supported:
-                    logger.info_once(_make_log_backend(backend))
-                    return backend, k_cls
-                else:
-                    logger.debug_once(_make_log_unsupported(backend, reason))
+                for k_cls in backend_to_kernel_clses(backend):
+                    supported, reason = k_cls.is_supported_config(
+                        k_cls, moe_config, None, None, activation_format
+                    )
+                    if supported:
+                        logger.info_once(_make_log_backend(backend))
+                        return backend, k_cls
+                    else:
+                        logger.debug_once(_make_log_unsupported(backend, reason))
 
             raise NotImplementedError(
                 "Found VLLM_USE_FLASHINFER_MOE_FP16=1, but no "
@@ -278,15 +301,15 @@ def select_unquantized_moe_backend(
             return _return_or_raise(backend, moe_config, activation_format)
 
     for backend in AVAILABLE_BACKENDS:
-        k_cls = backend_to_kernel_cls(backend)
-        supported, reason = k_cls.is_supported_config(
-            k_cls, moe_config, None, None, activation_format
-        )
-        if supported:
-            logger.info_once(_make_log_backend(backend))
-            return backend, k_cls
+        for k_cls in backend_to_kernel_clses(backend):
+            supported, reason = k_cls.is_supported_config(
+                k_cls, moe_config, None, None, activation_format
+            )
+            if supported:
+                logger.info_once(_make_log_backend(backend))
+                return backend, k_cls
 
-        logger.debug_once(_make_log_unsupported(backend, reason))
+            logger.debug_once(_make_log_unsupported(backend, reason))
 
     raise NotImplementedError(
         "No Unquantized MoE backend supports the deployment configuration."

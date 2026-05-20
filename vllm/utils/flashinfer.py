@@ -105,6 +105,9 @@ def _lazy_import_wrapper(
 flashinfer_trtllm_bf16_moe = _lazy_import_wrapper(
     "flashinfer.fused_moe", "trtllm_bf16_moe"
 )
+flashinfer_trtllm_bf16_routed_moe = _lazy_import_wrapper(
+    "flashinfer.fused_moe", "trtllm_bf16_routed_moe"
+)
 flashinfer_trtllm_fp8_block_scale_moe = _lazy_import_wrapper(
     "flashinfer.fused_moe", "trtllm_fp8_block_scale_moe"
 )
@@ -215,6 +218,19 @@ def has_flashinfer_trtllm_fused_moe() -> bool:
         if not mod or not hasattr(mod, attr_name):
             return False
     return True
+
+
+@functools.cache
+def has_flashinfer_trtllm_bf16_routed_moe() -> bool:
+    """Return `True` if FlashInfer exposes the routed bf16 MoE entrypoint.
+
+    The routed variant takes pre-dispatched topk_ids and is required by the
+    modular bf16 trtllm-gen MoE path (which supports EPLB / all2all).
+    """
+    if not has_flashinfer_trtllm_fused_moe():
+        return False
+    mod = _get_submodule("flashinfer.fused_moe")
+    return mod is not None and hasattr(mod, "trtllm_bf16_routed_moe")
 
 
 @functools.cache
