@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -137,7 +138,33 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         exclude_modules: list[str],
     ):
         super().__init__()
+        # Fix C: allow appending exclude patterns from the environment so
+        # operators can keep specific Linears at BF16 without re-emitting the
+        # checkpoint. Patterns are comma-separated wildcards in fnmatch format.
+        # Example for NemotronH rollout (keeps bulk MoE experts quantized,
+        # drops quantize overhead on small Linears):
+        #   VLLM_MODELOPT_EXTRA_EXCLUDE_MODULES="*qkv_proj,*o_proj,*gate,
+        #     *fc1_latent_proj,*fc2_latent_proj,*mixer.in_proj,*mixer.out_proj,
+        #     *mixer.conv1d"
+        # See tools/EXCLUDE_RECIPE.md.
+        extra_patterns = self._read_extra_exclude_env()
+        if extra_patterns:
+            exclude_modules = list(exclude_modules) + extra_patterns
+            logger.info_once(
+                "VLLM_MODELOPT_EXTRA_EXCLUDE_MODULES: appended %d "
+                "pattern(s) to ModelOpt exclude_modules: %s",
+                len(extra_patterns), ", ".join(extra_patterns),
+            )
         self.exclude_modules: list[str] = exclude_modules
+
+    @staticmethod
+    def _read_extra_exclude_env() -> list[str]:
+        raw = os.environ.get(
+            "VLLM_MODELOPT_EXTRA_EXCLUDE_MODULES", ""
+        ).strip()
+        if not raw:
+            return []
+        return [p.strip() for p in raw.split(",") if p.strip()]
 
     def is_layer_excluded(self, prefix: str) -> bool:
         """
@@ -1917,7 +1944,20 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        x_mxfp8: torch.Tensor | None = None,
+        x_mxfp8_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run the FlashInfer TRTLLM MXFP8 MoE.
+
+        Fix D opt-in: if `x_mxfp8` and `x_mxfp8_scale` are both passed,
+        skip the internal mxfp8_e4m3_quantize call and feed pre-quantized
+        tensors directly to the kernel. Layout must match the production
+        path: `x_mxfp8` is [M, K] fp8_e4m3fn, `x_mxfp8_scale` is
+        [M, K//32] uint8 in linear (un-swizzled) layout.
+        When x_mxfp8 is None (default), behaviour is bit-identical to
+        the pre-Fix-D path. See tools/LATENT_MOE_FUSION.md.
+        """
         from flashinfer.fused_moe.core import Fp8QuantizationType
 
         assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
@@ -1949,10 +1989,16 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         n_group = layer.num_expert_group or None
         topk_group = layer.topk_group or None
 
-        hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
-            x,
-            is_sf_swizzled_layout=False,
-        )
+        if x_mxfp8 is not None and x_mxfp8_scale is not None:
+            # Fix D opt-in: use pre-quantized tensors from caller
+            hidden_states_mxfp8, hidden_states_scale = x_mxfp8, x_mxfp8_scale
+        else:
+            hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
+                x,
+                # MUST be False: trtllm_fp8_block_scale_moe expects per-token
+                # [M, H/32] scale (linear layout). See tools/microbench_fix_b.py.
+                is_sf_swizzled_layout=False,
+            )
 
         kwargs: dict = dict(
             routing_logits=router_logits,
