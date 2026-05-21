@@ -57,7 +57,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    activation_to_flashinfer_type,
     swap_w13_to_w31,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -71,7 +70,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
-    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -94,7 +92,6 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
-from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -1857,7 +1854,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         self.quant_config = quant_config
         assert self.quant_config.is_checkpoint_mxfp8_serialized
 
-        self.mxfp8_backend, _ = select_mxfp8_moe_backend(self.moe)
+        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(self.moe)
+        self.moe_quant_config: FusedMoEQuantConfig | None = None
+        self.moe_kernel: mk.FusedMoEKernel | None = None
 
     def create_weights(
         self,
@@ -2058,6 +2057,14 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
         self._check_weight_dtypes(layer)
         self._shuffle_weights_for_trtllm(layer)
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            fp8_backend=self.mxfp8_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
         layer._already_called_process_weights_after_loading = True
 
     def maybe_make_prepare_finalize(
@@ -2079,11 +2086,15 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             "logic. This function should not be called."
         )
 
-    def get_fused_moe_quant_config(
-        self, layer: RoutedExperts
-    ) -> FusedMoEQuantConfig | None:
-        # TRTLLM MXFP8 path is monolithic and does not use modular kernel config.
-        return None
+    def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        return make_fp8_moe_quant_config(
+            fp8_backend=self.mxfp8_backend,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=[1, MXFP8_BLOCK_SIZE],
+        )
 
     @property
     def is_monolithic(self) -> bool:
@@ -2096,9 +2107,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from flashinfer.fused_moe.core import Fp8QuantizationType
-
         assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
+        assert self.moe_kernel is not None
 
         if layer.eplb_state is not None:
             raise NotImplementedError(
@@ -2113,8 +2123,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 f"{supported_names}, got {layer.activation.value}."
             )
 
-        fi_activation_type = activation_to_flashinfer_type(layer.activation)
-
         # DeepSeekV3 routing requires float32 logits; others expect bfloat16.
         if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
             assert router_logits.dtype == torch.float32, (
@@ -2124,42 +2132,20 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         else:
             router_logits = router_logits.to(torch.bfloat16)
 
-        # Treat 0 as "unset" for compatibility with ungrouped routing configs.
-        n_group = layer.num_expert_group or None
-        topk_group = layer.topk_group or None
-
-        hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
-            x,
-            is_sf_swizzled_layout=False,
-        )
-
-        kwargs: dict = dict(
-            routing_logits=router_logits,
-            routing_bias=layer.e_score_correction_bias,
-            hidden_states=hidden_states_mxfp8,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=layer.w13_weight,
-            gemm1_weights_scale=layer.w13_weight_scale,
-            gemm2_weights=layer.w2_weight,
-            gemm2_weights_scale=layer.w2_weight_scale,
-            num_experts=layer.global_num_experts,
-            top_k=layer.top_k,
-            # Keep Optional semantics: FlashInfer expects None for non-grouped
-            # routing (e.g. Qwen3 Renormalize), not 0.
-            n_group=n_group,
-            topk_group=topk_group,
-            intermediate_size=layer.intermediate_size_per_partition,
-            local_expert_offset=layer.ep_rank * layer.local_num_experts,
-            local_num_experts=layer.local_num_experts,
+        return self.moe_kernel.apply_monolithic(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            router_logits=router_logits,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
-            routing_method_type=layer.routing_method_type,
-            use_shuffled_weight=True,
-            weight_layout=0,
-            fp8_quantization_type=Fp8QuantizationType.MxFp8,
-            activation_type=fi_activation_type,
         )
-
-        return flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
 
     def apply(
         self,
