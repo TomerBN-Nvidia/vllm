@@ -1724,8 +1724,14 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
+        # Fix G (nemo-speed): in vLLM v0.20.2 FusedMoE.intermediate_size_per_partition
+        # and FusedMoE.hidden_size are read-only @property getters
+        # (fused_moe/layer.py:1610,1614). Writing to them raises
+        # AttributeError. The values are already populated on layer.moe_config
+        # in FusedMoE.__init__, so these assignments are redundant — skip them.
+        # Tracking issue: TomerBN-Nvidia/vllm ultra-rl-v0.20.2.
+        # layer.intermediate_size_per_partition = intermediate_size_per_partition
+        # layer.hidden_size = hidden_size
         layer.orig_dtype = params_dtype
 
         if hidden_size % MXFP8_BLOCK_SIZE != 0:
