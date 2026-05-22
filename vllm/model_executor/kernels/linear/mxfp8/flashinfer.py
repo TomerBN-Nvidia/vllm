@@ -60,7 +60,12 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         input_2d = x.view(-1, K)
         M_orig = input_2d.shape[0]
 
-        min_dim = 128
+        # iter4 nemo-speed: M alignment was 128 (forced 4x pad at M=32).
+        # K/N still need 128 (weight dim constraints unchanged).
+        # Real per-step decode gain expected for M < 128 batches.
+        KN_MIN_DIM = 128
+        M_ALIGN = 32
+        min_dim = M_ALIGN  # only affects M padding now
 
         assert min_dim <= K, (
             f"mm_mxfp8 requires K >= {min_dim}, got K={K}. "
