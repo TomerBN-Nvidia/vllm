@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -45,6 +47,26 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
                 weight_scale_swizzled.contiguous(), requires_grad=False
             )
 
+        # iter8 nemo-speed (opt-in via MXFP8_BF16_FALLBACK_SMALL_M=1):
+        # cache a BF16-dequantized copy of the weight for use at small M
+        # where mm_mxfp8 has to pad the input up to 128 rows and waste 75%
+        # of GEMM compute. Doubles linear-weight memory but unlocks the
+        # mid-concurrency regime where harness configs ab_mid/ab_decode_heavy/
+        # swe_192k_512 spend most of their time.
+        if os.environ.get("MXFP8_BF16_FALLBACK_SMALL_M") == "1":
+            # Dequantize:  bf16 = fp8.to(bf16) * 2^(scale_biased - 127)
+            # weight_scale_2d is e8m0 biased exponent stored in uint8.
+            descale = torch.exp2(
+                weight_scale_2d.to(torch.float32) - 127.0
+            ).to(torch.bfloat16)  # [N, K/32]
+            w_bf16 = weight.to(torch.bfloat16).view(N, scale_k, MXFP8_BLOCK_SIZE)
+            w_bf16 = w_bf16 * descale.unsqueeze(-1)
+            w_bf16 = w_bf16.view(N, K).contiguous()
+            if hasattr(layer, "weight_bf16"):
+                layer.weight_bf16.data.copy_(w_bf16)
+            else:
+                layer.weight_bf16 = Parameter(w_bf16, requires_grad=False)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -59,6 +81,19 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         input_shape = x.shape
         input_2d = x.view(-1, K)
         M_orig = input_2d.shape[0]
+
+        # iter8 nemo-speed: BF16 fallback for small M. mm_mxfp8 pads M up to
+        # 128 and processes a full 128-row tile regardless, wasting compute
+        # at M < 128 (smoke = 32, ab_mid/ab_decode/swe = 64). The cached
+        # weight_bf16 lets us do a plain bf16 matmul instead. Only enabled
+        # if MXFP8_BF16_FALLBACK_SMALL_M=1 was set at startup so
+        # process_weights_after_loading allocated weight_bf16.
+        if M_orig < 128 and hasattr(layer, "weight_bf16"):
+            input_bf16 = input_2d.to(torch.bfloat16)
+            output = torch.matmul(input_bf16, layer.weight_bf16.t())
+            if bias is not None:
+                output = output + bias
+            return output.view(*input_shape[:-1], N).to(out_dtype)
 
         min_dim = 128
 
