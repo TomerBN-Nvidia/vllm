@@ -326,7 +326,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
         activation_type = activation_to_flashinfer_int(activation)
         assert self.topk <= global_num_experts
-        assert self.topk <= 10
         assert global_num_experts % 4 == 0
         assert self.quant_config.block_shape in [[128, 128], [1, 32]]
         # Kernel expects #experts <= #threads 512
@@ -344,6 +343,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             n_group = num_expert_group or None
             selected_topk_group = topk_group or None
         else:
+            assert self.topk <= 10
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
             use_shuffled_weight = True
             weight_layout = WeightLayout.BlockMajorK
