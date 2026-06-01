@@ -905,6 +905,7 @@ class GPUModelRunner(
             max_running_requests=max_running_requests,
             max_model_len=self.max_model_len,
             device=self.device,
+            block_size=self.cache_config.block_size,
             rank=tp_group.rank_in_group,
             world_size=tp_group.world_size,
         )
@@ -987,6 +988,20 @@ class GPUModelRunner(
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _hydrate_cached_routed_experts(
+        self,
+        req_state: CachedRequestState,
+        num_cached_tokens: int,
+    ) -> None:
+        if not self.cache_config.return_routed_experts or num_cached_tokens <= 0:
+            return
+        get_global_experts_capturer().hydrate_cached_prefix(
+            req_id=req_state.req_id,
+            block_hashes=req_state.block_hashes,
+            num_cached_tokens=num_cached_tokens,
+            block_size=self.cache_config.block_size,
+        )
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1071,6 +1086,9 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                self._hydrate_cached_routed_experts(
+                    req_state, new_req_data.num_computed_tokens
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1104,11 +1122,15 @@ class GPUModelRunner(
                 pooling_params=pooling_params,
                 generator=generator,
                 block_ids=new_req_data.block_ids,
+                block_hashes=list(new_req_data.block_hashes),
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            self._hydrate_cached_routed_experts(
+                req_state, new_req_data.num_computed_tokens
+            )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1170,6 +1192,10 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            if i < len(req_data.block_hashes):
+                req_state.block_hashes = list(req_data.block_hashes[i])
+            if resumed_from_preemption:
+                self._hydrate_cached_routed_experts(req_state, num_computed_tokens)
 
             if not is_last_rank:
                 if not req_data.new_token_ids:
@@ -1347,6 +1373,7 @@ class GPUModelRunner(
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         req_state.block_ids = new_req_data.block_ids
+        req_state.block_hashes = list(new_req_data.block_hashes)
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
@@ -3265,9 +3292,16 @@ class GPUModelRunner(
                 for req_id in self.input_batch.req_ids
                 if req_id in scheduler_output.num_scheduled_tokens
             }
+            block_hashes = {
+                req_id: self.requests[req_id].block_hashes
+                for req_id in ordered_num_scheduled
+                if req_id in self.requests
+            }
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
                 positions=self.positions.cpu[:num_scheduled_tokens],
                 num_scheduled_tokes=ordered_num_scheduled,
+                block_hashes=block_hashes,
+                block_size=self.cache_config.block_size,
             )
 
         return (
@@ -4099,12 +4133,19 @@ class GPUModelRunner(
             # In async scheduling mode, valid_sampled_token_ids is empty at this point,
             # so we extract for all requests and let the scheduler filter.
             routed_experts_dict = None
+            routing_replay_added_block_hashes: list[bytes] = []
+            routing_replay_removed_block_hashes: list[bytes] = []
             if self.cache_config.return_routed_experts:
+                capturer = get_global_experts_capturer()
                 # Use req_ids_output_copy (all requests in batch) since
                 # valid_sampled_token_ids may be empty in async scheduling mode.
                 routed_experts_dict = self._extract_routed_experts_for_current_batch(
                     req_ids_output_copy
                 )
+                (
+                    routing_replay_added_block_hashes,
+                    routing_replay_removed_block_hashes,
+                ) = capturer.take_routing_replay_block_hash_updates()
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4119,6 +4160,12 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts_dict=routed_experts_dict,
+                routing_replay_added_block_hashes=(
+                    routing_replay_added_block_hashes
+                ),
+                routing_replay_removed_block_hashes=(
+                    routing_replay_removed_block_hashes
+                ),
             )
 
         if not self.use_async_scheduling:

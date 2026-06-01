@@ -253,6 +253,10 @@ class ModelRunnerOutput:
     # to avoid creating millions of Python int objects (~440x faster).
     routed_experts_dict: dict[str, tuple] | None = None
 
+    # Block-hash deltas for routed-expert replay data cached by the model runner.
+    routing_replay_added_block_hashes: list[bytes] = field(default_factory=list)
+    routing_replay_removed_block_hashes: list[bytes] = field(default_factory=list)
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,8 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    # Prefix-cache block hashes for the request's full token blocks.
+    block_hashes: list[bytes] = field(default_factory=list)
 
     @classmethod
     def from_request(
@@ -60,6 +62,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            block_hashes=list(request.block_hashes),
         )
 
     def __repr__(self) -> str:
@@ -75,6 +78,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"num_block_hashes={len(self.block_hashes)},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -100,6 +104,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"num_block_hashes={len(self.block_hashes)},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -122,6 +127,8 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Full prefix-cache block-hash chain per request, aligned with req_ids.
+    block_hashes: list[list[bytes]] = field(default_factory=list)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -129,6 +136,7 @@ class CachedRequestData:
         all_token_ids_lens = {
             req_id: len(toks) for req_id, toks in self.all_token_ids.items()
         }
+        block_hashes_lens = [len(hashes) for hashes in self.block_hashes]
         return (
             f"CachedRequestData("
             f"req_ids={self.req_ids},"
@@ -137,7 +145,8 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            f"block_hashes_lens={block_hashes_lens}"
             f")"
         )
 
@@ -172,6 +181,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            block_hashes=[],
         )
 
 
