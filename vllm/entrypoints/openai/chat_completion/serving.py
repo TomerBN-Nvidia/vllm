@@ -9,7 +9,9 @@ from collections.abc import Sequence as GenericSequence
 from typing import Any, Final
 
 import jinja2
+import numpy as np
 import partial_json_parser
+import ray
 import regex as re
 from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
@@ -34,6 +36,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    MoETopKIndices,
+    MoETopKIndicesPayload,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -173,6 +177,64 @@ class OpenAIServingChat(OpenAIServing):
         # Please use the Responses API instead.
         self.supports_code_interpreter = False
         self.python_tool = None
+
+        self.metadata_store_instance = None
+        self.block_store_instance_rank: int | None = None
+        self.block_store_instance_id: str | None = None
+        self.block_store_instance = None
+
+    def _get_metadata_store_instance(self) -> Any:
+        if self.metadata_store_instance is None:
+            instance_id = "nemo_rl.metadata_store"
+            try:
+                self.metadata_store_instance = ray.get_actor(instance_id)
+            except ValueError:
+                logger.warning_once(
+                    "NeMo RL metadata store actor %s is not available.", instance_id
+                )
+                self.metadata_store_instance = None
+                return None
+        return self.metadata_store_instance
+
+    def _get_grpo_weight_version_snapshot(self) -> int | None:
+        metadata_store = self._get_metadata_store_instance()
+        if metadata_store is None:
+            return None
+        weight_version_curr = ray.get(
+            metadata_store.get.remote("grpo.weight_version.curr")
+        )
+        weight_version_next = ray.get(
+            metadata_store.get.remote("grpo.weight_version.next")
+        )
+        # TODO: report weight update skew.
+        if weight_version_next is not None and weight_version_curr is not None:
+            return max(weight_version_next, weight_version_curr)
+        if weight_version_next is not None:
+            return weight_version_next
+        if weight_version_curr is not None:
+            return weight_version_curr
+        return None
+
+    def _get_block_store_instance(self) -> Any:
+        if self.block_store_instance is None:
+            node_ip = ray._private.services.get_node_ip_address()
+            instance_id = f"nemo_rl.block_store.node.{node_ip}"
+            try:
+                self.block_store_instance = ray.get_actor(instance_id)
+                runtime_metadata = ray.get(
+                    self.block_store_instance.get_runtime_metadata.remote()
+                )
+                self.block_store_instance_rank = runtime_metadata["instance_rank"]
+                self.block_store_instance_id = instance_id
+            except ValueError:
+                logger.warning_once(
+                    "NeMo RL MoE top-k block store actor %s is not available.", instance_id
+                )
+                self.block_store_instance_rank = None
+                self.block_store_instance = None
+                self.block_store_instance_id = None
+                return None
+        return self.block_store_instance
 
     async def warmup(self) -> None:
         """
@@ -349,8 +411,10 @@ class OpenAIServingChat(OpenAIServing):
 
         conversation, engine_prompts = result
 
+        base_request_id = self._base_request_id(raw_request, request.request_id)
+        assert base_request_id is not None
         request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+            f"vllm_chat_cmpl_{self._base_chat_request_id(base_request_id)}"
         )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -369,6 +433,16 @@ class OpenAIServingChat(OpenAIServing):
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+
+        return_moe_topk_indices = (
+            self.model_config.enable_moe_topk_indices_nemo_rl_block_store
+            or self.model_config.enable_moe_topk_indices_json
+        )
+        pre_generation_weight_version = (
+            self._get_grpo_weight_version_snapshot()
+            if return_moe_topk_indices and not request.stream
+            else None
+        )
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
@@ -462,6 +536,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                pre_generation_weight_version=pre_generation_weight_version,
             )
 
         try:
@@ -1403,6 +1478,7 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        pre_generation_weight_version: int | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1419,6 +1495,64 @@ class OpenAIServingChat(OpenAIServing):
 
         assert final_res is not None
 
+        logger.debug(f"chat_completion_full_generator: request id = {repr(request_id)}")
+
+        if False:
+            rl_metadata = None
+            if isinstance(request.metadata, dict):
+                rl_metadata = request.metadata.get("rl_metadata")
+            if isinstance(rl_metadata, str):
+                rl_metadata = json.loads(rl_metadata)
+            if rl_metadata is not None:
+                logger.debug(f"chat_completion_full_generator: rl metadata = {rl_metadata}")
+            else:
+                logger.debug("chat_completion_full_generator: no rl metadata")
+
+        block_store_enabled = (
+            self.model_config.enable_moe_topk_indices_nemo_rl_block_store
+        )
+        json_enabled = self.model_config.enable_moe_topk_indices_json
+        return_moe_topk_indices = block_store_enabled or json_enabled
+        has_routed_experts = (
+            final_res.prompt_routed_experts is not None
+            or any(output.routed_experts is not None for output in final_res.outputs)
+        )
+        if block_store_enabled and has_routed_experts and len(final_res.outputs) > 1:
+            return self.create_error_response(
+                "multiple response outputs not supported with "
+                "--enable-moe-topk-indices-nemo-rl-block-store"
+            )
+
+        rl_metadata = None
+        weight_version = (
+            self._get_grpo_weight_version_snapshot()
+            if return_moe_topk_indices and not request.stream
+            else None
+        )
+        if pre_generation_weight_version is None:
+            if rl_metadata is None:
+                rl_metadata = {}
+            rl_metadata["grpo.weight_version.pre"] = pre_generation_weight_version
+        if weight_version is not None:
+            if rl_metadata is None:
+                rl_metadata = {}
+            rl_metadata["grpo.weight_version"] = weight_version
+
+        assert final_res.prompt_token_ids is not None
+        num_prompt_tokens = len(final_res.prompt_token_ids)
+
+        prompt_moe_topk_indices = (
+            self._get_moe_topk_indices_payload(
+                request_id,
+                final_res.prompt_routed_experts,
+                start_pos=0,
+                end_pos=num_prompt_tokens,
+                rl_metadata=rl_metadata,
+            )
+            if return_moe_topk_indices
+            else None
+        )
+
         choices: list[ChatCompletionResponseChoice] = []
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
@@ -1433,6 +1567,17 @@ class OpenAIServingChat(OpenAIServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
             tool_call_info = None
+            completion_moe_topk_indices = (
+                self._get_moe_topk_indices_payload(
+                    request_id,
+                    output.routed_experts,
+                    start_pos=num_prompt_tokens,
+                    end_pos=num_prompt_tokens + len(token_ids),
+                    rl_metadata=rl_metadata,
+                )
+                if return_moe_topk_indices
+                else None
+            )
 
             if request.logprobs and request.top_logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
@@ -1493,6 +1638,7 @@ class OpenAIServingChat(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
+                    moe_topk_indices=completion_moe_topk_indices,
                 )
                 choices.append(choice_data)
                 continue
@@ -1702,6 +1848,7 @@ class OpenAIServingChat(OpenAIServing):
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
+                moe_topk_indices=completion_moe_topk_indices,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 
@@ -1722,7 +1869,16 @@ class OpenAIServingChat(OpenAIServing):
                 full_message = last_msg_content + (choice.message.content or "")
                 choice.message.content = full_message
 
-        assert final_res.prompt_token_ids is not None
+        if block_store_enabled and final_res.outputs:
+            self._maybe_store_moe_topk_indices(
+                request_id=request_id,
+                prompt_routed_experts=final_res.prompt_routed_experts,
+                completion_routed_experts=final_res.outputs[0].routed_experts,
+                num_prompt_tokens=num_prompt_tokens,
+                num_completion_tokens=len(final_res.outputs[0].token_ids),
+                rl_metadata=rl_metadata,
+            )
+
         num_prompt_tokens = len(final_res.prompt_token_ids)
         if final_res.encoder_prompt_token_ids is not None:
             num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
@@ -1752,6 +1908,7 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            prompt_moe_topk_indices=prompt_moe_topk_indices,
         )
 
         # Log complete response if output logging is enabled
@@ -1787,6 +1944,215 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
         return response
+
+    @staticmethod
+    def _base_chat_request_id(request_id: str) -> str:
+        known_prefixes = (
+            "vllm_chat_cmpl_",
+            "chatcmpl-",
+            "chatcmpl_",
+            "chat_cmpl_",
+            "chat_cmpl-",
+            "chat-cmpl_",
+            "chat-cmpl-",
+            "chat_",
+            "chat-",
+        )
+        for prefix in known_prefixes:
+            if request_id.startswith(prefix):
+                return request_id[len(prefix) :]
+        return request_id
+
+    def _get_moe_topk_indices_payload(
+        self,
+        request_id: str,
+        routed_experts: Any,
+        start_pos: int,
+        end_pos: int,
+        vllm_metadata: dict[str, Any] | None = None,
+        rl_metadata: dict[str, Any] | None = None,
+    ) -> MoETopKIndicesPayload:
+        if self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
+            return {
+                "data_tag": self._get_moe_topk_indices_data_tag(
+                    request_id,
+                    start_pos=start_pos,
+                    end_pos=end_pos,
+                    vllm_metadata=vllm_metadata,
+                    rl_metadata=rl_metadata,
+                ),
+            }
+        if self.model_config.enable_moe_topk_indices_json:
+            return self._format_moe_topk_indices(routed_experts)
+        return None
+
+    def _get_moe_topk_indices_data_tag(
+        self,
+        request_id: str,
+        start_pos: int,
+        end_pos: int,
+        vllm_metadata: dict[str, Any] | None = None,
+        rl_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.model_config.enable_moe_topk_indices_nemo_rl_block_store:
+            return None
+        if self._get_block_store_instance() is None:
+            return None
+        tag = {
+            "instance_rank": self.block_store_instance_rank,
+            "instance_id": self.block_store_instance_id,
+            "req_id": request_id,
+            "key": "moe_topk_indices",
+            "start": start_pos,
+            "end": end_pos,
+        }
+        if vllm_metadata is not None:
+            tag["vllm_metadata"] = vllm_metadata
+        if rl_metadata is not None:
+            tag["rl_metadata"] = rl_metadata
+        return tag
+
+    @staticmethod
+    def _normalize_moe_topk_indices_array(
+        routed_experts: Any,
+        expected_len: int,
+        field_name: str,
+        vllm_metadata: dict,
+    ) -> np.ndarray | None:
+        if routed_experts is None:
+            return None
+
+        if isinstance(routed_experts, list):
+            if routed_experts and isinstance(routed_experts[0], list):
+                logger.warning_once(
+                    "%s uses nested Python lists for MoE top-k indices; "
+                    "list[np.ndarray] is preferred.",
+                    field_name,
+                )
+            elif routed_experts and not isinstance(routed_experts[0], np.ndarray):
+                elem_types = sorted(
+                    {type(item).__name__ for item in routed_experts}
+                )
+                logger.warning_once(
+                    "%s has MoE top-k indices list element types %s; expected "
+                    "list[np.ndarray]. Attempting numpy conversion.",
+                    field_name,
+                    elem_types,
+                )
+        elif not isinstance(routed_experts, np.ndarray):
+            logger.warning_once(
+                "%s has MoE top-k indices type %s; expected np.ndarray, "
+                "list[np.ndarray], or list[list]. Attempting numpy conversion.",
+                field_name,
+                type(routed_experts).__name__,
+            )
+
+        routed_experts = np.asarray(routed_experts, dtype=np.int16)
+        if routed_experts.ndim == 0:
+            return None
+
+        seq_len = int(routed_experts.shape[0])
+        if seq_len > expected_len:
+            routed_experts = routed_experts[:expected_len]
+        elif seq_len < expected_len:
+            if seq_len == 0:
+                return None
+            pad_shape = (expected_len - seq_len, *routed_experts.shape[1:])
+            routed_experts = np.concatenate(
+                (routed_experts, np.zeros(pad_shape, dtype=routed_experts.dtype)),
+                axis=0,
+            )
+
+        if routed_experts.size == 0:
+            return routed_experts
+
+        # num_moe_layers = int(routed_experts.shape[-2])
+        topk = int(routed_experts.shape[-1])
+        # rows = routed_experts.reshape(-1, num_moe_layers * topk)
+        rows = routed_experts.reshape(-1, topk)
+        row_count = int(rows.shape[0])
+        invalid_row_count = 0
+        for row_idx in range(row_count):
+            row = rows[row_idx]
+            all_zeros = np.all(row == 0)
+            non_negative_unique = np.all(row >= 0) and (
+                np.unique(row).size == row.size
+            )
+            if not (all_zeros or non_negative_unique):
+                # TODO(pjin): re-enable.
+                # row.fill(0)
+                invalid_row_count += 1
+
+        vllm_metadata[field_name] = {
+            "row_count": row_count,
+            "invalid_row_count": invalid_row_count,
+        }
+
+        if False and invalid_row_count > 0:
+            logger.warning(
+                "%s has %d invalid MoE top-k row(s); expected unique "
+                "non-negative integers or all zeros. Rewriting invalid rows to "
+                "all zeros.",
+                field_name,
+                invalid_row_count,
+            )
+        if invalid_row_count > 0:
+            print(
+                "DEBUG: vllm.entrypoints.openai.chat_completion.serving: _normalize_moe_topk_indices_array: {field_name} has {invalid_row_count}/{row_count} invalid MoE top-k row(s); expected unique "
+                "non-negative integers or all zeros. Rewriting invalid rows to "
+                "all zeros.",
+                flush=True,
+            )
+
+        return routed_experts
+
+    def _maybe_store_moe_topk_indices(
+        self,
+        request_id: str,
+        prompt_routed_experts: Any,
+        completion_routed_experts: Any,
+        num_prompt_tokens: int,
+        num_completion_tokens: int,
+        rl_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.block_store_instance is None:
+            return
+
+        vllm_metadata = {}
+        prompt_array = self._normalize_moe_topk_indices_array(
+            prompt_routed_experts, num_prompt_tokens, "prompt_routed_experts", vllm_metadata
+        )
+        completion_array = self._normalize_moe_topk_indices_array(
+            completion_routed_experts, num_completion_tokens, "routed_experts", vllm_metadata
+        )
+        arrays = [
+            array for array in (prompt_array, completion_array) if array is not None
+        ]
+        if not arrays:
+            return
+
+        moe_topk_indices = (
+            arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
+        )
+        ray.get(
+            self.block_store_instance.put_numpy.remote(
+                request_id,
+                "moe_topk_indices",
+                moe_topk_indices,
+                vllm_metadata=vllm_metadata,
+                rl_metadata=rl_metadata,
+            )
+        )
+
+    def _format_moe_topk_indices(self, routed_experts: Any) -> list | None:
+        if routed_experts is None:
+            return None
+        if isinstance(routed_experts, list):
+            return routed_experts
+        tolist = getattr(routed_experts, "tolist", None)
+        if callable(tolist):
+            return tolist()
+        return list(routed_experts)
 
     def _get_top_logprobs(
         self,

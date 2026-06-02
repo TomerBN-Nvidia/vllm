@@ -12,6 +12,7 @@ from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
+from openai.types.shared import Metadata
 from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
@@ -81,6 +82,10 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
+MoETopKIndices = list[Any] | list[list[list[int]]] | None
+MoETopKIndicesPayload = dict[str, Any] | MoETopKIndices
+
+
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     message: ChatMessage
@@ -92,10 +97,13 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    moe_topk_indices: MoETopKIndicesPayload = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    id: str = Field(default_factory=lambda: f"vllm_chat_cmpl_{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
@@ -110,6 +118,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    prompt_moe_topk_indices: MoETopKIndicesPayload = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -123,7 +134,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
+    id: str = Field(default_factory=lambda: f"vllm_chat_cmpl_{random_uuid()}")
     object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
@@ -162,6 +173,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "the max_completion_tokens field",
     )
     max_completion_tokens: int | None = None
+    metadata: Metadata | None = None
     n: int | None = 1
     presence_penalty: float | None = 0.0
     response_format: AnyResponseFormat | None = None
