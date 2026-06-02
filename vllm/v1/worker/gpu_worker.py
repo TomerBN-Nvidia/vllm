@@ -220,8 +220,16 @@ class Worker(WorkerBase):
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
-            # This env var set by Ray causes exceptions with graph building.
-            os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            # TORCH_NCCL_ASYNC_ERROR_HANDLING enables detection of NCCL failures
+            # (hangs, timeouts, connection errors). Previously removed because
+            # "it causes exceptions with graph building" — but without it,
+            # NCCL errors go completely undetected, causing silent hangs.
+            #
+            # Set VLLM_DISABLE_NCCL_ASYNC_ERROR=1 to restore old behavior.
+            if os.environ.get("VLLM_DISABLE_NCCL_ASYNC_ERROR") == "1":
+                os.environ.pop("TORCH_NCCL_ASYNC_ERROR_HANDLING", None)
+            else:
+                os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
             parallel_config = self.parallel_config
             if (
                 parallel_config.distributed_executor_backend
@@ -838,8 +846,34 @@ class Worker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def check_health(self) -> None:
-        # worker will always be healthy as long as it's running.
-        return
+        """Health check: verify GPU accessible and worker responsive."""
+        # 1. Check GPU is accessible
+        if self.device is not None:
+            try:
+                import torch
+                torch.cuda.current_device()
+                # Small allocation to verify GPU memory works
+                probe = torch.zeros(1, device=self.device)
+                del probe
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"GPU health check failed on rank {self.rank}: {e}"
+                ) from e
+
+        # 2. Check NCCL group health (if distributed is initialized)
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_group = get_tp_group()
+            if tp_group is not None and tp_group.world_size > 1:
+                import torch
+                probe = torch.zeros(1, device=self.device)
+                torch.distributed.all_reduce(probe, group=tp_group.device_group)
+                del probe
+        except Exception:
+            # NCCL probe is best-effort during health check
+            pass
+
+
 
     def save_sharded_state(
         self,

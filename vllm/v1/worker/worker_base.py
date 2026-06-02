@@ -96,8 +96,10 @@ class WorkerBase:
         raise NotImplementedError
 
     def check_health(self) -> None:
-        """Basic health check (override for device-specific checks)."""
-        return
+        """Basic health check. Override for device-specific checks.
+        Raise an exception if the worker is unhealthy."""
+        return  # base implementation assumes healthy
+
 
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
