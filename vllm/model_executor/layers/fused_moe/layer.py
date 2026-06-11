@@ -970,22 +970,11 @@ class FusedMoE(CustomOp):
             shard_size = expert_data.shape[shard_dim] // 2
         else:
             shard_size = expert_data.shape[shard_dim]
-        loaded_shard_size = shard_size
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            loaded_dim = loaded_weight.shape[shard_dim]
-            if loaded_dim < shard_size * self.tp_size:
-                assert loaded_dim % self.tp_size == 0, (
-                    "Loaded MoE weight dimension must be divisible by TP size "
-                    f"when loading into a padded parameter. Got dim={loaded_dim}, "
-                    f"tp_size={self.tp_size}."
-                )
-                loaded_shard_size = loaded_dim // self.tp_size
-            else:
-                loaded_shard_size = shard_size
             loaded_weight = loaded_weight.narrow(
-                shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                shard_dim, shard_size * tp_rank, shard_size
             )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -995,28 +984,6 @@ class FusedMoE(CustomOp):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-
-        needs_padding = loaded_shard_size < shard_size
-        if loaded_weight.ndim > 0:
-            for dim, loaded_dim in enumerate(loaded_weight.shape):
-                if expert_data.shape[dim] > loaded_dim:
-                    needs_padding = True
-                elif expert_data.shape[dim] < loaded_dim:
-                    raise ValueError(
-                        "Loaded MoE weight dimension is larger than the "
-                        "target padded parameter. "
-                        f"dim={dim}, loaded_dim={loaded_dim}, "
-                        f"target_dim={expert_data.shape[dim]}."
-                    )
-
-        if needs_padding:
-            expert_data.zero_()
-        if loaded_shard_size < shard_size:
-            expert_data = expert_data.narrow(shard_dim, 0, loaded_shard_size)
-        if loaded_weight.ndim > 0:
-            for dim, loaded_dim in enumerate(loaded_weight.shape):
-                if expert_data.shape[dim] > loaded_dim:
-                    expert_data = expert_data.narrow(dim, 0, loaded_dim)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -1031,45 +998,12 @@ class FusedMoE(CustomOp):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        loaded_shard_size = shard_size
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
-            loaded_dim = loaded_weight.shape[shard_dim]
-            if loaded_dim < shard_size * self.tp_size:
-                assert loaded_dim % self.tp_size == 0, (
-                    "Loaded MoE weight dimension must be divisible by TP size "
-                    f"when loading into a padded parameter. Got dim={loaded_dim}, "
-                    f"tp_size={self.tp_size}."
-                )
-                loaded_shard_size = loaded_dim // self.tp_size
-            else:
-                loaded_shard_size = shard_size
             loaded_weight = loaded_weight.narrow(
-                shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                shard_dim, shard_size * tp_rank, shard_size
             )
-
-        needs_padding = loaded_shard_size < shard_size
-        if loaded_weight.ndim > 0:
-            for dim, loaded_dim in enumerate(loaded_weight.shape):
-                if expert_data.shape[dim] > loaded_dim:
-                    needs_padding = True
-                elif expert_data.shape[dim] < loaded_dim:
-                    raise ValueError(
-                        "Loaded MoE weight dimension is larger than the "
-                        "target padded parameter. "
-                        f"dim={dim}, loaded_dim={loaded_dim}, "
-                        f"target_dim={expert_data.shape[dim]}."
-                    )
-
-        if needs_padding:
-            expert_data.zero_()
-        if loaded_shard_size < shard_size:
-            expert_data = expert_data.narrow(shard_dim, 0, loaded_shard_size)
-        if loaded_weight.ndim > 0:
-            for dim, loaded_dim in enumerate(loaded_weight.shape):
-                if expert_data.shape[dim] > loaded_dim:
-                    expert_data = expert_data.narrow(dim, 0, loaded_dim)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 

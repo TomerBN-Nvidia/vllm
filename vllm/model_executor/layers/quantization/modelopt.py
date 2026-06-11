@@ -1837,72 +1837,64 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                     f"Expected {name} dtype {expected_dtype}, got {actual}."
                 )
 
-    @staticmethod
-    def _round_up(value: int, multiple: int) -> int:
-        return ((value + multiple - 1) // multiple) * multiple
+    def _shuffle_weights_for_trtllm(self, layer: torch.nn.Module) -> None:
+        """Build padded/shuffled FlashInfer TRTLLM MXFP8 apply weights.
 
-    @staticmethod
-    def _pad_tensor_dim(
-        tensor: torch.Tensor,
-        dim: int,
-        padded_size: int,
-    ) -> torch.Tensor:
-        current_size = tensor.shape[dim]
-        if current_size == padded_size:
-            return tensor
-        if current_size > padded_size:
-            raise ValueError(
-                f"Cannot pad dim {dim} from {current_size} to {padded_size}."
-            )
-
-        padded_shape = list(tensor.shape)
-        padded_shape[dim] = padded_size
-        padded = torch.zeros(
-            padded_shape,
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        target = padded.narrow(dim, 0, current_size)
-        target.copy_(tensor)
-        return padded
-
-    @staticmethod
-    def _remember_raw_padded_shapes(layer: torch.nn.Module) -> None:
-        """Record raw loadable tensor shapes before TRTLLM shuffling."""
-        layer.mxfp8_raw_w13_weight_shape = tuple(layer.w13_weight.shape)
-        layer.mxfp8_raw_w2_weight_shape = tuple(layer.w2_weight.shape)
-        layer.mxfp8_raw_w13_weight_scale_shape = tuple(
-            layer.w13_weight_scale.shape
-        )
-        layer.mxfp8_raw_w2_weight_scale_shape = tuple(layer.w2_weight_scale.shape)
-
-    def _maybe_pad_intermediate_for_trtllm(self, layer: torch.nn.Module) -> None:
-        """Pad MXFP8 MoE dimensions for FlashInfer TRTLLM layout.
-
-        Model checkpoints keep the original expert intermediate size. Pad the
-        in-memory vLLM expert weights/scales after loading so FlashInfer's
-        TRTLLM MXFP8 scale shuffle and tactic selection see supported shapes.
-        The activation/output path pads and slices the hidden dimension at
-        apply time, so padded hidden columns/rows stay internal to this kernel.
-        The padded rows/columns are zero and therefore do not change numerics.
+        ``w13_weight``/``w2_weight`` and their scales keep the checkpoint
+        layout and original shape so refit can load into them repeatedly.
+        The TRTLLM kernel consumes the ``*_for_apply`` tensors built here.
         """
-        original_intermediate_size = layer.intermediate_size_per_partition
-        original_hidden_size = layer.hidden_size
-        padded_intermediate_size = self._round_up(
-            original_intermediate_size,
-            256,
+        from flashinfer import (
+            reorder_rows_for_gated_act_gemm,
+            shuffle_matrix_a,
+            shuffle_matrix_sf_a,
         )
-        padded_hidden_size = self._round_up(original_hidden_size, 256)
-        if (
-            padded_intermediate_size == original_intermediate_size
-            and padded_hidden_size == original_hidden_size
-        ):
-            self._remember_raw_padded_shapes(layer)
-            return
 
+        def round_up(value: int, multiple: int) -> int:
+            return ((value + multiple - 1) // multiple) * multiple
+
+        def pad_tensor_dim(
+            tensor: torch.Tensor,
+            dim: int,
+            padded_size: int,
+        ) -> torch.Tensor:
+            current_size = tensor.shape[dim]
+            if current_size == padded_size:
+                return tensor
+            if current_size > padded_size:
+                raise ValueError(
+                    f"Cannot pad dim {dim} from {current_size} to {padded_size}."
+                )
+
+            padded_shape = list(tensor.shape)
+            padded_shape[dim] = padded_size
+            padded = torch.zeros(
+                padded_shape,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            padded.narrow(dim, 0, current_size).copy_(tensor)
+            return padded
+
+        def set_apply_parameter(name: str, value: torch.Tensor) -> None:
+            value = value.contiguous()
+            param = getattr(layer, name, None)
+            if param is not None and tuple(param.shape) == tuple(value.shape):
+                param.data.copy_(value)
+            else:
+                replace_parameter(layer, name, value)
+
+        epilogue_tile_m = 128
+        num_experts = layer.w13_weight.shape[0]
         is_gated = self.moe.is_act_and_mul
         intermediate_size_factor = 2 if is_gated else 1
-        padded_scale_blocks = padded_intermediate_size // MXFP8_BLOCK_SIZE
+        original_intermediate_size = layer.w2_weight.shape[2]
+        original_hidden_size = layer.w13_weight.shape[2]
+        padded_intermediate_size = round_up(original_intermediate_size, 256)
+        padded_hidden_size = round_up(original_hidden_size, 256)
+        padded_intermediate_scale_blocks = (
+            padded_intermediate_size // MXFP8_BLOCK_SIZE
+        )
         padded_hidden_scale_blocks = padded_hidden_size // MXFP8_BLOCK_SIZE
 
         layer.mxfp8_unpadded_hidden_size = original_hidden_size
@@ -1913,125 +1905,34 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         layer.mxfp8_padded_intermediate_size_per_partition = (
             padded_intermediate_size
         )
-
-        replace_parameter(
-            layer,
-            "w13_weight",
-            self._pad_tensor_dim(
-                layer.w13_weight.data,
-                1,
-                intermediate_size_factor * padded_intermediate_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w13_weight",
-            self._pad_tensor_dim(
-                layer.w13_weight.data,
-                2,
-                padded_hidden_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight",
-            self._pad_tensor_dim(
-                layer.w2_weight.data,
-                2,
-                padded_intermediate_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight",
-            self._pad_tensor_dim(
-                layer.w2_weight.data,
-                1,
-                padded_hidden_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w13_weight_scale",
-            self._pad_tensor_dim(
-                layer.w13_weight_scale.data,
-                1,
-                intermediate_size_factor * padded_intermediate_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w13_weight_scale",
-            self._pad_tensor_dim(
-                layer.w13_weight_scale.data,
-                2,
-                padded_hidden_scale_blocks,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_scale",
-            self._pad_tensor_dim(
-                layer.w2_weight_scale.data,
-                1,
-                padded_hidden_size,
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_scale",
-            self._pad_tensor_dim(
-                layer.w2_weight_scale.data,
-                2,
-                padded_scale_blocks,
-            ),
-        )
-        # replace_parameter creates fresh Parameter objects and only preserves
-        # weight_loader; keep the MoE reload path on the block-scale branch.
-        set_weight_attrs(
-            layer.w13_weight_scale,
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
-        )
-        set_weight_attrs(
-            layer.w2_weight_scale,
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
-        )
-
         layer.hidden_size = padded_hidden_size
         layer.moe_config.hidden_dim = padded_hidden_size
         layer.intermediate_size_per_partition = padded_intermediate_size
         layer.moe_config.intermediate_size_per_partition = padded_intermediate_size
         self.moe.hidden_dim = padded_hidden_size
         self.moe.intermediate_size_per_partition = padded_intermediate_size
-        self._remember_raw_padded_shapes(layer)
 
-        logger.info_once(
-            "Padded MXFP8 MoE dims for %s hidden %d->%d, intermediate %d->%d "
-            "for FlashInfer TRTLLM MXFP8 kernel shape constraints.",
-            getattr(layer, "layer_name", layer.__class__.__name__),
-            original_hidden_size,
+        w13_weight = pad_tensor_dim(
+            layer.w13_weight.data,
+            1,
+            intermediate_size_factor * padded_intermediate_size,
+        )
+        w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
+        w2_weight = pad_tensor_dim(layer.w2_weight.data, 2, padded_intermediate_size)
+        w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
+        w13_scale = pad_tensor_dim(
+            layer.w13_weight_scale.data,
+            1,
+            intermediate_size_factor * padded_intermediate_size,
+        )
+        w13_scale = pad_tensor_dim(w13_scale, 2, padded_hidden_scale_blocks)
+        w2_scale = pad_tensor_dim(
+            layer.w2_weight_scale.data,
+            1,
             padded_hidden_size,
-            original_intermediate_size,
-            padded_intermediate_size,
         )
+        w2_scale = pad_tensor_dim(w2_scale, 2, padded_intermediate_scale_blocks)
 
-    def _shuffle_weights_for_trtllm(self, layer: torch.nn.Module) -> None:
-        """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
-        from flashinfer import (
-            reorder_rows_for_gated_act_gemm,
-            shuffle_matrix_a,
-            shuffle_matrix_sf_a,
-        )
-
-        self._maybe_pad_intermediate_for_trtllm(layer)
-
-        epilogue_tile_m = 128
-        num_experts = layer.w13_weight.shape[0]
-        is_gated = self.moe.is_act_and_mul
-        intermediate_size_factor = 2 if is_gated else 1
-
-        w13_weight = layer.w13_weight.data
-        w13_scale = layer.w13_weight_scale.data
         if is_gated:
             # FI TRTLLM gated kernels use W31 ordering. Model checkpoints store
             # gated projection as W13, so convert once before shuffling.
@@ -2056,7 +1957,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
             w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
             w2_shuffled_i = shuffle_matrix_a(
-                layer.w2_weight.data[i].view(torch.uint8), epilogue_tile_m
+                w2_weight[i].view(torch.uint8), epilogue_tile_m
             )
             w13_weight_shuffled.append(
                 w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE)
@@ -2072,9 +1973,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
             w2_sf_shuffled_i = shuffle_matrix_sf_a(
-                layer.w2_weight_scale.data[i]
-                .view(torch.uint8)
-                .reshape(layer.hidden_size, -1),
+                w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1),
                 epilogue_tile_m,
             )
             w13_scale_shuffled.append(
@@ -2084,33 +1983,14 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
             )
 
-        replace_parameter(
-            layer,
-            "w13_scale_for_apply",
-            torch.stack(w13_scale_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w2_scale_for_apply",
-            torch.stack(w2_scale_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w13_weight",
-            torch.stack(w13_weight_shuffled).contiguous(),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight",
-            torch.stack(w2_weight_shuffled).contiguous(),
-        )
+        set_apply_parameter("w13_weight_for_apply", torch.stack(w13_weight_shuffled))
+        set_apply_parameter("w2_weight_for_apply", torch.stack(w2_weight_shuffled))
+        set_apply_parameter("w13_scale_for_apply", torch.stack(w13_scale_shuffled))
+        set_apply_parameter("w2_scale_for_apply", torch.stack(w2_scale_shuffled))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._check_weight_dtypes(layer)
-        if getattr(layer, "mxfp8_trtllm_weights_processed", False):
-            return
         self._shuffle_weights_for_trtllm(layer)
-        layer.mxfp8_trtllm_weights_processed = True
 
     def maybe_make_prepare_finalize(
         self,
@@ -2214,9 +2094,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             routing_bias=layer.e_score_correction_bias,
             hidden_states=hidden_states_mxfp8,
             hidden_states_scale=hidden_states_scale,
-            gemm1_weights=layer.w13_weight,
+            gemm1_weights=layer.w13_weight_for_apply,
             gemm1_weights_scale=layer.w13_scale_for_apply,
-            gemm2_weights=layer.w2_weight,
+            gemm2_weights=layer.w2_weight_for_apply,
             gemm2_weights_scale=layer.w2_scale_for_apply,
             num_experts=layer.global_num_experts,
             top_k=layer.top_k,
