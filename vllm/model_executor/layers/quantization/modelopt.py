@@ -1890,26 +1890,29 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         intermediate_size_factor = 2 if is_gated else 1
         original_intermediate_size = layer.w2_weight.shape[2]
         original_hidden_size = layer.w13_weight.shape[2]
-        padded_intermediate_size = round_up(original_intermediate_size, 256)
-        padded_hidden_size = round_up(original_hidden_size, 256)
+        assert original_hidden_size % 128 == 0, (
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden_size divisible by "
+            f"128, got {original_hidden_size}."
+        )
+
+        padded_intermediate_size = round_up(original_intermediate_size, 128)
         padded_intermediate_scale_blocks = (
             padded_intermediate_size // MXFP8_BLOCK_SIZE
         )
-        padded_hidden_scale_blocks = padded_hidden_size // MXFP8_BLOCK_SIZE
 
         layer.mxfp8_unpadded_hidden_size = original_hidden_size
-        layer.mxfp8_padded_hidden_size = padded_hidden_size
+        layer.mxfp8_padded_hidden_size = original_hidden_size
         layer.mxfp8_unpadded_intermediate_size_per_partition = (
             original_intermediate_size
         )
         layer.mxfp8_padded_intermediate_size_per_partition = (
             padded_intermediate_size
         )
-        layer.hidden_size = padded_hidden_size
-        layer.moe_config.hidden_dim = padded_hidden_size
+        layer.hidden_size = original_hidden_size
+        layer.moe_config.hidden_dim = original_hidden_size
         layer.intermediate_size_per_partition = padded_intermediate_size
         layer.moe_config.intermediate_size_per_partition = padded_intermediate_size
-        self.moe.hidden_dim = padded_hidden_size
+        self.moe.hidden_dim = original_hidden_size
         self.moe.intermediate_size_per_partition = padded_intermediate_size
 
         w13_weight = pad_tensor_dim(
@@ -1917,20 +1920,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             1,
             intermediate_size_factor * padded_intermediate_size,
         )
-        w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
         w2_weight = pad_tensor_dim(layer.w2_weight.data, 2, padded_intermediate_size)
-        w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
         w13_scale = pad_tensor_dim(
             layer.w13_weight_scale.data,
             1,
             intermediate_size_factor * padded_intermediate_size,
         )
-        w13_scale = pad_tensor_dim(w13_scale, 2, padded_hidden_scale_blocks)
-        w2_scale = pad_tensor_dim(
-            layer.w2_weight_scale.data,
-            1,
-            padded_hidden_size,
-        )
+        w2_scale = layer.w2_weight_scale.data
         w2_scale = pad_tensor_dim(w2_scale, 2, padded_intermediate_scale_blocks)
 
         if is_gated:
@@ -2067,21 +2063,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         n_group = layer.num_expert_group or None
         topk_group = layer.topk_group or None
 
-        padded_hidden_size = getattr(
-            layer,
-            "mxfp8_padded_hidden_size",
-            x.shape[-1],
+        assert x.shape[-1] % 128 == 0, (
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden states with "
+            f"last dimension divisible by 128, got {x.shape[-1]}."
         )
-        if x.shape[-1] < padded_hidden_size:
-            x_for_moe = torch.nn.functional.pad(
-                x,
-                (0, padded_hidden_size - x.shape[-1]),
-            )
-        else:
-            x_for_moe = x
 
         hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
-            x_for_moe,
+            x,
             is_sf_swizzled_layout=False,
         )
 
