@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -32,6 +34,14 @@ class Sampler:
             raise NotImplementedError(f"Unsupported logprobs_mode: {logprobs_mode}")
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
+        self.debug_logprobs = os.getenv("VLLM_NEMO_DEBUG_LOGPROBS") == "1"
+        self._debug_logprobs_prints = 0
+        try:
+            self._debug_logprobs_max_prints = int(
+                os.getenv("VLLM_NEMO_DEBUG_LOGPROBS_MAX_PRINTS", "32")
+            )
+        except ValueError:
+            self._debug_logprobs_max_prints = 32
 
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
         self.penalties_state = PenaltiesState(req_states)
@@ -84,6 +94,15 @@ class Sampler:
             logprobs_tensors = compute_topk_logprobs(
                 logits, max_num_logprobs, sampled, cu_num_logits
             )
+            if self.debug_logprobs:
+                self._debug_logprobs_path(
+                    logits_for_logprobs=logits,
+                    processed_logits=processed_logits,
+                    logprobs=logprobs_tensors.logprobs,
+                    sampled=sampled,
+                    idx_mapping_np=idx_mapping_np,
+                    max_num_logprobs=max_num_logprobs,
+                )
         else:
             logprobs_tensors = None
 
@@ -97,6 +116,85 @@ class Sampler:
             num_nans=num_nans,
         )
         return sampler_output
+
+    def _debug_logprobs_path(
+        self,
+        logits_for_logprobs: torch.Tensor,
+        processed_logits: torch.Tensor,
+        logprobs: torch.Tensor,
+        sampled: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        max_num_logprobs: int,
+    ) -> None:
+        def tensor_counts(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            finite_count = torch.isfinite(tensor).sum().item()
+            return tensor.numel(), finite_count, nan_count, inf_count
+
+        _, _, logits_nan, logits_inf = tensor_counts(logits_for_logprobs)
+        _, _, processed_nan, processed_inf = tensor_counts(processed_logits)
+        _, _, logprob_nan, logprob_inf = tensor_counts(logprobs)
+        has_nonfinite = any(
+            count
+            for count in (
+                logits_nan,
+                logits_inf,
+                processed_nan,
+                processed_inf,
+                logprob_nan,
+                logprob_inf,
+            )
+        )
+        should_print = has_nonfinite or self._debug_logprobs_prints < 2
+        if not should_print:
+            return
+        if self._debug_logprobs_prints >= self._debug_logprobs_max_prints:
+            return
+
+        logits_total, logits_finite, _, _ = tensor_counts(logits_for_logprobs)
+        proc_total, proc_finite, _, _ = tensor_counts(processed_logits)
+        lp_total, lp_finite, _, _ = tensor_counts(logprobs)
+
+        bad_logprob_rows = torch.nonzero(
+            ~torch.isfinite(logprobs).all(dim=1), as_tuple=False
+        ).flatten()
+        bad_logits_rows = torch.nonzero(
+            ~torch.isfinite(logits_for_logprobs).all(dim=1), as_tuple=False
+        ).flatten()
+
+        first_bad_logprob_rows = (
+            bad_logprob_rows[:8].detach().cpu().tolist()
+            if bad_logprob_rows.numel()
+            else []
+        )
+        first_bad_logits_rows = (
+            bad_logits_rows[:8].detach().cpu().tolist()
+            if bad_logits_rows.numel()
+            else []
+        )
+        sampled_preview = sampled[:8].detach().cpu().tolist()
+        req_preview = idx_mapping_np[:8].tolist()
+
+        print(
+            "[vllm-nemo-debug-logprobs] "
+            f"mode={self.logprobs_mode} max_num_logprobs={max_num_logprobs} "
+            f"reqs={len(idx_mapping_np)} req_idx_preview={req_preview} "
+            f"sampled_preview={sampled_preview} "
+            f"logits_shape={tuple(logits_for_logprobs.shape)} "
+            f"logits_finite={logits_finite}/{logits_total} "
+            f"logits_nan={logits_nan} logits_inf={logits_inf} "
+            f"processed_shape={tuple(processed_logits.shape)} "
+            f"processed_finite={proc_finite}/{proc_total} "
+            f"processed_nan={processed_nan} processed_inf={processed_inf} "
+            f"logprobs_shape={tuple(logprobs.shape)} "
+            f"logprobs_finite={lp_finite}/{lp_total} "
+            f"logprobs_nan={logprob_nan} logprobs_inf={logprob_inf} "
+            f"bad_logits_rows={first_bad_logits_rows} "
+            f"bad_logprob_rows={first_bad_logprob_rows}",
+            flush=True,
+        )
+        self._debug_logprobs_prints += 1
 
     def sample(
         self,

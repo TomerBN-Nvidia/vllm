@@ -1692,6 +1692,8 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        import os
+
         if layer.weight.dtype != MXFP8_VALUE_DTYPE:
             raise ValueError(
                 f"Weight dtype {layer.weight.dtype} != expected {MXFP8_VALUE_DTYPE}"
@@ -1702,13 +1704,31 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 f"expected {MXFP8_SCALE_DTYPE}"
             )
 
-        return self.mxfp8_linear_op.apply(
+        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
+        if debug_finite and not torch.isfinite(x).all().item():
+            raise RuntimeError(
+                f"Non-finite MXFP8 linear input: "
+                f"shape={tuple(x.shape)}, dtype={x.dtype}, "
+                f"weight_shape={tuple(layer.weight.shape)}, "
+                f"weight_scale_shape={tuple(layer.weight_scale.shape)}"
+            )
+
+        output = self.mxfp8_linear_op.apply(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale_for_apply,
             out_dtype=x.dtype,
             bias=bias,
         )
+        if debug_finite and not torch.isfinite(output).all().item():
+            raise RuntimeError(
+                f"Non-finite MXFP8 linear output: "
+                f"shape={tuple(output.shape)}, dtype={output.dtype}, "
+                f"input_shape={tuple(x.shape)}, "
+                f"weight_shape={tuple(layer.weight.shape)}, "
+                f"weight_scale_shape={tuple(layer.weight_scale.shape)}"
+            )
+        return output
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
@@ -1857,6 +1877,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             tensor: torch.Tensor,
             dim: int,
             padded_size: int,
+            pad_value: int | float = 0,
         ) -> torch.Tensor:
             current_size = tensor.shape[dim]
             if current_size == padded_size:
@@ -1873,6 +1894,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 dtype=tensor.dtype,
                 device=tensor.device,
             )
+            if pad_value != 0:
+                padded.fill_(pad_value)
             padded.narrow(dim, 0, current_size).copy_(tensor)
             return padded
 
@@ -1883,6 +1906,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 param.data.copy_(value)
             else:
                 replace_parameter(layer, name, value)
+
+        def clamp_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
+            return torch.where(scale == 0, torch.ones_like(scale), scale)
 
         epilogue_tile_m = 128
         num_experts = layer.w13_weight.shape[0]
@@ -1896,12 +1922,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
         padded_intermediate_size = round_up(original_intermediate_size, 128)
+        padded_hidden_size = original_hidden_size
         padded_intermediate_scale_blocks = (
             padded_intermediate_size // MXFP8_BLOCK_SIZE
         )
 
         layer.mxfp8_unpadded_hidden_size = original_hidden_size
-        layer.mxfp8_padded_hidden_size = original_hidden_size
+        layer.mxfp8_padded_hidden_size = padded_hidden_size
         layer.mxfp8_unpadded_intermediate_size_per_partition = (
             original_intermediate_size
         )
@@ -1920,14 +1947,24 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             1,
             intermediate_size_factor * padded_intermediate_size,
         )
+        # Keep H unpadded. Only the MoE intermediate dimension is padded for
+        # the TRTLLM MXFP8 kernel.
         w2_weight = pad_tensor_dim(layer.w2_weight.data, 2, padded_intermediate_size)
         w13_scale = pad_tensor_dim(
             layer.w13_weight_scale.data,
             1,
             intermediate_size_factor * padded_intermediate_size,
+            pad_value=1,
         )
         w2_scale = layer.w2_weight_scale.data
-        w2_scale = pad_tensor_dim(w2_scale, 2, padded_intermediate_scale_blocks)
+        w2_scale = pad_tensor_dim(
+            w2_scale,
+            2,
+            padded_intermediate_scale_blocks,
+            pad_value=1,
+        )
+        w13_scale = clamp_mxfp8_scale(w13_scale)
+        w2_scale = clamp_mxfp8_scale(w2_scale)
 
         if is_gated:
             # FI TRTLLM gated kernels use W31 ordering. Model checkpoints store
@@ -1969,7 +2006,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
             w2_sf_shuffled_i = shuffle_matrix_sf_a(
-                w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1),
+                w2_scale[i].view(torch.uint8).reshape(padded_hidden_size, -1),
                 epilogue_tile_m,
             )
             w13_scale_shuffled.append(
@@ -2024,6 +2061,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        import os
+
         from flashinfer.fused_moe.core import (
             ActivationType,
             Fp8QuantizationType,
@@ -2058,6 +2097,39 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             )
         else:
             router_logits = router_logits.to(torch.bfloat16)
+
+        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
+
+        def check_finite(name: str, tensor: torch.Tensor) -> None:
+            if not debug_finite:
+                return
+            finite = torch.isfinite(tensor)
+            if not finite.all().item():
+                finite_count = int(finite.sum().item())
+                total = tensor.numel()
+                bad_rows: list[int] = []
+                if tensor.ndim >= 2:
+                    bad_rows = (
+                        (~finite.reshape(tensor.shape[0], -1).all(dim=1))
+                        .nonzero(as_tuple=False)
+                        .flatten()[:8]
+                        .tolist()
+                    )
+                raise RuntimeError(
+                    f"Non-finite MXFP8 MoE {name}: "
+                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                    f"finite={finite_count}/{total}, "
+                    f"nan={int(torch.isnan(tensor).sum().item())}, "
+                    f"inf={int(torch.isinf(tensor).sum().item())}, "
+                    f"bad_rows={bad_rows}, "
+                    f"w13_shape={tuple(layer.w13_weight.shape)}, "
+                    f"w13_apply_shape={tuple(layer.w13_weight_for_apply.shape)}, "
+                    f"w2_shape={tuple(layer.w2_weight.shape)}, "
+                    f"w2_apply_shape={tuple(layer.w2_weight_for_apply.shape)}"
+                )
+
+        check_finite("input", x)
+        check_finite("router_logits", router_logits)
 
         # Treat 0 as "unset" for compatibility with ungrouped routing configs.
         n_group = layer.num_expert_group or None
@@ -2104,7 +2176,19 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             routing_replay_out=routing_replay_out,
         )
 
-        return flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
+        unpadded_hidden_size = getattr(
+            layer,
+            "mxfp8_unpadded_hidden_size",
+            x.shape[-1],
+        )
+        output = flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
+        if output.shape[-1] != unpadded_hidden_size:
+            raise RuntimeError(
+                "FlashInfer TRTLLM MXFP8 MoE returned an unexpected hidden size: "
+                f"got {output.shape[-1]}, expected {unpadded_hidden_size}."
+            )
+        check_finite("output", output)
+        return output
 
     def apply(
         self,

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -63,6 +65,14 @@ class Sampler(nn.Module):
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
+        self.debug_logprobs = os.getenv("VLLM_NEMO_DEBUG_LOGPROBS") == "1"
+        self._debug_logprobs_prints = 0
+        try:
+            self._debug_logprobs_max_prints = int(
+                os.getenv("VLLM_NEMO_DEBUG_LOGPROBS_MAX_PRINTS", "32")
+            )
+        except ValueError:
+            self._debug_logprobs_max_prints = 32
 
     def forward(
         self,
@@ -72,6 +82,8 @@ class Sampler(nn.Module):
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        raw_logits_for_debug = logits if self.debug_logprobs else None
+        raw_logprobs = None
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
@@ -114,6 +126,18 @@ class Sampler(nn.Module):
             logprobs_tensors = self.gather_logprobs(
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
+            if self.debug_logprobs:
+                self._debug_logprobs_path(
+                    logprobs_mode=logprobs_mode,
+                    raw_logits=raw_logits_for_debug,
+                    raw_logprobs=raw_logprobs,
+                    processed_logits=logits,
+                    processed_logprobs=processed_logprobs,
+                    gathered_logprobs=logprobs_tensors.logprobs,
+                    sampled=sampled,
+                    sampling_metadata=sampling_metadata,
+                    num_logprobs=num_logprobs,
+                )
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -127,6 +151,94 @@ class Sampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    def _debug_logprobs_path(
+        self,
+        logprobs_mode: LogprobsMode,
+        raw_logits: torch.Tensor | None,
+        raw_logprobs: torch.Tensor | None,
+        processed_logits: torch.Tensor,
+        processed_logprobs: torch.Tensor | None,
+        gathered_logprobs: torch.Tensor,
+        sampled: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        num_logprobs: int,
+    ) -> None:
+        def tensor_counts(tensor: torch.Tensor | None) -> tuple[int, int, int, int]:
+            if tensor is None:
+                return 0, 0, 0, 0
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            finite_count = torch.isfinite(tensor).sum().item()
+            return tensor.numel(), finite_count, nan_count, inf_count
+
+        raw_total, raw_finite, raw_nan, raw_inf = tensor_counts(raw_logits)
+        rlp_total, rlp_finite, rlp_nan, rlp_inf = tensor_counts(raw_logprobs)
+        proc_total, proc_finite, proc_nan, proc_inf = tensor_counts(processed_logits)
+        plp_total, plp_finite, plp_nan, plp_inf = tensor_counts(processed_logprobs)
+        glp_total, glp_finite, glp_nan, glp_inf = tensor_counts(gathered_logprobs)
+
+        has_nonfinite = any(
+            count
+            for count in (
+                raw_nan,
+                raw_inf,
+                rlp_nan,
+                rlp_inf,
+                proc_nan,
+                proc_inf,
+                plp_nan,
+                plp_inf,
+                glp_nan,
+                glp_inf,
+            )
+        )
+        should_print = has_nonfinite or self._debug_logprobs_prints < 2
+        if not should_print:
+            return
+        if self._debug_logprobs_prints >= self._debug_logprobs_max_prints:
+            return
+
+        def bad_rows(tensor: torch.Tensor | None) -> list[int]:
+            if tensor is None or tensor.ndim < 2:
+                return []
+            rows = torch.nonzero(~torch.isfinite(tensor).all(dim=1), as_tuple=False)
+            return rows.flatten()[:8].detach().cpu().tolist()
+
+        sampled_preview = sampled[:8].detach().cpu().tolist()
+        output_len_preview = [len(ids) for ids in sampling_metadata.output_token_ids[:8]]
+
+        print(
+            "[vllm-nemo-debug-logprobs] "
+            f"mode={logprobs_mode} num_logprobs={num_logprobs} "
+            f"batch={processed_logits.shape[0]} "
+            f"all_greedy={sampling_metadata.all_greedy} "
+            f"all_random={sampling_metadata.all_random} "
+            f"sampled_preview={sampled_preview} "
+            f"output_len_preview={output_len_preview} "
+            f"raw_logits_shape={tuple(raw_logits.shape) if raw_logits is not None else None} "
+            f"raw_logits_finite={raw_finite}/{raw_total} "
+            f"raw_logits_nan={raw_nan} raw_logits_inf={raw_inf} "
+            f"raw_logprobs_shape={tuple(raw_logprobs.shape) if raw_logprobs is not None else None} "
+            f"raw_logprobs_finite={rlp_finite}/{rlp_total} "
+            f"raw_logprobs_nan={rlp_nan} raw_logprobs_inf={rlp_inf} "
+            f"processed_logits_shape={tuple(processed_logits.shape)} "
+            f"processed_logits_finite={proc_finite}/{proc_total} "
+            f"processed_logits_nan={proc_nan} processed_logits_inf={proc_inf} "
+            f"processed_logprobs_shape={tuple(processed_logprobs.shape) if processed_logprobs is not None else None} "
+            f"processed_logprobs_finite={plp_finite}/{plp_total} "
+            f"processed_logprobs_nan={plp_nan} processed_logprobs_inf={plp_inf} "
+            f"gathered_logprobs_shape={tuple(gathered_logprobs.shape)} "
+            f"gathered_logprobs_finite={glp_finite}/{glp_total} "
+            f"gathered_logprobs_nan={glp_nan} gathered_logprobs_inf={glp_inf} "
+            f"bad_raw_logits_rows={bad_rows(raw_logits)} "
+            f"bad_raw_logprobs_rows={bad_rows(raw_logprobs)} "
+            f"bad_processed_logits_rows={bad_rows(processed_logits)} "
+            f"bad_processed_logprobs_rows={bad_rows(processed_logprobs)} "
+            f"bad_gathered_logprobs_rows={bad_rows(gathered_logprobs)}",
+            flush=True,
+        )
+        self._debug_logprobs_prints += 1
 
     @staticmethod
     def apply_temperature(
