@@ -5,6 +5,7 @@ from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -1922,10 +1923,15 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
         padded_intermediate_size = round_up(original_intermediate_size, 128)
-        padded_hidden_size = original_hidden_size
+        # FlashInfer TRTLLM MXFP8 MoE showed intermittent non-finite output for
+        # Nemotron-3-Nano's H=2816 padded hidden shape. Padding H to the next
+        # 512 boundary gives the stable H=3072 shape while keeping the loaded
+        # checkpoint tensors at their original size for refit.
+        padded_hidden_size = round_up(original_hidden_size, 512)
         padded_intermediate_scale_blocks = (
             padded_intermediate_size // MXFP8_BLOCK_SIZE
         )
+        padded_hidden_scale_blocks = padded_hidden_size // MXFP8_BLOCK_SIZE
 
         layer.mxfp8_unpadded_hidden_size = original_hidden_size
         layer.mxfp8_padded_hidden_size = padded_hidden_size
@@ -1947,16 +1953,27 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             1,
             intermediate_size_factor * padded_intermediate_size,
         )
-        # Keep H unpadded. Only the MoE intermediate dimension is padded for
-        # the TRTLLM MXFP8 kernel.
+        w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
         w2_weight = pad_tensor_dim(layer.w2_weight.data, 2, padded_intermediate_size)
+        w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
         w13_scale = pad_tensor_dim(
             layer.w13_weight_scale.data,
             1,
             intermediate_size_factor * padded_intermediate_size,
             pad_value=1,
         )
-        w2_scale = layer.w2_weight_scale.data
+        w13_scale = pad_tensor_dim(
+            w13_scale,
+            2,
+            padded_hidden_scale_blocks,
+            pad_value=1,
+        )
+        w2_scale = pad_tensor_dim(
+            layer.w2_weight_scale.data,
+            1,
+            padded_hidden_size,
+            pad_value=1,
+        )
         w2_scale = pad_tensor_dim(
             w2_scale,
             2,
@@ -2140,8 +2157,22 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             f"last dimension divisible by 128, got {x.shape[-1]}."
         )
 
+        padded_hidden_size = getattr(
+            layer,
+            "mxfp8_padded_hidden_size",
+            x.shape[-1],
+        )
+        if x.shape[-1] < padded_hidden_size:
+            x_for_moe = F.pad(
+                x,
+                (0, padded_hidden_size - x.shape[-1]),
+                value=1.0,
+            )
+        else:
+            x_for_moe = x
+
         hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
-            x,
+            x_for_moe,
             is_sf_swizzled_layout=False,
         )
 
@@ -2183,10 +2214,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
         output = flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
         if output.shape[-1] != unpadded_hidden_size:
-            raise RuntimeError(
-                "FlashInfer TRTLLM MXFP8 MoE returned an unexpected hidden size: "
-                f"got {output.shape[-1]}, expected {unpadded_hidden_size}."
-            )
+            output = output[..., :unpadded_hidden_size].contiguous()
         check_finite("output", output)
         return output
 
