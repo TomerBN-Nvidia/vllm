@@ -613,26 +613,6 @@ class NemotronHModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        import os
-
-        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
-
-        def check_finite(
-            name: str,
-            tensor: torch.Tensor | None,
-            layer_idx: int | None = None,
-            layer_type: str | None = None,
-        ) -> None:
-            if not debug_finite or tensor is None:
-                return
-            layer_msg = (
-                "input"
-                if layer_idx is None
-                else f"layer={layer_idx} type={layer_type}"
-            )
-            if not torch.isfinite(tensor).all().item():
-                raise RuntimeError(f"Non-finite NemotronH {name}: {layer_msg}")
-
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -644,13 +624,7 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        check_finite("hidden_states", hidden_states)
-        check_finite("residual", residual)
-
-        for layer_idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             if isinstance(layer, NemotronHMoEDecoderLayer):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -663,20 +637,12 @@ class NemotronHModel(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                 )
-            check_finite(
-                "hidden_states",
-                hidden_states,
-                layer_idx,
-                layer.__class__.__name__,
-            )
-            check_finite("residual", residual, layer_idx, layer.__class__.__name__)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
-        check_finite("hidden_states", hidden_states, self.end_layer, "norm_f")
         return hidden_states
 
     def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
@@ -990,26 +956,7 @@ class NemotronHForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        import os
-
-        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
-        if debug_finite and not torch.isfinite(hidden_states).all().item():
-            raise RuntimeError(
-                "Non-finite NemotronH logits input: "
-                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}"
-            )
         logits = self.logits_processor(self.lm_head, hidden_states)
-        if (
-            debug_finite
-            and logits is not None
-            and not torch.isfinite(logits).all().item()
-        ):
-            raise RuntimeError(
-                "Non-finite NemotronH logits output: "
-                f"shape={tuple(logits.shape)}, dtype={logits.dtype}, "
-                f"hidden_shape={tuple(hidden_states.shape)}, "
-                f"hidden_dtype={hidden_states.dtype}"
-            )
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

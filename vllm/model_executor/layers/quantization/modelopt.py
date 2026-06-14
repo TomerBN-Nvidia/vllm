@@ -1693,8 +1693,6 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        import os
-
         if layer.weight.dtype != MXFP8_VALUE_DTYPE:
             raise ValueError(
                 f"Weight dtype {layer.weight.dtype} != expected {MXFP8_VALUE_DTYPE}"
@@ -1705,31 +1703,13 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 f"expected {MXFP8_SCALE_DTYPE}"
             )
 
-        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
-        if debug_finite and not torch.isfinite(x).all().item():
-            raise RuntimeError(
-                f"Non-finite MXFP8 linear input: "
-                f"shape={tuple(x.shape)}, dtype={x.dtype}, "
-                f"weight_shape={tuple(layer.weight.shape)}, "
-                f"weight_scale_shape={tuple(layer.weight_scale.shape)}"
-            )
-
-        output = self.mxfp8_linear_op.apply(
+        return self.mxfp8_linear_op.apply(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale_for_apply,
             out_dtype=x.dtype,
             bias=bias,
         )
-        if debug_finite and not torch.isfinite(output).all().item():
-            raise RuntimeError(
-                f"Non-finite MXFP8 linear output: "
-                f"shape={tuple(output.shape)}, dtype={output.dtype}, "
-                f"input_shape={tuple(x.shape)}, "
-                f"weight_shape={tuple(layer.weight.shape)}, "
-                f"weight_scale_shape={tuple(layer.weight_scale.shape)}"
-            )
-        return output
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
@@ -2078,8 +2058,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        import os
-
         from flashinfer.fused_moe.core import (
             ActivationType,
             Fp8QuantizationType,
@@ -2114,39 +2092,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             )
         else:
             router_logits = router_logits.to(torch.bfloat16)
-
-        debug_finite = os.getenv("VLLM_MXFP8_DEBUG_FINITE") == "1"
-
-        def check_finite(name: str, tensor: torch.Tensor) -> None:
-            if not debug_finite:
-                return
-            finite = torch.isfinite(tensor)
-            if not finite.all().item():
-                finite_count = int(finite.sum().item())
-                total = tensor.numel()
-                bad_rows: list[int] = []
-                if tensor.ndim >= 2:
-                    bad_rows = (
-                        (~finite.reshape(tensor.shape[0], -1).all(dim=1))
-                        .nonzero(as_tuple=False)
-                        .flatten()[:8]
-                        .tolist()
-                    )
-                raise RuntimeError(
-                    f"Non-finite MXFP8 MoE {name}: "
-                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
-                    f"finite={finite_count}/{total}, "
-                    f"nan={int(torch.isnan(tensor).sum().item())}, "
-                    f"inf={int(torch.isinf(tensor).sum().item())}, "
-                    f"bad_rows={bad_rows}, "
-                    f"w13_shape={tuple(layer.w13_weight.shape)}, "
-                    f"w13_apply_shape={tuple(layer.w13_weight_for_apply.shape)}, "
-                    f"w2_shape={tuple(layer.w2_weight.shape)}, "
-                    f"w2_apply_shape={tuple(layer.w2_weight_for_apply.shape)}"
-                )
-
-        check_finite("input", x)
-        check_finite("router_logits", router_logits)
 
         # Treat 0 as "unset" for compatibility with ungrouped routing configs.
         n_group = layer.num_expert_group or None
@@ -2215,7 +2160,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         output = flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
         if output.shape[-1] != unpadded_hidden_size:
             output = output[..., :unpadded_hidden_size].contiguous()
-        check_finite("output", output)
         return output
 
     def apply(

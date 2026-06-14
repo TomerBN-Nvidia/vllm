@@ -47,8 +47,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
-import os
-
 # Added by the IBM Team, 2024
 
 
@@ -511,29 +509,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
-    def _debug_check_finite(self, name: str, tensor: torch.Tensor) -> None:
-        if os.getenv("VLLM_MXFP8_DEBUG_FINITE") != "1":
-            return
-        if not torch.isfinite(tensor).all().item():
-            raise RuntimeError(
-                "Non-finite MambaMixer2 "
-                f"{name}: prefix={self.prefix}, shape={tuple(tensor.shape)}, "
-                f"dtype={tensor.dtype}"
-            )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
     ):
-        self._debug_check_finite("input", hidden_states)
-
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
-        self._debug_check_finite("projected_states", projected_states)
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
-            self._debug_check_finite("projected_states_after_mup", projected_states)
 
         # 2. Prepare inputs for conv + SSM
         ssm_output = torch.empty(
@@ -553,20 +537,16 @@ class MambaMixer2(MambaBase, PluggableLayer):
             ssm_output,
             self.prefix,
         )
-        self._debug_check_finite("ssm_output", ssm_output)
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
         gate = projected_states[..., : self.tped_intermediate_size]
-        self._debug_check_finite("gate", gate)
         hidden_states = self.norm(ssm_output, gate)
-        self._debug_check_finite("post_norm", hidden_states)
 
         # 5. Final linear projection
         output, _ = self.out_proj(hidden_states)
-        self._debug_check_finite("output", output)
 
         return output
 
