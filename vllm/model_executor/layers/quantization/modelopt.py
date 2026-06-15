@@ -2111,7 +2111,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             x_for_moe = F.pad(
                 x,
                 (0, padded_hidden_size - x.shape[-1]),
-                value=1.0,
+                value=0.0,
             )
         else:
             x_for_moe = x
