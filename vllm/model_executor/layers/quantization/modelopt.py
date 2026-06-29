@@ -5,6 +5,7 @@ from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -1838,20 +1839,130 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 )
 
     def _shuffle_weights_for_trtllm(self, layer: torch.nn.Module) -> None:
-        """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
+        """Build padded/shuffled FlashInfer TRTLLM MXFP8 apply weights.
+
+        ``w13_weight``/``w2_weight`` and their scales keep the checkpoint
+        layout and original shape so refit can load into them repeatedly.
+        The TRTLLM kernel consumes the ``*_for_apply`` tensors built here.
+        """
         from flashinfer import (
             reorder_rows_for_gated_act_gemm,
             shuffle_matrix_a,
             shuffle_matrix_sf_a,
         )
 
+        def round_up(value: int, multiple: int) -> int:
+            return ((value + multiple - 1) // multiple) * multiple
+
+        def pad_tensor_dim(
+            tensor: torch.Tensor,
+            dim: int,
+            padded_size: int,
+            pad_value: int | float = 0,
+        ) -> torch.Tensor:
+            current_size = tensor.shape[dim]
+            if current_size == padded_size:
+                return tensor
+            if current_size > padded_size:
+                raise ValueError(
+                    f"Cannot pad dim {dim} from {current_size} to {padded_size}."
+                )
+
+            padded_shape = list(tensor.shape)
+            padded_shape[dim] = padded_size
+            padded = torch.zeros(
+                padded_shape,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            if pad_value != 0:
+                padded.fill_(pad_value)
+            padded.narrow(dim, 0, current_size).copy_(tensor)
+            return padded
+
+        def set_apply_parameter(name: str, value: torch.Tensor) -> None:
+            value = value.contiguous()
+            param = getattr(layer, name, None)
+            if param is not None and tuple(param.shape) == tuple(value.shape):
+                param.data.copy_(value)
+            else:
+                replace_parameter(layer, name, value)
+
+        def clamp_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
+            return torch.where(scale == 0, torch.ones_like(scale), scale)
+
         epilogue_tile_m = 128
         num_experts = layer.w13_weight.shape[0]
         is_gated = self.moe.is_act_and_mul
         intermediate_size_factor = 2 if is_gated else 1
+        original_intermediate_size = layer.w2_weight.shape[2]
+        original_hidden_size = layer.w13_weight.shape[2]
+        assert original_hidden_size % 128 == 0, (
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden_size divisible by "
+            f"128, got {original_hidden_size}."
+        )
 
-        w13_weight = layer.w13_weight.data
-        w13_scale = layer.w13_weight_scale.data
+        padded_intermediate_size = round_up(original_intermediate_size, 128)
+        # FlashInfer TRTLLM MXFP8 MoE showed intermittent non-finite output for
+        # Nemotron-3-Nano's H=2816 padded hidden shape. Padding H to the next
+        # 512 boundary gives the stable H=3072 shape while keeping the loaded
+        # checkpoint tensors at their original size for refit.
+        padded_hidden_size = round_up(original_hidden_size, 512)
+        padded_intermediate_scale_blocks = (
+            padded_intermediate_size // MXFP8_BLOCK_SIZE
+        )
+        padded_hidden_scale_blocks = padded_hidden_size // MXFP8_BLOCK_SIZE
+
+        layer.mxfp8_unpadded_hidden_size = original_hidden_size
+        layer.mxfp8_padded_hidden_size = padded_hidden_size
+        layer.mxfp8_unpadded_intermediate_size_per_partition = (
+            original_intermediate_size
+        )
+        layer.mxfp8_padded_intermediate_size_per_partition = (
+            padded_intermediate_size
+        )
+        layer.hidden_size = original_hidden_size
+        layer.moe_config.hidden_dim = original_hidden_size
+        layer.intermediate_size_per_partition = padded_intermediate_size
+        layer.moe_config.intermediate_size_per_partition = padded_intermediate_size
+        self.moe.hidden_dim = original_hidden_size
+        self.moe.intermediate_size_per_partition = padded_intermediate_size
+
+        w13_weight = pad_tensor_dim(
+            layer.w13_weight.data,
+            1,
+            intermediate_size_factor * padded_intermediate_size,
+        )
+        w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
+        w2_weight = pad_tensor_dim(layer.w2_weight.data, 2, padded_intermediate_size)
+        w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
+        w13_scale = pad_tensor_dim(
+            layer.w13_weight_scale.data,
+            1,
+            intermediate_size_factor * padded_intermediate_size,
+            pad_value=1,
+        )
+        w13_scale = pad_tensor_dim(
+            w13_scale,
+            2,
+            padded_hidden_scale_blocks,
+            pad_value=1,
+        )
+        w2_scale = pad_tensor_dim(
+            layer.w2_weight_scale.data,
+            1,
+            padded_hidden_size,
+            pad_value=1,
+        )
+        w2_scale = pad_tensor_dim(
+            w2_scale,
+            2,
+            padded_intermediate_scale_blocks,
+            pad_value=1,
+        )
+        w13_scale = clamp_mxfp8_scale(w13_scale)
+        w2_scale = clamp_mxfp8_scale(w2_scale)
+
         if is_gated:
             # FI TRTLLM gated kernels use W31 ordering. Model checkpoints store
             # gated projection as W13, so convert once before shuffling.
@@ -1876,7 +1987,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
             w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
             w2_shuffled_i = shuffle_matrix_a(
-                layer.w2_weight.data[i].view(torch.uint8), epilogue_tile_m
+                w2_weight[i].view(torch.uint8), epilogue_tile_m
             )
             w13_weight_shuffled.append(
                 w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE)
@@ -1892,9 +2003,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 epilogue_tile_m,
             )
             w2_sf_shuffled_i = shuffle_matrix_sf_a(
-                layer.w2_weight_scale.data[i]
-                .view(torch.uint8)
-                .reshape(layer.hidden_size, -1),
+                w2_scale[i].view(torch.uint8).reshape(padded_hidden_size, -1),
                 epilogue_tile_m,
             )
             w13_scale_shuffled.append(
@@ -1903,35 +2012,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             w2_scale_shuffled.append(
                 w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
             )
-        
-        if hasattr(layer, "w13_scale_for_apply"):
-            layer.w13_scale_for_apply.copy_(torch.stack(w13_scale_shuffled).contiguous())
-            layer.w2_scale_for_apply.copy_(torch.stack(w2_scale_shuffled).contiguous())
-        else:
-            layer.w13_scale_for_apply = torch.nn.Parameter(torch.stack(w13_scale_shuffled).contiguous(), requires_grad=False)
-            layer.w2_scale_for_apply = torch.nn.Parameter(torch.stack(w2_scale_shuffled).contiguous(), requires_grad=False)
-        layer.w13_weight.copy_(torch.stack(w13_weight_shuffled).contiguous())
-        layer.w2_weight.copy_(torch.stack(w2_weight_shuffled).contiguous())
 
-        # replace_parameter(
-        #     layer, "w13_weight", torch.stack(w13_weight_shuffled).contiguous()
-        # )
-        # replace_parameter(
-        #     layer, "w2_weight", torch.stack(w2_weight_shuffled).contiguous()
-        # )
-        # replace_parameter(
-        #     layer,
-        #     "w13_weight_scale",
-        #     torch.stack(w13_scale_shuffled).contiguous(),
-        # )
-        # replace_parameter(
-        #     layer,
-        #     "w2_weight_scale",
-        #     torch.stack(w2_scale_shuffled).contiguous(),
-        # )
+        set_apply_parameter("w13_weight_for_apply", torch.stack(w13_weight_shuffled))
+        set_apply_parameter("w2_weight_for_apply", torch.stack(w2_weight_shuffled))
+        set_apply_parameter("w13_scale_for_apply", torch.stack(w13_scale_shuffled))
+        set_apply_parameter("w2_scale_for_apply", torch.stack(w2_scale_shuffled))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
         self._check_weight_dtypes(layer)
         self._shuffle_weights_for_trtllm(layer)
 
@@ -2010,8 +2097,27 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         n_group = layer.num_expert_group or None
         topk_group = layer.topk_group or None
 
+        assert x.shape[-1] % 128 == 0, (
+            "FlashInfer TRTLLM MXFP8 MoE requires hidden states with "
+            f"last dimension divisible by 128, got {x.shape[-1]}."
+        )
+
+        padded_hidden_size = getattr(
+            layer,
+            "mxfp8_padded_hidden_size",
+            x.shape[-1],
+        )
+        if x.shape[-1] < padded_hidden_size:
+            x_for_moe = F.pad(
+                x,
+                (0, padded_hidden_size - x.shape[-1]),
+                value=0.0,
+            )
+        else:
+            x_for_moe = x
+
         hidden_states_mxfp8, hidden_states_scale = mxfp8_e4m3_quantize(
-            x,
+            x_for_moe,
             is_sf_swizzled_layout=False,
         )
 
@@ -2024,9 +2130,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             routing_bias=layer.e_score_correction_bias,
             hidden_states=hidden_states_mxfp8,
             hidden_states_scale=hidden_states_scale,
-            gemm1_weights=layer.w13_weight,
+            gemm1_weights=layer.w13_weight_for_apply,
             gemm1_weights_scale=layer.w13_scale_for_apply,
-            gemm2_weights=layer.w2_weight,
+            gemm2_weights=layer.w2_weight_for_apply,
             gemm2_weights_scale=layer.w2_scale_for_apply,
             num_experts=layer.global_num_experts,
             top_k=layer.top_k,
@@ -2046,7 +2152,15 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             routing_replay_out=routing_replay_out,
         )
 
-        return flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
+        unpadded_hidden_size = getattr(
+            layer,
+            "mxfp8_unpadded_hidden_size",
+            x.shape[-1],
+        )
+        output = flashinfer_trtllm_fp8_block_scale_moe(**kwargs)
+        if output.shape[-1] != unpadded_hidden_size:
+            output = output[..., :unpadded_hidden_size].contiguous()
+        return output
 
     def apply(
         self,
