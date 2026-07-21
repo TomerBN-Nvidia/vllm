@@ -10,9 +10,9 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError as ConcurrentInvalidStateError
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
@@ -61,6 +61,85 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+
+class _AnyLoopAsyncLock:
+    """An async lock that can be awaited from different event loops.
+
+    asyncio.Lock instances are tied to one event loop, but AsyncMPClient can be
+    driven by multiple loops when embedded in a threaded server.
+    """
+
+    def __init__(self) -> None:
+        self._guard = Lock()
+        self._locked = False
+        self._waiters = deque[asyncio.Future[None]]()
+
+    async def __aenter__(self) -> "_AnyLoopAsyncLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self.release()
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        with self._guard:
+            if not self._locked:
+                self._locked = True
+                return
+
+            waiter = loop.create_future()
+            self._waiters.append(waiter)
+
+        try:
+            await waiter
+        except BaseException:
+            should_release = False
+            with self._guard:
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    # The lock was already granted to this waiter. If the
+                    # awaiting task is cancelled before it resumes, pass the
+                    # lock to the next waiter.
+                    should_release = waiter.done() and not waiter.cancelled()
+            if should_release:
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while True:
+            with self._guard:
+                if not self._locked:
+                    raise RuntimeError("_AnyLoopAsyncLock is not locked")
+
+                if not self._waiters:
+                    self._locked = False
+                    return
+
+                waiter = self._waiters.popleft()
+
+            loop = waiter.get_loop()
+            if waiter.cancelled() or loop.is_closed():
+                continue
+
+            def wake_waiter() -> None:
+                try:
+                    if waiter.cancelled():
+                        self.release()
+                    elif not waiter.done():
+                        waiter.set_result(None)
+                except asyncio.InvalidStateError:
+                    self.release()
+
+            try:
+                loop.call_soon_threadsafe(wake_waiter)
+            except RuntimeError:
+                # The waiter's loop closed after the is_closed() check.
+                continue
+            return
 
 
 class EngineCoreClient(ABC):
@@ -710,20 +789,33 @@ def _process_utility_output(
     """Set the result from a utility method in the waiting future."""
     future = utility_results.pop(output.call_id)
     failure_message = output.failure_message
-    try:
-        if failure_message is not None:
-            future.set_exception(Exception(failure_message))
+
+    def set_utility_result() -> None:
+        try:
+            if failure_message is not None:
+                future.set_exception(Exception(failure_message))
+            else:
+                assert output.result is not None
+                future.set_result(output.result.result)
+        except (asyncio.InvalidStateError, ConcurrentInvalidStateError):
+            # This can happen if the future is cancelled due to the
+            # original calling task being cancelled.
+            if failure_message is not None:
+                logger.error(
+                    "Cancelled call to utility method failed with error: %s",
+                    failure_message,
+                )
+
+    if isinstance(future, asyncio.Future):
+        loop = future.get_loop()
+        if loop.is_closed():
+            return
+        if in_loop(loop):
+            set_utility_result()
         else:
-            assert output.result is not None
-            future.set_result(output.result.result)
-    except asyncio.InvalidStateError:
-        # This can happen if the future is cancelled due to the
-        # original calling task being cancelled.
-        if failure_message is not None:
-            logger.error(
-                "Cancelled call to utility method failed with error: %s",
-                failure_message,
-            )
+            loop.call_soon_threadsafe(set_utility_result)
+    else:
+        set_utility_result()
 
 
 class SyncMPClient(MPClient):
@@ -921,6 +1013,7 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+        self._input_send_lock = _AnyLoopAsyncLock()
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -1030,23 +1123,36 @@ class AsyncMPClient(MPClient):
         objects is a reference to retain until zmq is finished with the
         buffers, in case they were extracted from tensors in the request.
         """
-        self.ensure_alive()
-        self.free_pending_messages()
+        async def wait_for_send(send_future: Awaitable[Any]) -> Any:
+            try:
+                return await asyncio.shield(send_future)
+            except asyncio.CancelledError:
+                # Keep the multipart send serialized even if the caller is
+                # cancelled while pyzmq is still flushing the frames.
+                with contextlib.suppress(BaseException):
+                    await send_future
+                raise
 
-        msg = (engine,) + message
-        if not objects or len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
-            return self.input_socket.send_multipart(msg, copy=False)
+        async def send_locked() -> Any:
+            async with self._input_send_lock:
+                self.ensure_alive()
+                self.free_pending_messages()
 
-        future: asyncio.Future[zmq.MessageTracker]
-        future = self.input_socket.send_multipart(msg, copy=False, track=True)
+                msg = (engine,) + message
+                if not objects or len(msg) <= 3:
+                    # No auxiliary buffers => no tensor backing buffers in request.
+                    return await wait_for_send(
+                        self.input_socket.send_multipart(msg, copy=False)
+                    )
 
-        def add_pending(f: asyncio.Future[zmq.MessageTracker]):
-            with contextlib.suppress(BaseException):
-                self.add_pending_message(f.result(), objects)
+                future: asyncio.Future[zmq.MessageTracker]
+                future = self.input_socket.send_multipart(msg, copy=False, track=True)
+                tracker = await wait_for_send(future)
+                if tracker is not None:
+                    self.add_pending_message(tracker, objects)
+                return tracker
 
-        future.add_done_callback(add_pending)
-        return future
+        return asyncio.get_running_loop().create_task(send_locked())
 
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
