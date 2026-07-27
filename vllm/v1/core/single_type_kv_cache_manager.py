@@ -1113,9 +1113,15 @@ class MambaManager(SingleTypeKVCacheManager):
         mask = [False] * (end_block - start_block)
 
         # (1) Segment-boundary states. A Mamba hit needs exactly the single
-        # state block ending on the boundary (no window, and draft models have
-        # no mamba layers, so no eagle shift). Block ``i`` ends at token
-        # ``(i + 1) * block_size``.
+        # state block ending on the boundary (no window). The eagle shift
+        # applied in (2) is intentionally omitted here: with EAGLE, a shared
+        # prefix that diverges within one alignment block past a boundary S
+        # pops to an attention-verified hit below S, and the hybrid min()
+        # clamp then falls back to the previous segment boundary — a bounded
+        # reuse loss of at most one retention interval (never corruption).
+        # Also retaining S - alignment_tokens would recover it at the cost of
+        # one extra state per segment; revisit with selective retention
+        # (#47782). Block ``i`` ends at token ``(i + 1) * block_size``.
         segment_tokens = None if retention_interval == 0 else retention_interval
         if segment_tokens is not None:
             per_segment = segment_tokens // block_size
@@ -1131,12 +1137,20 @@ class MambaManager(SingleTypeKVCacheManager):
         # (2) Replay boundary. ``get_computed_blocks`` caps hits at
         # ``num_prompt - 1``, so an exact prompt replay lands on the latest
         # fine-aligned boundary. Sparse retention would otherwise skip its
-        # state, so keep it explicitly.
+        # state, so keep it explicitly. With EAGLE the attention lookup pops
+        # its last matched block and re-aligns downward, so a replay can
+        # verify at most ``latest - alignment_tokens``; retain that boundary
+        # state too, or the hybrid min() hit clamp pins every replay hit
+        # to 0 (a silently-disabled cache).
         if num_prompt_tokens is not None:
             latest = (num_prompt_tokens - 1) // alignment_tokens * alignment_tokens
-            boundary_block = latest // block_size - 1
-            if start_block <= boundary_block < end_block:
-                mask[boundary_block - start_block] = True
+            replay_boundaries = [latest]
+            if use_eagle:
+                replay_boundaries.append(latest - alignment_tokens)
+            for boundary in replay_boundaries:
+                boundary_block = boundary // block_size - 1
+                if start_block <= boundary_block < end_block:
+                    mask[boundary_block - start_block] = True
 
         return mask
 

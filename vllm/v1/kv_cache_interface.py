@@ -119,6 +119,15 @@ class KVCacheSpec:
     def storage_block_size(self) -> int:
         return self.block_size
 
+    @property
+    def supports_eagle_cache_peek(self) -> bool:
+        """Whether EAGLE cache lookup may peek one extra block for this spec
+        and drop the last matched block afterwards. Recurrent-state specs
+        (e.g. Mamba) must not participate: their block at position p stores
+        the state after exactly (p + 1) * block_size tokens, so a lookahead
+        hit would resume from a state ahead of the token prefix."""
+        return True
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -684,6 +693,10 @@ class MambaSpec(KVCacheSpec):
             assert self.page_size_padded >= page_size
             return self.page_size_padded
         return page_size
+
+    @property
+    def supports_eagle_cache_peek(self) -> bool:
+        return False
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":

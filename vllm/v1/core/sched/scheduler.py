@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import round_down
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -354,7 +355,8 @@ class Scheduler(SchedulerInterface):
         #                       num_prompt_tokens + num_output_tokens
         #                     )
         # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if num_computed_tokens < prefill_end:
             # To enable block-aligned caching of the Mamba state, `num_new_tokens`
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
@@ -367,10 +369,26 @@ class Scheduler(SchedulerInterface):
             # eagle prune
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
+            # Marconi cache admission optimization: stop at the uncached
+            # common prefix so concurrent requests can share it. Applied as
+            # an end-position cap BEFORE the alignment below; rounding the
+            # capped chunk length afterwards (the previous form) would
+            # reintroduce an unaligned non-final chunk end whenever the
+            # start offset is unaligned (external KV) — the same #43559
+            # poisoning geometry the branches below prevent.
+            if (
+                num_uncached_common_prefix_tokens >= block_size
+                and num_new_tokens > num_uncached_common_prefix_tokens
+            ):
+                num_new_tokens = num_uncached_common_prefix_tokens
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
-                # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                # Align the chunk END; the start may be unaligned (external KV).
+                num_new_tokens = max(
+                    round_down(num_computed_tokens_after_sched, block_size)
+                    - num_computed_tokens,
+                    0,
+                )
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -378,19 +396,19 @@ class Scheduler(SchedulerInterface):
             ):
                 # force to cache the last chunk
                 num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
-                pass
-
-            # Marconi cache admission optimization:
-            # cache common prefixes by scheduling num_new_tokens = common prefix length
-            if (
-                num_uncached_common_prefix_tokens >= block_size
-                and num_new_tokens > num_uncached_common_prefix_tokens
-            ):
-                num_new_tokens = num_uncached_common_prefix_tokens
-                # keep alignment to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+            elif num_computed_tokens_after_sched < prefill_end:
+                # Non-final chunk past the last cacheable boundary: the kernel
+                # snapshots the chunk-end state into an aligned block-table slot
+                # and cache_blocks later hashes that slot as the boundary state,
+                # so a mid-block end poisons the prefix cache (#43559). Stop at
+                # the last reachable boundary; defer (0) if none is reachable.
+                # Only the final chunk may end unaligned: its slot is never
+                # hashed (num_full_blocks floors past it).
+                num_new_tokens = max(
+                    round_down(num_computed_tokens_after_sched, block_size)
+                    - num_computed_tokens,
+                    0,
+                )
         return num_new_tokens
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
