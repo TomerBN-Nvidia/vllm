@@ -276,7 +276,9 @@ class MooncakeStoreCoordinator:
                 kv_cache_group_ids=group_ids,
                 block_pool=cast(BlockPool, cached_block_pool),
                 kv_cache_spec=spec,
-                drop_eagle_block=(0 in eagle_indices),
+                drop_eagle_block=(
+                    0 in eagle_indices and spec.supports_eagle_cache_peek
+                ),
                 alignment_tokens=spec.block_size,
             )
             num_groups = len(self.kv_cache_groups)
@@ -305,7 +307,12 @@ class MooncakeStoreCoordinator:
                     )
                     continue
 
-                drop_eagle_block = idx in eagle_indices and idx not in eagle_verified
+                # Recurrent-state specs (e.g. Mamba) must not participate in
+                # the one-block eagle peek: their manager ignores
+                # drop_eagle_block, so an ungated peek would let them match
+                # one block past the attention-verified hit (#43559).
+                can_eagle_peek = idx in eagle_indices and spec.supports_eagle_cache_peek
+                drop_eagle_block = can_eagle_peek and idx not in eagle_verified
                 _max_length = curr_hit_length
                 if drop_eagle_block:
                     _max_length = min(curr_hit_length + spec.block_size, max_length)
@@ -324,7 +331,9 @@ class MooncakeStoreCoordinator:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     eagle_verified.clear()
-                curr_hit_length = _new_hit_length
+                # min(): a non-peeking group (e.g. Mamba) may report a hit
+                # longer than the attention-verified length; never extend.
+                curr_hit_length = min(curr_hit_length, _new_hit_length)
                 for gid, blocks in zip(group_ids, hit_blocks, strict=True):
                     hit_blocks_by_group[gid] = blocks
 
