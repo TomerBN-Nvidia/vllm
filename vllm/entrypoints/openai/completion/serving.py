@@ -397,6 +397,14 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
 
+                    routed_experts_b64 = None
+                    if finish_reason is not None and output.routed_experts is not None:
+                        buf = io.BytesIO()
+                        np.save(buf, output.routed_experts)
+                        routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
+                            "ascii"
+                        )
+
                     self._raise_if_error(finish_reason, request_id)
 
                     chunk = CompletionStreamResponse(
@@ -417,6 +425,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                routed_experts=routed_experts_b64,
                             )
                         ],
                     )

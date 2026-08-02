@@ -62,3 +62,35 @@ async def test_routed_experts(server):
         assert topk == NUM_EXPERTS_PER_TOK
         assert (routed_experts >= 0).all()
         assert (routed_experts < NUM_LOCAL_EXPERTS).all()
+
+
+@pytest.mark.asyncio
+async def test_streaming_routed_experts_on_terminal_chunk(server):
+    """Streaming preserves latency metrics and returns routes at completion."""
+    async with server.get_async_client() as client:
+        stream = await client.completions.create(
+            model=MODEL_NAME,
+            prompt="Hello, world",
+            max_tokens=10,
+            temperature=0,
+            stream=True,
+        )
+
+        chunks = [chunk async for chunk in stream]
+        choices = [chunk.model_dump()["choices"][0] for chunk in chunks]
+        route_chunks = [choice for choice in choices if choice.get("routed_experts")]
+
+        assert len(route_chunks) == 1
+        assert route_chunks[0]["finish_reason"] is not None
+
+        routed_experts = np.load(
+            io.BytesIO(base64.b64decode(route_chunks[0]["routed_experts"]))
+        )
+        assert routed_experts.ndim == 3
+        assert routed_experts.shape[0] > 0
+        assert routed_experts.shape[1:] == (
+            NUM_HIDDEN_LAYERS,
+            NUM_EXPERTS_PER_TOK,
+        )
+        assert (routed_experts >= 0).all()
+        assert (routed_experts < NUM_LOCAL_EXPERTS).all()

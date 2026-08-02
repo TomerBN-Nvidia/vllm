@@ -579,6 +579,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    # Present only on the terminal chunk. See CompletionResponseChoice.
+    routed_experts: str | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
