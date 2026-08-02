@@ -959,6 +959,8 @@ def test_prefill_hybrid_model_combinations_eagle(
     # Should have blocks for all groups
     assert len(blocks.get_block_ids()) == num_groups
 
+    manager.new_step_starts()
+
     # Second request: should hit cached blocks for common prefix
     all_token_ids = common_token_ids + [6] * 5
     req1 = make_request("1", all_token_ids, block_size, hash_fn)
