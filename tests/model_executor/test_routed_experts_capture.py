@@ -277,6 +277,29 @@ def test_gpu_model_runner_rejects_monolithic_without_replay_support(monkeypatch)
         gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, DummyCapturer())
 
 
+def test_monolithic_routing_replay_buffer_covers_naive_dp_allgather():
+    """Replay output covers the largest batch gathered across DP ranks."""
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import CPUExpertsFp8
+
+    fused_experts = CPUExpertsFp8.__new__(CPUExpertsFp8)
+    fused_experts.moe_config = SimpleNamespace(
+        max_num_tokens=8,
+        experts_per_token=2,
+        dp_size=2,
+        device=torch.device("cpu"),
+    )
+
+    fused_experts.set_capture_fn(lambda _: None)
+
+    replay_buffer = fused_experts._maybe_make_routing_replay_buffer(
+        num_tokens=16,
+        device=torch.device("cpu"),
+    )
+    assert replay_buffer is not None
+    assert replay_buffer.shape == (16, 2)
+    assert replay_buffer.dtype == torch.int16
+
+
 def test_routed_experts_capturer_single_dp_no_metadata():
     """dp_metadata is None: capture writes the full topk_ids rows."""
     capturer = _capturer_with_buffer(dp_rank=0)
