@@ -27,6 +27,7 @@ from vllm.multimodal.evs import compute_retained_tokens_count
 from vllm.multimodal.inputs import AudioItem
 from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.tokenizers.hf import HfTokenizer
+from vllm.transformers_utils.configs.radio import get_radio_config_value
 
 from .internvl import calculate_internvl_targets, get_internvl_target_ratios
 
@@ -602,8 +603,29 @@ class BaseNanoNemotronVLProcessor(ABC):
         )
         self.image_size = image_size
         self.use_thumbnail: bool = config.use_thumbnail
-        self.norm_mean = torch.Tensor(config.norm_mean).reshape(1, 3, 1, 1)
-        self.norm_std = torch.Tensor(config.norm_std).reshape(1, 3, 1, 1)
+        vision_config = config.vision_config
+        legacy_args = getattr(vision_config, "args", None)
+        outer_norm_mean = getattr(config, "norm_mean", None)
+        outer_norm_std = getattr(config, "norm_std", None)
+        norm_mean = get_radio_config_value(
+            vision_config,
+            "norm_mean",
+            outer_norm_mean
+            if outer_norm_mean is not None
+            else (0.48145466, 0.4578275, 0.40821073),
+        )
+        norm_std = get_radio_config_value(
+            vision_config,
+            "norm_std",
+            outer_norm_std
+            if outer_norm_std is not None
+            else (0.26862954, 0.26130258, 0.27577711),
+        )
+        if legacy_args is not None:
+            norm_mean = outer_norm_mean if outer_norm_mean is not None else norm_mean
+            norm_std = outer_norm_std if outer_norm_std is not None else norm_std
+        self.norm_mean = torch.Tensor(norm_mean).reshape(1, 3, 1, 1)
+        self.norm_std = torch.Tensor(norm_std).reshape(1, 3, 1, 1)
 
         self.dynamic_tiler: DynamicResolutionImageTiler | None = None
         if self.use_dynamic_resolution(config):
@@ -611,16 +633,30 @@ class BaseNanoNemotronVLProcessor(ABC):
                 max_model_len=max_model_len,
                 patch_size=patch_size,
                 downsample_ratio=downsample_ratio,
-                min_num_patches=config.vision_config.args["min_num_patches"],
-                max_num_patches=config.vision_config.args["max_num_patches"],
-                norm_mean=config.norm_mean,
-                norm_std=config.norm_std,
+                min_num_patches=get_radio_config_value(
+                    vision_config, "min_num_patches"
+                ),
+                max_num_patches=get_radio_config_value(
+                    vision_config, "max_num_patches"
+                ),
+                norm_mean=norm_mean,
+                norm_std=norm_std,
             )
         self.dtype: torch.dtype = getattr(config, "dtype", torch.float32)
 
     @staticmethod
     def use_dynamic_resolution(config: PretrainedConfig) -> bool:
-        return "min_num_patches" in config.vision_config.args
+        min_num_patches = get_radio_config_value(
+            config.vision_config, "min_num_patches"
+        )
+        max_num_patches = get_radio_config_value(
+            config.vision_config, "max_num_patches"
+        )
+        if (min_num_patches is None) != (max_num_patches is None):
+            raise ValueError(
+                "RADIO config must set both min_num_patches and max_num_patches"
+            )
+        return min_num_patches is not None
 
     @property
     @abstractmethod

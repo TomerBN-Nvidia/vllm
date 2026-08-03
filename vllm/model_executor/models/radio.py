@@ -73,7 +73,7 @@ class ClsToken(nn.Module):
         self.num_registers = 0
         self.num_tokens = num_tokens
         if enabled:
-            if num_registers:
+            if num_registers is not None:
                 self.num_registers = num_registers
             elif register_multiple:
                 self.num_registers = register_multiple - (
@@ -593,14 +593,18 @@ class RadioInternVisionModel(nn.Module):
         )
         self.temporal_patch_size = config.video_temporal_patch_size
         unique_teachers = set(t["name"] for t in config.teachers)
+        num_cls_tokens = getattr(config, "num_cls_tokens", None)
+        if num_cls_tokens is None:
+            num_cls_tokens = len(unique_teachers) if config.cls_token_per_teacher else 1
         self.patch_generator = ViTPatchGenerator(
             config.patch_size,
             config.hidden_size,
             input_dims=self.img_size,
             max_input_dims=max_img_size,
             cls_token=True,
-            num_cls_tokens=len(unique_teachers) if config.cls_token_per_teacher else 1,
+            num_cls_tokens=num_cls_tokens,
             register_multiple=config.register_multiple,
+            num_registers=getattr(config, "num_registers", None),
             temporal_patch_size=self.temporal_patch_size,
             separate_video_embedder=config.separate_video_embedder,
         )
@@ -717,13 +721,15 @@ class RadioModel(nn.Module):
             prefix=prefix,
         )
 
-        summary_idxs = None
-        if config.teachers:
+        summary_idxs = getattr(config, "summary_idxs", None)
+        if summary_idxs is not None:
+            summary_idxs = torch.tensor(summary_idxs)
+        elif config.teachers:
             summary_idxs = torch.tensor(
                 [i for i, t in enumerate(config.teachers) if t.get("use_summary", True)]
             )
-            if summary_idxs.numel() > 0:
-                self.register_buffer("summary_idxs", summary_idxs)
+        if summary_idxs is not None and summary_idxs.numel() > 0:
+            self.register_buffer("summary_idxs", summary_idxs)
         self.summary_idxs = summary_idxs
 
     def forward(
@@ -745,17 +751,32 @@ class RadioModel(nn.Module):
         loaded_params: set[str] = set()
         params_dict = dict(self.named_parameters())
 
+        native_embedding_mapping = {
+            "embeddings.patch_projection.": "model.patch_generator.embedder.",
+            "embeddings.video_patch_projection.": (
+                "model.patch_generator.video_embedder."
+            ),
+            "embeddings.position_embedding": "model.patch_generator.pos_embed",
+            "embeddings.cls_register_token": "model.patch_generator.cls_token.token",
+        }
+        native_layer_mapping = {
+            "attention.output.dense.": ("attn.proj.", None),
+            "attention.attention.query.": ("attn.qkv.", "q"),
+            "attention.attention.key.": ("attn.qkv.", "k"),
+            "attention.attention.value.": ("attn.qkv.", "v"),
+            "layer_scale1.lambda1": ("ls1", None),
+            "layer_scale2.lambda1": ("ls2", None),
+        }
+
         if isinstance(weights, dict):
             weights_list = list(weights.items())
         else:
             weights_list = list(weights)
 
         for name, weight in weights_list:
-            if not name.startswith("radio_model."):
-                # Skip non-radio weights
-                continue
-
-            sub = name[len("radio_model.") :]  # drop "radio_model." prefix
+            sub = (
+                name[len("radio_model.") :] if name.startswith("radio_model.") else name
+            )
 
             # Skip buffers not used in vLLM
             if sub in {"summary_idxs"}:
@@ -766,6 +787,7 @@ class RadioModel(nn.Module):
                 continue
 
             vllm_key = None
+            shard_id = None
             if sub.startswith("model.patch_generator."):
                 vllm_key = f"model.patch_generator.{sub.split('.', 2)[-1]}"
             elif sub.startswith("input_conditioner."):
@@ -777,16 +799,48 @@ class RadioModel(nn.Module):
                 if len(parts) >= 4:
                     layer_idx = parts[2]
                     suffix = ".".join(parts[3:])
-                    # Skip layer-scale entries that vLLM doesn't use
-                    if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
-                        continue
                     vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+            else:
+                native_sub = sub
+                if native_sub.startswith(("model.embeddings.", "model.encoder.layer.")):
+                    native_sub = native_sub[len("model.") :]
+
+                for native_prefix, target_prefix in native_embedding_mapping.items():
+                    if native_sub.startswith(native_prefix):
+                        vllm_key = native_sub.replace(native_prefix, target_prefix, 1)
+                        break
+
+                if native_sub.startswith("encoder.layer."):
+                    parts = native_sub.split(".")
+                    if len(parts) >= 4:
+                        layer_idx = parts[2]
+                        suffix = ".".join(parts[3:])
+                        for native_prefix, (
+                            target_prefix,
+                            target_shard,
+                        ) in native_layer_mapping.items():
+                            if suffix.startswith(native_prefix):
+                                suffix = suffix.replace(native_prefix, target_prefix, 1)
+                                shard_id = target_shard
+                                break
+                        vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
 
             if vllm_key and vllm_key in params_dict:
                 param = params_dict[vllm_key]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
+                if shard_id is None:
+                    weight_loader(param, weight)
+                else:
+                    weight_loader(param, weight, shard_id)
                 loaded_params.add(vllm_key)
+
+        # Some RADIO exports fold layer-scale into the projection weights and
+        # omit ls1/ls2. Keep those scales as identity even with dummy init.
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        for name, param in params_dict.items():
+            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
+                with torch.no_grad():
+                    param.fill_(initializer_factor)
 
         return loaded_params
 
