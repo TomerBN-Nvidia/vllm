@@ -910,6 +910,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
 _EAGLE_HYBRID_MODEL_TEST_CASES = [
     # 2 groups: 1 full + 1 other
     pytest.param(["full", "sliding_window"], 3, id="2g-full+sw"),
+    pytest.param(["full", "mamba"], 3, id="2g-full+mamba"),
 ]
 
 
