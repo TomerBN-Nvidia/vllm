@@ -23,6 +23,7 @@ from transformers.models.auto.modeling_auto import (
 )
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
+from transformers.utils import IMAGE_PROCESSOR_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
@@ -1013,9 +1014,22 @@ def get_hf_image_processor_config(
     # ModelScope does not provide an interface for image_processor
     if envs.VLLM_USE_MODELSCOPE:
         return dict()
-    return get_image_processor_config(
+    image_processor_config = get_image_processor_config(
         model, token=hf_token, revision=revision, **kwargs
     )
+    if image_processor_config:
+        return image_processor_config
+
+    # Transformers can discard preprocessor_config.json when a repository also
+    # has a processor_config.json without a nested "image_processor" section.
+    if isinstance(
+        try_get_local_file(
+            model=model, file_name=IMAGE_PROCESSOR_NAME, revision=revision
+        ),
+        Path,
+    ):
+        return get_hf_file_to_dict(IMAGE_PROCESSOR_NAME, model, revision) or {}
+    return {}
 
 
 def get_hf_text_config(config: PretrainedConfig):

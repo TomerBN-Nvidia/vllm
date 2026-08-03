@@ -44,6 +44,9 @@ class RadioConfig(PretrainedConfig):
         norm_std: Standard deviation values for image normalization
             (RGB channels). Defaults to (0.26862954, 0.26130258, 0.27577711)).
         register_multiple: Number of register tokens to use.
+        num_cls_tokens: Explicit number of class tokens.
+        num_registers: Explicit number of register tokens.
+        summary_idxs: Class-token indices returned as summary embeddings.
         teachers: A list of teacher model configurations. Each teacher configuration is
             a dict with keys like "name" and some may have "use_summary".
         cls_token_per_teacher: Whether to use a separate CLS token for each teacher.
@@ -74,6 +77,9 @@ class RadioConfig(PretrainedConfig):
         norm_mean: tuple[float, float, float] | list = OPENAI_CLIP_MEAN,
         norm_std: tuple[float, float, float] | list = OPENAI_CLIP_STD,
         register_multiple: int | None = None,
+        num_cls_tokens: int | None = None,
+        num_registers: int | None = None,
+        summary_idxs: list[int] | None = None,
         teachers: list[dict[str, Any]] | None = None,
         cls_token_per_teacher: bool = False,
         video_temporal_patch_size: int = 1,
@@ -103,6 +109,9 @@ class RadioConfig(PretrainedConfig):
             list(norm_std) if isinstance(norm_std, (tuple, list)) else norm_std
         )
         self.register_multiple = register_multiple
+        self.num_cls_tokens = num_cls_tokens
+        self.num_registers = num_registers
+        self.summary_idxs = summary_idxs
         self.teachers = teachers if teachers is not None else []
         self.cls_token_per_teacher = cls_token_per_teacher
         self.video_temporal_patch_size = video_temporal_patch_size
