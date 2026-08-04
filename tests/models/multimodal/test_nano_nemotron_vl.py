@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
+from types import SimpleNamespace
 
+import pytest
+import torch
+import torch.nn as nn
+
+import vllm.model_executor.models.nano_nemotron_vl as nano_nemotron_vl
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.transformers_utils.processors.nano_nemotron_vl import (
+    BaseNanoNemotronVLProcessor,
+)
 
 
 class _TextOnlyMultiModalConfig:
@@ -43,6 +51,20 @@ class _MissingMultiModalModule:
 class _AdapterModule:
     def named_parameters(self):
         return []
+
+
+class _WeightModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+
+def _make_native_adapter() -> nn.Module:
+    adapter = nn.Module()
+    adapter.add_module("0", _WeightModule())
+    adapter.add_module("1", _WeightModule())
+    adapter.add_module("3", _WeightModule())
+    return adapter
 
 
 class _VisionModel:
@@ -113,6 +135,35 @@ def test_nano_nemotron_vl_loads_vision_weights_without_sound_encoder():
     ]
 
 
+def test_nano_nemotron_vl_loads_native_flat_vision_weights():
+    model = object.__new__(NemotronH_Nano_VL_V2)
+    language_model = _LanguageModel()
+    vision_model = _VisionModel()
+    adapter = _make_native_adapter()
+    object.__setattr__(model, "model_config", _ImageOnlyModelConfig())
+    object.__setattr__(model, "language_model", language_model)
+    object.__setattr__(model, "mlp1", adapter)
+    object.__setattr__(model, "vision_model", vision_model)
+    object.__setattr__(model, "sound_encoder", None)
+
+    vision_weight = _FakeTensor()
+    model.load_weights(
+        [
+            ("vision_projector.mlp1.norm.weight", torch.ones(1)),
+            ("vision_projector.mlp1.linear1.weight", torch.full((1,), 2.0)),
+            ("vision_projector.mlp1.linear2.weight", torch.full((1,), 3.0)),
+            ("vision_model.embeddings.position_embedding", vision_weight),
+        ]
+    )
+
+    assert torch.equal(adapter.get_submodule("0").weight, torch.ones(1))
+    assert torch.equal(adapter.get_submodule("1").weight, torch.full((1,), 2.0))
+    assert torch.equal(adapter.get_submodule("3").weight, torch.full((1,), 3.0))
+    assert vision_model.loaded_weights == [
+        ("embeddings.position_embedding", vision_weight)
+    ]
+
+
 def test_nano_nemotron_vl_requires_sound_encoder_for_sound_weights():
     model = object.__new__(NemotronH_Nano_VL_V2)
     language_model = _LanguageModel()
@@ -125,3 +176,92 @@ def test_nano_nemotron_vl_requires_sound_encoder_for_sound_weights():
 
     with pytest.raises(AssertionError):
         model.load_weights([("sound_encoder.encoder.weight", object())])
+
+
+def test_nano_nemotron_vl_builds_radio_config_from_flat_config(monkeypatch):
+    monkeypatch.setattr(nano_nemotron_vl, "RadioModel", lambda config: config)
+    vision_config = SimpleNamespace(
+        hidden_size=1280,
+        num_hidden_layers=32,
+        num_attention_heads=16,
+        mlp_ratio=4.0,
+        hidden_act="gelu",
+        layer_norm_eps=1e-6,
+        qkv_bias=True,
+        layerscale_value=1.0,
+        image_size=224,
+        patch_size=16,
+        max_img_size=2048,
+        num_cls_tokens=3,
+        num_registers=7,
+        summary_idxs=[0, 1],
+        norm_mean=[0.1, 0.2, 0.3],
+        norm_std=[0.4, 0.5, 0.6],
+        video_temporal_patch_size=2,
+        use_swiglu_ffn=False,
+    )
+    hf_config = SimpleNamespace(vision_config=vision_config)
+
+    radio_config = NemotronH_Nano_VL_V2.get_vit_model_from_radio_config(
+        object(), hf_config
+    )
+
+    assert radio_config.model_name == "vit_huge_patch16_224"
+    assert radio_config.hidden_size == 1280
+    assert radio_config.num_hidden_layers == 32
+    assert radio_config.num_attention_heads == 16
+    assert radio_config.intermediate_size == 5120
+    assert radio_config.cpe_max_size == 2048
+    assert radio_config.num_cls_tokens == 3
+    assert radio_config.num_registers == 7
+    assert radio_config.summary_idxs == [0, 1]
+    assert radio_config.video_temporal_patch_size == 2
+
+
+def test_nano_nemotron_vl_builds_radio_config_from_legacy_args(monkeypatch):
+    monkeypatch.setattr(nano_nemotron_vl, "RadioModel", lambda config: config)
+    args = {
+        "model": "vit_huge_patch16_224",
+        "image_size": 224,
+        "patch_size": 16,
+        "teachers": [{"name": "teacher"}],
+    }
+    vision_config = SimpleNamespace(args=args, preferred_resolution=(432, 432))
+    hf_config = SimpleNamespace(
+        vision_config=vision_config,
+        norm_mean=[0.1, 0.2, 0.3],
+        norm_std=[0.4, 0.5, 0.6],
+    )
+
+    radio_config = NemotronH_Nano_VL_V2.get_vit_model_from_radio_config(
+        object(), hf_config
+    )
+
+    assert args["model"] == "vit_huge_patch16_224"
+    assert radio_config.model_name == "vit_huge_patch16_224"
+    assert radio_config.image_size == 432
+    assert radio_config.hidden_size == 1280
+    assert radio_config.num_hidden_layers == 32
+
+
+def test_nano_nemotron_vl_flat_radio_config_is_not_dynamic_resolution():
+    config = SimpleNamespace(vision_config=SimpleNamespace(model_type="radio"))
+
+    assert not BaseNanoNemotronVLProcessor.use_dynamic_resolution(config)
+
+
+def test_nano_nemotron_vl_legacy_dynamic_resolution_config():
+    config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            args={"min_num_patches": 1, "max_num_patches": 12}
+        )
+    )
+
+    assert BaseNanoNemotronVLProcessor.use_dynamic_resolution(config)
+
+
+def test_nano_nemotron_vl_rejects_partial_dynamic_resolution_config():
+    config = SimpleNamespace(vision_config=SimpleNamespace(min_num_patches=1))
+
+    with pytest.raises(ValueError, match="both min_num_patches"):
+        BaseNanoNemotronVLProcessor.use_dynamic_resolution(config)

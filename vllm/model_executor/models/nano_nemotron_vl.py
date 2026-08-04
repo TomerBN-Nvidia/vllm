@@ -1509,11 +1509,21 @@ class NemotronH_Nano_VL_V2(
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
 
-        def is_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("mlp1")
+        def get_adapter_name(name: str) -> str | None:
+            if name.startswith("mlp1."):
+                return name[len("mlp1.") :]
+            native_adapter_mapping = {
+                "vision_projector.mlp1.norm.": "0.",
+                "vision_projector.mlp1.linear1.": "1.",
+                "vision_projector.mlp1.linear2.": "3.",
+            }
+            for source_prefix, target_prefix in native_adapter_mapping.items():
+                if name.startswith(source_prefix):
+                    return name.replace(source_prefix, target_prefix, 1)
+            return None
 
         def is_vision_weights(name: str) -> bool:
-            return name.startswith("vision_model.radio_model.")
+            return name.startswith("vision_model.")
 
         def is_sound_weights(name: str) -> bool:
             return name.startswith("sound")
@@ -1533,15 +1543,14 @@ class NemotronH_Nano_VL_V2(
                 if is_llm(name):
                     # Strip 'language_model.' prefix for LLM weights
                     yield ".".join(name.split(".")[1:]), w
-                elif is_adapter_weights((name, w)):
+                elif (adapter_name := get_adapter_name(name)) is not None:
                     if not load_multimodal_weights:
                         continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    adapter_weights.append((trimmed_name, w.detach().clone()))
+                    adapter_weights.append((adapter_name, w.detach().clone()))
                 elif is_vision_weights(name):
                     if not load_multimodal_weights:
                         continue
-                    # Convert: vision_model.radio_model.* → radio_model.*
+                    # Preserve either legacy radio_model.* or native flat keys.
                     hf_key = name[len("vision_model.") :]
                     vision_weights.append((hf_key, w.detach().clone()))
                 elif is_sound_weights(name):
@@ -1568,33 +1577,10 @@ class NemotronH_Nano_VL_V2(
                 self.sound_encoder.load_weights(sound_weights)
 
     def get_vit_model_from_radio_config(self, hf_config):
-        hf_config_vision = hf_config.vision_config
-        model_name = hf_config_vision.args.get("model")
-        if model_name is None:
-            raise ValueError(f"Unsupported vit model type: {model_name}")
-
-        preferred_resolution = getattr(hf_config_vision, "preferred_resolution", None)
-        image_size = preferred_resolution[0] if preferred_resolution else 224
-        patch_size = getattr(hf_config_vision, "patch_size", 16)
-
-        # video_temporal_patch_size and separate_video_embedder are
-        # top-level vision_config attributes, not inside args.
-        video_temporal_patch_size = getattr(
-            hf_config_vision, "video_temporal_patch_size", 1
-        )
-        separate_video_embedder = getattr(
-            hf_config_vision, "separate_video_embedder", True
-        )
-
-        radio_config = RadioConfig(
-            model_name=model_name,
-            image_size=image_size,
-            patch_size=patch_size,
-            norm_mean=hf_config.norm_mean,
-            norm_std=hf_config.norm_std,
-            video_temporal_patch_size=video_temporal_patch_size,
-            separate_video_embedder=separate_video_embedder,
-            **hf_config_vision.args,
+        radio_config = RadioConfig.from_hf_config(
+            hf_config.vision_config,
+            norm_mean=getattr(hf_config, "norm_mean", None),
+            norm_std=getattr(hf_config, "norm_std", None),
         )
 
         return RadioModel(config=radio_config)
