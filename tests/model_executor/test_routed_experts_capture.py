@@ -277,6 +277,53 @@ def test_gpu_model_runner_rejects_monolithic_without_replay_support(monkeypatch)
         gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, DummyCapturer())
 
 
+def test_monolithic_routing_replay_buffer_covers_naive_dp_allgather():
+    """Replay output covers the largest batch gathered across DP ranks."""
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import CPUExpertsFp8
+
+    fused_experts = CPUExpertsFp8.__new__(CPUExpertsFp8)
+    fused_experts.moe_config = SimpleNamespace(
+        max_num_tokens=8,
+        experts_per_token=2,
+        dp_size=2,
+        ep_size=1,
+        device=torch.device("cpu"),
+    )
+
+    fused_experts.set_capture_fn(lambda _: None)
+
+    replay_buffer = fused_experts._maybe_make_routing_replay_buffer(
+        num_tokens=16,
+        device=torch.device("cpu"),
+    )
+    assert replay_buffer is not None
+    assert replay_buffer.shape == (16, 2)
+    assert replay_buffer.dtype == torch.int16
+
+
+def test_monolithic_routing_replay_buffer_covers_naive_dp_ep_allgather():
+    """Replay output covers SP shards flattened into a DP+EP group."""
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import CPUExpertsFp8
+
+    fused_experts = CPUExpertsFp8.__new__(CPUExpertsFp8)
+    fused_experts.moe_config = SimpleNamespace(
+        max_num_tokens=8,
+        experts_per_token=2,
+        dp_size=2,
+        ep_size=4,
+        device=torch.device("cpu"),
+    )
+
+    fused_experts.set_capture_fn(lambda _: None)
+
+    replay_buffer = fused_experts._maybe_make_routing_replay_buffer(
+        num_tokens=32,
+        device=torch.device("cpu"),
+    )
+    assert replay_buffer is not None
+    assert replay_buffer.shape == (32, 2)
+
+
 def test_routed_experts_capturer_single_dp_no_metadata():
     """dp_metadata is None: capture writes the full topk_ids rows."""
     capturer = _capturer_with_buffer(dp_rank=0)
@@ -316,6 +363,46 @@ def test_routed_experts_capturer_dp_modular_local_tokens():
     with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert torch.equal(capturer.device_buffer[:3, 0, :], topk)
+
+
+@pytest.mark.parametrize(
+    ("dp_rank", "want"),
+    [
+        (0, [[0, 1], [2, 3]]),
+        (1, [[10, 11], [12, 13], [14, 15]]),
+    ],
+)
+def test_routed_experts_capturer_dp_ep_gathered_sp_shards(dp_rank, want):
+    """DP+EP capture reconstructs a DP batch from padded SP shards."""
+    capturer = _capturer_with_buffer(
+        dp_rank=dp_rank,
+        tp_size=2,
+    )
+    num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
+    ctx = SimpleNamespace(
+        dp_metadata=SimpleNamespace(
+            num_tokens_across_dp_cpu=num_tokens_dp,
+            # ceil([2, 3] / TP2), repeated for each TP shard.
+            local_sizes=[1, 1, 2, 2],
+        )
+    )
+    # Flattened EP order: DP0/TP0, DP0/TP1, DP1/TP0, DP1/TP1. The
+    # final row is padding for DP1's three real tokens.
+    topk = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [10, 11],
+            [12, 13],
+            [14, 15],
+            [99, 99],
+        ],
+        dtype=torch.int32,
+    )
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(layer_id=0, topk_ids=topk)
+    want_tensor = torch.tensor(want, dtype=torch.int32)
+    assert torch.equal(capturer.device_buffer[: len(want), 0, :], want_tensor)
 
 
 def test_routed_experts_capturer_dp_unexpected_batch_raises():
