@@ -37,6 +37,14 @@ from .nemotron_h import (
 )
 
 
+def _get_mtp_model_config(vllm_config: VllmConfig) -> ModelConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    model_config = speculative_config.draft_model_config
+    assert model_config is not None
+    return model_config
+
+
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
     def __init__(
         self,
@@ -216,7 +224,8 @@ class NemotronHMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        model_config = _get_mtp_model_config(vllm_config)
+        config = model_config.hf_config
 
         self.config = config
         self.vocab_size = config.vocab_size
@@ -256,7 +265,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
             common_kwargs = dict(
                 config=config,
                 layer_idx=self.mtp_start_layer_idx + i,
-                model_config=vllm_config.model_config,
+                model_config=model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
                 parallel_config=vllm_config.parallel_config,
@@ -322,7 +331,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = _get_mtp_model_config(vllm_config).hf_config
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = vllm_config.quant_config
@@ -414,6 +423,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            if name.startswith("language_model."):
+                name = name.removeprefix("language_model.")
+
             # Only process MTP weights - skip all non-MTP weights
             if not name.startswith("mtp.") and "embeddings" not in name:
                 continue

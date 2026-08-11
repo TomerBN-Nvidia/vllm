@@ -697,6 +697,27 @@ class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        config = model_config.hf_config
+        vision_config = config.vision_config
+        if not hasattr(vision_config, "args"):
+            image_processor_config = model_config.hf_image_processor_config
+            vision_config.args = {
+                "model": "vit_huge_patch16_224",
+                "qkv_bias": vision_config.qkv_bias,
+                "layer_norm_eps": vision_config.layer_norm_eps,
+                "initializer_factor": vision_config.layerscale_value,
+                "hidden_act": vision_config.hidden_act,
+                "cpe_max_size": vision_config.max_img_size,
+                "num_cls_tokens": vision_config.num_cls_tokens,
+                "num_registers": vision_config.num_registers,
+                "summary_idxs": vision_config.summary_idxs,
+                "min_num_patches": image_processor_config["min_num_patches"],
+                "max_num_patches": image_processor_config["max_num_patches"],
+            }
+            config.norm_mean = vision_config.norm_mean
+            config.norm_std = vision_config.norm_std
+            config.use_thumbnail = False
+
         mm_config = model_config.multimodal_config
         if mm_config is not None:
             video_kwargs = mm_config.media_io_kwargs.setdefault("video", {})
@@ -951,6 +972,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,
+    "NemotronH_Omni_Reasoning_V3": NemotronHNanoVLV2Config,
     "NomicBertModel": NomicBertModelConfig,
     "Qwen2ForProcessRewardModel": Qwen2ForProcessRewardModelConfig,
     "Qwen2ForRewardModel": Qwen2ForRewardModelConfig,
