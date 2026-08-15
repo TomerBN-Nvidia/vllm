@@ -764,10 +764,37 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
+        num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+        blocks = self.req_to_blocks[request.request_id]
+        prompt_tokens = request.num_prompt_tokens
+        for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
+            block_start = block_idx * self.block_size
+            if block_start >= prompt_tokens:
+                break
+            block = blocks[block_idx]
+            if block.is_null:
+                continue
+            block_end = min(block_start + self.block_size, prompt_tokens)
+            # Fine-grained lookup probes these interior hash boundaries.
+            # Register them when a prompt block first becomes cacheable so a
+            # later request can identify a shared prefix ending mid-block.
+            for boundary in range(
+                block_start + hash_block_size,
+                block_end,
+                hash_block_size,
+            ):
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=block,
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                )
         self._cache_partial_tail_block(request, num_tokens)
 
     def _cache_partial_tail_block(
@@ -1668,7 +1695,11 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        cacheable_partial_boundaries = {latest_prompt_hash_boundary}
+        shared_prefix_boundary = request.shared_prefix_boundary
+        if shared_prefix_boundary > 0 and shared_prefix_boundary % hash_block_size == 0:
+            cacheable_partial_boundaries.add(shared_prefix_boundary)
+        if num_tokens not in cacheable_partial_boundaries:
             return None
 
         block_idx = num_tokens // self.block_size

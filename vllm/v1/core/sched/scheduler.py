@@ -416,10 +416,18 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
-            # Marconi shared-prefix junction, block-floored (a sub-block
-            # junction's state is not separately cacheable): cache its state
-            # so sibling requests sharing the prefix can reuse it.
-            start + (request.shared_prefix_boundary - start) // block_size * block_size
+            # Marconi shared-prefix junction. When fine-grained Mamba prefix
+            # matching is configured, stop at an exact hash boundary so the
+            # partial-block state can be cached for sibling requests.
+            (
+                request.shared_prefix_boundary
+                if (
+                    self.mamba_partial_cache_hit
+                    and request.shared_prefix_boundary % self.hash_block_size == 0
+                )
+                else start
+                + (request.shared_prefix_boundary - start) // block_size * block_size
+            )
             if start < request.shared_prefix_boundary < end
             else 0,
         )
