@@ -1579,6 +1579,9 @@ class NemotronH_Nano_VL_V2(
 
     def get_vit_model_from_radio_config(self, hf_config):
         hf_config_vision = hf_config.vision_config
+        if isinstance(hf_config_vision, RadioConfig):
+            return RadioModel(config=hf_config_vision)
+
         model_name = hf_config_vision.args.get("model")
         if model_name is None:
             raise ValueError(f"Unsupported vit model type: {model_name}")
