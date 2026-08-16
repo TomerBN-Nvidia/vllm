@@ -620,7 +620,8 @@ class BaseNanoNemotronVLProcessor(ABC):
 
     @staticmethod
     def use_dynamic_resolution(config: PretrainedConfig) -> bool:
-        return "min_num_patches" in config.vision_config.args
+        vision_args = getattr(config.vision_config, "args", {})
+        return "min_num_patches" in vision_args
 
     @property
     @abstractmethod

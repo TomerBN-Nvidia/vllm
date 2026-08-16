@@ -7,6 +7,9 @@ import pytest
 
 from vllm.model_executor.models.config import NemotronHNanoVLV2Config
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.transformers_utils.processors.nano_nemotron_vl import (
+    BaseNanoNemotronVLProcessor,
+)
 
 
 class _TextOnlyMultiModalConfig:
@@ -77,6 +80,16 @@ def test_nano_nemotron_vl_config_skips_vision_metadata_in_language_only_mode():
     )
 
     NemotronHNanoVLV2Config.verify_and_update_model_config(model_config)
+
+
+def test_nano_nemotron_vl_dynamic_resolution_accepts_typed_vision_config():
+    typed_config = SimpleNamespace(vision_config=SimpleNamespace())
+    legacy_config = SimpleNamespace(
+        vision_config=SimpleNamespace(args={"min_num_patches": 1})
+    )
+
+    assert not BaseNanoNemotronVLProcessor.use_dynamic_resolution(typed_config)
+    assert BaseNanoNemotronVLProcessor.use_dynamic_resolution(legacy_config)
 
 
 def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():
