@@ -235,6 +235,10 @@ fastar==0.10.0
     # via fastapi-cloud-cli
 fastavro==1.12.2
     # via cohere
+fastokens==0.3.1
+    # via
+    #   -c requirements/common.txt
+    #   -r requirements/test/../common.txt
 fastparquet==2026.3.0
     # via genai-perf
 fastsafetensors==0.3.2
