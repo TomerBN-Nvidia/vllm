@@ -77,7 +77,10 @@ from vllm.multimodal.video_prune.evs import (
 from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
-from vllm.transformers_utils.configs.radio import RadioConfig
+from vllm.transformers_utils.configs.radio import (
+    VIT_TIMM_DIM_BY_NAME,
+    RadioConfig,
+)
 from vllm.transformers_utils.processors.internvl import get_internvl_target_ratios
 from vllm.transformers_utils.processors.nano_nemotron_vl import (
     AUDIO_CONTEXT,
@@ -1581,6 +1584,36 @@ class NemotronH_Nano_VL_V2(
         hf_config_vision = hf_config.vision_config
         if isinstance(hf_config_vision, RadioConfig):
             return RadioModel(config=hf_config_vision)
+
+        if getattr(hf_config_vision, "model_type", None) == "radio" and not hasattr(
+            hf_config_vision, "args"
+        ):
+            hidden_size = hf_config_vision.hidden_size
+            intermediate_size = getattr(hf_config_vision, "intermediate_size", None)
+            if intermediate_size is None:
+                intermediate_size = round(hidden_size * hf_config_vision.mlp_ratio)
+            architecture = (
+                hidden_size,
+                hf_config_vision.num_hidden_layers,
+                hf_config_vision.num_attention_heads,
+                intermediate_size,
+            )
+            model_name = next(
+                (
+                    name
+                    for name, dimensions in VIT_TIMM_DIM_BY_NAME.items()
+                    if dimensions == architecture
+                ),
+                None,
+            )
+            if model_name is None:
+                raise ValueError(f"Unsupported RADIO architecture: {architecture}")
+
+            config_dict = hf_config_vision.to_dict()
+            config_dict.pop("model_name", None)
+            config_dict["cpe_max_size"] = config_dict.pop("max_img_size", 2048)
+            config_dict.setdefault("separate_video_embedder", True)
+            return RadioModel(config=RadioConfig(model_name=model_name, **config_dict))
 
         model_name = hf_config_vision.args.get("model")
         if model_name is None:
