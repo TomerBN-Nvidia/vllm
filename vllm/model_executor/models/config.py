@@ -697,6 +697,10 @@ class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        mm_config = model_config.multimodal_config
+        if mm_config is None or mm_config.language_model_only:
+            return
+
         config = model_config.hf_config
         vision_config = config.vision_config
         if not hasattr(vision_config, "args"):
@@ -718,10 +722,8 @@ class NemotronHNanoVLV2Config(VerifyAndUpdateConfig):
             config.norm_std = vision_config.norm_std
             config.use_thumbnail = False
 
-        mm_config = model_config.multimodal_config
-        if mm_config is not None:
-            video_kwargs = mm_config.media_io_kwargs.setdefault("video", {})
-            video_kwargs.setdefault("video_backend", "nemotron_vl")
+        video_kwargs = mm_config.media_io_kwargs.setdefault("video", {})
+        video_kwargs.setdefault("video_backend", "nemotron_vl")
 
 
 class NomicBertModelConfig(VerifyAndUpdateConfig):

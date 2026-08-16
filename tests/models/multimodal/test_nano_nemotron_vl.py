@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
+from vllm.model_executor.models.config import NemotronHNanoVLV2Config
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 
 
@@ -64,6 +67,16 @@ class _FakeTensor:
 
     def clone(self):
         return self
+
+
+def test_nano_nemotron_vl_config_skips_vision_metadata_in_language_only_mode():
+    model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(language_model_only=True),
+        hf_config=SimpleNamespace(),
+        hf_image_processor_config={},
+    )
+
+    NemotronHNanoVLV2Config.verify_and_update_model_config(model_config)
 
 
 def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():
