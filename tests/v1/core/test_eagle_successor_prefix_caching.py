@@ -304,7 +304,8 @@ def test_stale_async_output_does_not_restore_materialization() -> None:
     in_flight_step = scheduler.schedule()
     scheduler.reset_prefix_cache(reset_running_requests=True)
     assert request.num_materialized_eagle_tokens == 0
-    assert request.async_tokens_to_discard > 0
+    assert request.num_stale_output_tokens > 0
+    assert request.drop_stale_output
 
     stale_output = ModelRunnerOutput(
         req_ids=[request.request_id],
@@ -315,7 +316,41 @@ def test_stale_async_output_does_not_restore_materialization() -> None:
         draft_kv_materialized_req_ids={request.request_id},
     )
     scheduler.update_from_output(in_flight_step, stale_output)
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
+    assert request.num_publishable_block_hashes == 0
+    assert request.num_materialized_eagle_tokens == 0
+
+
+def test_preempted_async_output_does_not_restore_materialization() -> None:
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=32,
+    )
+    scheduler.use_eagle_prefix_cache_hashing = True
+    scheduler.kv_cache_manager.use_eagle_prefix_cache_hashing = True
+    scheduler.kv_cache_manager.coordinator.use_eagle_prefix_cache_hashing = True
+    request = _make_request("eagle", list(range(9)))
+    scheduler.add_request(request)
+
+    in_flight_step = scheduler.schedule()
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    assert request.num_stale_output_tokens > 0
+    assert not request.drop_stale_output
+    assert request.num_materialized_eagle_tokens == 0
+
+    stale_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        draft_kv_materialized_req_ids={request.request_id},
+    )
+    scheduler.update_from_output(in_flight_step, stale_output)
+    assert request.num_stale_output_tokens == 0
     assert request.num_publishable_block_hashes == 0
     assert request.num_materialized_eagle_tokens == 0
 
