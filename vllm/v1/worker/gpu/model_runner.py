@@ -1478,6 +1478,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_eagle()
+            ):
+                model_runner_output.draft_kv_materialized_req_ids = set(
+                    input_batch.req_ids
+                )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

@@ -9,6 +9,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
+    BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
 )
@@ -335,7 +336,20 @@ class SingleTypeKVCacheManager(ABC):
                 a tail once per that-sized segment. Only SWA acts on it.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        if self.block_size == self.block_pool.hash_block_size:
+            num_resolved_hashes = len(request.block_hashes)
+        else:
+            num_resolved_hashes = len(
+                BlockHashListWithBlockSize(
+                    request.block_hashes,
+                    self.block_pool.hash_block_size,
+                    self.block_size,
+                )
+            )
+        num_full_blocks = min(
+            num_tokens // self.block_size,
+            num_resolved_hashes,
+        )
 
         if num_cached_blocks >= num_full_blocks:
             return
