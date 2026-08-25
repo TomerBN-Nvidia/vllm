@@ -56,6 +56,9 @@ def create_scheduler(
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     speculative_method: str | None = None,
+    max_num_scheduled_tokens: int | None = None,
+    mamba_cache_mode: str = "none",
+    kv_cache_groups: list[KVCacheGroupSpec] | None = None,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -89,6 +92,7 @@ def create_scheduler(
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
@@ -104,6 +108,7 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):
@@ -167,7 +172,9 @@ def create_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        kv_cache_groups=kv_cache_groups
+        if kv_cache_groups is not None
+        else [KVCacheGroupSpec(["layer"], kv_cache_spec)],
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)

@@ -311,6 +311,43 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        if self.need_mamba_block_aligned_split:
+            # In align mode prefill chunks must end on mamba block boundaries,
+            # so a prefill longer than one block never progresses when a whole
+            # block cannot fit in the per-step budget. The old config-time
+            # assert compared max_num_batched_tokens, but the effective
+            # per-step budget (max_num_scheduled_tokens) can be lower, e.g.
+            # speculative decoding reserves draft-token slots -- and asserts
+            # are stripped under python -O. Checking here compares the
+            # resolved block size against the budget the splitter actually
+            # sees, and also covers schedulers constructed outside EngineCore.
+            block_size = self.cache_config.block_size
+            if block_size > self.max_num_scheduled_tokens:
+                raise ValueError(
+                    "In Mamba cache align mode, prefill is scheduled in whole "
+                    f"blocks of the resolved mamba block size ({block_size} "
+                    "tokens), but the per-step token budget is only "
+                    f"{self.max_num_scheduled_tokens} (max_num_scheduled_"
+                    "tokens: equal to --max-num-batched-tokens unless "
+                    "lowered, e.g. by speculative decoding reserving "
+                    "draft-token slots). Prefills longer than one "
+                    "block would never make progress. Increase the budget to "
+                    f">= {block_size}, or disable prefix caching to turn off "
+                    "align mode."
+                )
+            long_prefill_token_threshold = (
+                self.scheduler_config.long_prefill_token_threshold
+            )
+            if 0 < long_prefill_token_threshold < block_size:
+                logger.warning(
+                    "long_prefill_token_threshold (%d) is below the resolved "
+                    "mamba block size (%d) in Mamba cache align mode, which "
+                    "would prevent prefill progress; clamping it to %d.",
+                    long_prefill_token_threshold,
+                    block_size,
+                    block_size,
+                )
+                self.scheduler_config.long_prefill_token_threshold = block_size
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
