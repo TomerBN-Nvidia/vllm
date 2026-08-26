@@ -37,7 +37,10 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    is_eagle_prefix_cache_hashing_enabled,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -66,6 +69,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Keep manually constructed schedulers in focused tests and extensions on
+    # the legacy path unless __init__ explicitly enables the protocol.
+    use_eagle_prefix_cache_hashing = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -256,6 +263,12 @@ class Scheduler(SchedulerInterface):
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        self.use_eagle_prefix_cache_hashing = is_eagle_prefix_cache_hashing_enabled(
+            vllm_config
+        )
+        if self.use_eagle_prefix_cache_hashing:
+            logger.info("Using successor-aware EAGLE prefix-cache hashing")
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -265,6 +278,7 @@ class Scheduler(SchedulerInterface):
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
+            use_eagle_prefix_cache_hashing=self.use_eagle_prefix_cache_hashing,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -365,7 +379,7 @@ class Scheduler(SchedulerInterface):
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
             # eagle prune
-            if self.use_eagle:
+            if self.use_eagle and not self.use_eagle_prefix_cache_hashing:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
@@ -1168,6 +1182,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.invalidate_eagle_hash_publication()
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -1257,6 +1272,11 @@ class Scheduler(SchedulerInterface):
         ]
         del session._all_token_ids[num_computed_tokens:]
         session._output_token_ids.clear()
+        session.truncate_block_hashes(
+            num_computed_tokens,
+            self.kv_cache_manager.block_pool.hash_block_size,
+            lookahead_tokens=int(self.use_eagle_prefix_cache_hashing),
+        )
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
         session.prompt_token_ids.extend(kept_output_tokens)
@@ -1526,6 +1546,17 @@ class Scheduler(SchedulerInterface):
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
+    def _mark_eagle_hashes_publishable(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> None:
+        if self.use_eagle_prefix_cache_hashing:
+            request.mark_eagle_hashes_publishable(
+                num_tokens,
+                self.kv_cache_manager.block_pool.hash_block_size,
+            )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1539,6 +1570,27 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        draft_kv_materialized_req_ids = (
+            model_runner_output.draft_kv_materialized_req_ids or set()
+        )
+        if self.use_eagle_prefix_cache_hashing:
+            publishable_prefix_tokens = {
+                req.req_id: req.num_computed_tokens
+                for req in scheduler_output.scheduled_new_reqs
+            }
+            # These are schedule-time snapshots. Live request counters may
+            # already include a later async-scheduled chunk.
+            materialized_token_starts = publishable_prefix_tokens.copy()
+            materialized_token_starts.update(
+                zip(
+                    scheduler_output.scheduled_cached_reqs.req_ids,
+                    scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+                    strict=True,
+                )
+            )
+        else:
+            publishable_prefix_tokens = {}
+            materialized_token_starts = {}
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1616,6 +1668,12 @@ class Scheduler(SchedulerInterface):
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
                 continue
+            if (
+                not output_is_stale
+                and self.use_eagle_prefix_cache_hashing
+                and (prefix_tokens := publishable_prefix_tokens.get(req_id, 0))
+            ):
+                self._mark_eagle_hashes_publishable(request, prefix_tokens)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -1670,6 +1728,24 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if (
+                req_id in draft_kv_materialized_req_ids
+                and self.use_eagle_prefix_cache_hashing
+                and status_before_stop == RequestStatus.RUNNING
+                and not output_is_stale
+            ):
+                materialized_start = materialized_token_starts[req_id]
+                if materialized_start <= request.num_materialized_eagle_tokens:
+                    num_publishable_tokens = min(
+                        request.num_computed_tokens - request.num_output_placeholders,
+                        materialized_start + num_tokens_scheduled,
+                    )
+                    self._mark_eagle_hashes_publishable(request, num_publishable_tokens)
+                    self.kv_cache_manager.cache_blocks(
+                        request,
+                        num_publishable_tokens,
+                    )
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request

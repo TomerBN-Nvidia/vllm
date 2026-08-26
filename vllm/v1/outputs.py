@@ -280,6 +280,10 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # Requests for which this step executed the EAGLE drafter forward. Only
+    # these requests may publish successor-aware prefix-cache hashes.
+    draft_kv_materialized_req_ids: set[str] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

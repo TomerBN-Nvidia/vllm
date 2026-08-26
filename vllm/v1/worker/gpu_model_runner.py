@@ -4680,6 +4680,13 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                draft_kv_materialized_req_ids=(
+                    set(req_ids_output_copy)
+                    if spec_config is not None
+                    and spec_config.use_eagle()
+                    and input_fits_in_drafter
+                    else None
+                ),
             )
 
         if not self.use_async_scheduling:

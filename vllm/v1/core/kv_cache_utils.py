@@ -730,6 +730,78 @@ def get_request_block_hasher(
     return request_block_hasher
 
 
+def get_request_eagle_block_hasher(
+    hash_block_size: int,
+    caching_hash_fn: Callable[[Any], bytes],
+) -> Callable[[Request], list[BlockHash]]:
+    """Return a successor-aware block hasher for colocated EAGLE caching.
+
+    The draft KV for a target block also depends on the token and model input
+    at the following position. A block is therefore hashable only after that
+    successor is finalized, and the successor identity is included in the
+    hash chain.
+    """
+
+    def request_eagle_block_hasher(request: Request) -> list[BlockHash]:
+        start_token_idx = len(request.block_hashes) * hash_block_size
+        num_tokens = request.num_tokens
+        new_block_hashes: list[BlockHash] = []
+        curr_mm_idx = -1 if start_token_idx > 0 else 0
+        prev_block_hash_value = (
+            request.block_hashes[-1] if request.block_hashes else None
+        )
+
+        while (end_token_idx := start_token_idx + hash_block_size) < num_tokens:
+            block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
+                request,
+                start_token_idx,
+                end_token_idx,
+                curr_mm_idx,
+            )
+            successor_extra_keys, _ = generate_block_hash_extra_keys(
+                request,
+                end_token_idx,
+                end_token_idx + 1,
+                next_block_mm_idx,
+            )
+            extra_keys = (
+                block_extra_keys,
+                request.all_token_ids[end_token_idx],
+                successor_extra_keys,
+            )
+            block_hash = hash_block_tokens(
+                caching_hash_fn,
+                prev_block_hash_value,
+                request.all_token_ids[start_token_idx:end_token_idx],
+                extra_keys,
+            )
+            new_block_hashes.append(block_hash)
+            prev_block_hash_value = block_hash
+            start_token_idx = end_token_idx
+            curr_mm_idx = next_block_mm_idx
+
+        return new_block_hashes
+
+    return request_eagle_block_hasher
+
+
+def is_eagle_prefix_cache_hashing_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether the colocated successor-aware EAGLE protocol is supported."""
+    speculative_config = vllm_config.speculative_config
+    kv_events_config = vllm_config.kv_events_config
+    kv_events_enabled = (
+        kv_events_config is not None and kv_events_config.enable_kv_cache_events
+    )
+    return bool(
+        speculative_config is not None
+        and speculative_config.use_eagle()
+        and vllm_config.cache_config.enable_prefix_caching
+        and vllm_config.kv_transfer_config is None
+        and not kv_events_enabled
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+    )
+
+
 def _check_enough_kv_cache_memory(
     available_memory: int,
     get_needed_memory: Callable[[], int],

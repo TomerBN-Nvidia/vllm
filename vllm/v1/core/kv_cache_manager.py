@@ -121,6 +121,7 @@ class KVCacheManager:
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
+        use_eagle_prefix_cache_hashing: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
@@ -137,6 +138,7 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
+        self.use_eagle_prefix_cache_hashing = use_eagle_prefix_cache_hashing
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
         # FIXME: make prefix cache stats conditional on log_stats. We still need
@@ -149,6 +151,7 @@ class KVCacheManager:
             max_model_len=self.max_model_len,
             max_in_flight_tokens=max_in_flight_tokens,
             use_eagle=self.use_eagle,
+            use_eagle_prefix_cache_hashing=use_eagle_prefix_cache_hashing,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
@@ -462,7 +465,8 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if not self.use_eagle_prefix_cache_hashing:
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
