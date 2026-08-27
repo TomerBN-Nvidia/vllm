@@ -1515,11 +1515,17 @@ class NemotronH_Nano_VL_V2(
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
 
+        adapter_mapping = {
+            "vision_projector.mlp1.norm.weight": "0.weight",
+            "vision_projector.mlp1.linear1.weight": "1.weight",
+            "vision_projector.mlp1.linear2.weight": "3.weight",
+        }
+
         def is_adapter_weights(weight: tuple[str, torch.Tensor]):
             return weight[0].startswith("mlp1")
 
         def is_vision_weights(name: str) -> bool:
-            return name.startswith("vision_model.radio_model.")
+            return name.startswith("vision_model.")
 
         def is_sound_weights(name: str) -> bool:
             return name.startswith("sound")
@@ -1544,10 +1550,14 @@ class NemotronH_Nano_VL_V2(
                         continue
                     trimmed_name = ".".join(name.split(".")[1:])
                     adapter_weights.append((trimmed_name, w.detach().clone()))
+                elif name in adapter_mapping:
+                    if not load_multimodal_weights:
+                        continue
+                    adapter_weights.append((adapter_mapping[name], w.detach().clone()))
                 elif is_vision_weights(name):
                     if not load_multimodal_weights:
                         continue
-                    # Convert: vision_model.radio_model.* → radio_model.*
+                    # Strip the multimodal wrapper prefix.
                     hf_key = name[len("vision_model.") :]
                     vision_weights.append((hf_key, w.detach().clone()))
                 elif is_sound_weights(name):
