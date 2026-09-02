@@ -7537,6 +7537,14 @@ class GPUModelRunner(
             if not isinstance(module, MoERunner):
                 continue
             layer_id = module.layer_id
+            layer_id_to_capture_index = getattr(
+                capturer, "layer_id_to_capture_index", None
+            )
+            if (
+                layer_id_to_capture_index is not None
+                and layer_id not in layer_id_to_capture_index
+            ):
+                continue
 
             def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
                 _capturer.capture(_layer_id, topk_ids)

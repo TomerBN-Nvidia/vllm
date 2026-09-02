@@ -55,6 +55,31 @@ def get_num_experts(hf_config) -> int:
     )
 
 
+def get_routed_experts_layer_indices(hf_config) -> tuple[int, ...]:
+    """Return backbone layer IDs represented by the routing payload.
+
+    Hybrid Nemotron configs explicitly identify MoE blocks in
+    ``layers_block_type``. Compress those sparse global layer IDs into a dense
+    payload axis. Other model families retain the historical full-layer layout
+    unless they expose an equivalent explicit block list.
+
+    MTP block types intentionally live in ``mtp_layers_block_type`` and are not
+    included: rollout routes replay only backbone MoE layers.
+    """
+    layer_types = getattr(hf_config, "layers_block_type", None)
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        moe_layer_ids = tuple(
+            layer_id
+            for layer_id, layer_type in enumerate(layer_types)
+            if str(layer_type).lower() == "moe"
+        )
+        if moe_layer_ids:
+            return moe_layer_ids
+
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+    return tuple(range(num_hidden_layers))
+
+
 class RoutedExpertsCapturer:
     """Worker-side capturer for routed experts, lives on GPU.
 
@@ -90,15 +115,17 @@ class RoutedExpertsCapturer:
     ) -> None:
         hf_config = vllm_config.model_config.hf_text_config
         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
-        num_layers = hf_config.num_hidden_layers
+        routed_layer_ids = get_routed_experts_layer_indices(hf_config)
+        num_layers = len(routed_layer_ids)
         logger.info(
             "RoutedExpertsCapturer: allocating buffer with "
-            "max_tokens=%d, num_layers=%d, num_experts_per_tok=%d "
-            "(hf_config.model_type=%s)",
+            "max_tokens=%d, routed_layers=%d, num_experts_per_tok=%d "
+            "(hf_config.model_type=%s, global_layer_ids=%s)",
             max_num_batched_tokens,
             num_layers,
             num_experts_per_tok,
             getattr(hf_config, "model_type", "unknown"),
+            routed_layer_ids,
         )
         self.device_buffer = torch.zeros(
             (
@@ -116,6 +143,10 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.layer_id_to_capture_index = {
+            layer_id: capture_index
+            for capture_index, layer_id in enumerate(routed_layer_ids)
+        }
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Capture expert routing decisions for a specific layer.
@@ -205,12 +236,21 @@ class RoutedExpertsCapturer:
                     f"tp_size={self.tp_size})"
                 )
 
-        # Defensive: model may expose more layers than the capture buffer
-        # was sized for (unusual, but guards against miss-config).
-        if layer_id >= self.device_buffer.shape[1]:
+        layer_id_to_capture_index = getattr(self, "layer_id_to_capture_index", None)
+        capture_index = (
+            layer_id
+            if layer_id_to_capture_index is None
+            else layer_id_to_capture_index.get(layer_id)
+        )
+        # Missing IDs include non-MoE backbone blocks and MTP routers.
+        if (
+            capture_index is None
+            or capture_index < 0
+            or capture_index >= self.device_buffer.shape[1]
+        ):
             return
 
-        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
+        self.device_buffer[:token_num_per_dp, capture_index, :] = topk_ids[
             start_loc:end_loc, :
         ]
 
@@ -281,6 +321,7 @@ class RoutedExpertsManager:
         hf_config = vllm_config.model_config.hf_text_config
         num_experts = get_num_experts(hf_config)
         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+        routed_layer_ids = get_routed_experts_layer_indices(hf_config)
         max_num_slots = kv_cache_config.num_blocks * self.block_size
         # Expert IDs are 0..num_experts-1; uint8 fits 256 distinct
         # values so the boundary is ``<= 256`` (NOT ``< 256``). Keeping
@@ -290,7 +331,7 @@ class RoutedExpertsManager:
         self.routed_experts_by_slot = np.zeros(
             (
                 max_num_slots,
-                hf_config.num_hidden_layers,
+                len(routed_layer_ids),
                 num_experts_per_tok,
             ),
             dtype=expert_id_dtype,
@@ -300,8 +341,8 @@ class RoutedExpertsManager:
             "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
             self.routed_experts_by_slot.nbytes / 1e9,
             max_num_slots,
-            hf_config.num_hidden_layers,
-            hf_config.num_experts_per_tok,
+            len(routed_layer_ids),
+            num_experts_per_tok,
             self.routed_experts_by_slot.dtype.name,
         )
 
