@@ -11,6 +11,7 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    get_routed_experts_layer_indices,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
@@ -70,6 +71,22 @@ def _make_modular_routed_experts():
     return types.SimpleNamespace(
         quant_method=types.SimpleNamespace(is_monolithic=False),
     )
+
+
+def test_routed_experts_layer_indices_compress_explicit_moe_blocks():
+    hf_config = SimpleNamespace(
+        num_hidden_layers=6,
+        layers_block_type=["attention", "moe", "mamba", "moe", "mamba", "moe"],
+        mtp_layers_block_type=["attention", "moe"],
+    )
+
+    assert get_routed_experts_layer_indices(hf_config) == (1, 3, 5)
+
+
+def test_routed_experts_layer_indices_preserve_legacy_layout_without_block_types():
+    hf_config = SimpleNamespace(num_hidden_layers=4)
+
+    assert get_routed_experts_layer_indices(hf_config) == (0, 1, 2, 3)
 
 
 def test_base_router_capture_pre_eplb_mapping():
@@ -200,6 +217,36 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     assert len(capturer.calls) == 1
 
 
+def test_gpu_model_runner_binds_only_compact_payload_layers(monkeypatch):
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    class DummyFusedMoE:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.router = _make_router()
+            self.routed_experts = _make_modular_routed_experts()
+            self._quant_method = self.routed_experts.quant_method
+
+    selected_module = DummyFusedMoE(layer_id=1)
+    skipped_module = DummyFusedMoE(layer_id=2)
+
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "MoERunner", DummyFusedMoE)
+
+    dummy_self = types.SimpleNamespace(
+        model=types.SimpleNamespace(modules=lambda: [selected_module, skipped_module])
+    )
+    capturer = types.SimpleNamespace(
+        layer_id_to_capture_index={1: 0}, capture=lambda *_: None
+    )
+
+    gmr.GPUModelRunner._bind_routed_experts_capturer(dummy_self, capturer)
+
+    assert selected_module.router.capture_fn is not None
+    assert skipped_module.router.capture_fn is None
+
+
 def test_gpu_model_runner_does_not_bind_draft_router_capture(monkeypatch):
     from vllm.v1.worker import gpu_model_runner as gmr
 
@@ -286,6 +333,19 @@ def test_routed_experts_capturer_single_dp_no_metadata():
         capturer.capture(layer_id=0, topk_ids=topk)
     assert torch.equal(capturer.device_buffer[:3, 0, :], topk)
     assert capturer.device_buffer[3, 0, 0].item() == -1
+
+
+def test_routed_experts_capturer_maps_sparse_global_moe_layer_ids():
+    capturer = _capturer_with_buffer(num_layers=2, dp_rank=0)
+    capturer.layer_id_to_capture_index = {1: 0, 3: 1}
+    topk = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    ctx = SimpleNamespace(dp_metadata=None)
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(layer_id=3, topk_ids=topk)
+        capturer.capture(layer_id=2, topk_ids=topk + 10)
+
+    assert torch.equal(capturer.device_buffer[:2, 1, :], topk)
+    assert torch.all(capturer.device_buffer[:, 0, :] == -1)
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
