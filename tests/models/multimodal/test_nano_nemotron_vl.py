@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
+import torch.nn as nn
 
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 
@@ -111,6 +113,56 @@ def test_nano_nemotron_vl_loads_vision_weights_without_sound_encoder():
     assert vision_model.loaded_weights == [
         ("radio_model.encoder.weight", vision_weight)
     ]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["vision_final_layernorm.", "vision_projector.vision_final_layernorm."],
+)
+def test_nano_nemotron_vl_loads_and_applies_radio_final_layernorm(prefix: str):
+    model = object.__new__(NemotronH_Nano_VL_V2)
+    language_model = _LanguageModel()
+    vision_model = _VisionModel()
+    final_layernorm = nn.LayerNorm(4, eps=1.0e-6).float()
+    object.__setattr__(model, "model_config", _ImageOnlyModelConfig())
+    object.__setattr__(model, "language_model", language_model)
+    object.__setattr__(model, "mlp1", _AdapterModule())
+    object.__setattr__(model, "vision_model", vision_model)
+    object.__setattr__(model, "vision_final_layernorm", final_layernorm)
+    object.__setattr__(model, "_loaded_vision_final_layernorm_params", set())
+    object.__setattr__(model, "_vision_final_layernorm_enabled", False)
+    object.__setattr__(model, "sound_encoder", None)
+
+    weight = torch.tensor([1.0, 1.5, 2.0, 2.5], dtype=torch.bfloat16)
+    bias = torch.tensor([-0.5, 0.0, 0.5, 1.0], dtype=torch.bfloat16)
+    model.load_weights(
+        [
+            (f"{prefix}weight", weight),
+            (f"{prefix}bias", bias),
+        ]
+    )
+
+    assert model._vision_final_layernorm_enabled
+    assert torch.equal(final_layernorm.weight, weight.float())
+    assert torch.equal(final_layernorm.bias, bias.float())
+    assert vision_model.loaded_weights == []
+
+    inputs = torch.tensor(
+        [[[1.0, 2.0, 4.0, 8.0], [2.0, 3.0, 5.0, 9.0]]],
+        dtype=torch.bfloat16,
+    )
+    expected = final_layernorm(inputs.float()).to(inputs.dtype)
+    actual = model._apply_vision_final_layernorm(inputs)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_nano_nemotron_vl_does_not_apply_unloaded_radio_final_layernorm():
+    model = object.__new__(NemotronH_Nano_VL_V2)
+    object.__setattr__(model, "vision_final_layernorm", nn.LayerNorm(4))
+    object.__setattr__(model, "_vision_final_layernorm_enabled", False)
+    inputs = torch.randn(2, 3, 4)
+
+    assert model._apply_vision_final_layernorm(inputs) is inputs
 
 
 def test_nano_nemotron_vl_requires_sound_encoder_for_sound_weights():

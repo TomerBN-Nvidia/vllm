@@ -976,6 +976,17 @@ class NemotronH_Nano_VL_V2(
                 nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
             )
             self.mlp1 = mlp1.to(llm_dtype)
+            self.vision_final_layernorm: nn.LayerNorm | None = None
+            if (getattr(config.text_config, "num_nextn_predict_layers", 0) or 0) > 0:
+                # Megatron adds this post-RADIO norm when the inherited vision
+                # config has MTP enabled. Keep it available for dummy-load +
+                # refit, but do not apply it until its checkpoint tensors load.
+                self.vision_final_layernorm = nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1.0e-6),
+                ).float()
+            self._loaded_vision_final_layernorm_params: set[str] = set()
+            self._vision_final_layernorm_enabled = False
             self.sound_encoder: ProjectedParakeet | None = None
             if getattr(config, "sound_config", None) is not None:
                 logger.info_once(
@@ -1049,11 +1060,19 @@ class NemotronH_Nano_VL_V2(
 
         return x
 
+    def _apply_vision_final_layernorm(self, vit_embeds: torch.Tensor) -> torch.Tensor:
+        if not self._vision_final_layernorm_enabled:
+            return vit_embeds
+        assert self.vision_final_layernorm is not None
+        output_dtype = vit_embeds.dtype
+        return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
+
     def extract_feature_dynamic(
         self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
     ):
         """Dynamic resolution extract_feature for images."""
         _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes=imgs_sizes)
         vit_embeds = self.mlp1(vit_embeds)
@@ -1086,6 +1105,7 @@ class NemotronH_Nano_VL_V2(
                 _, vit_embeds = self.vision_model(chunk, num_frames=chunk.shape[0])
             else:
                 _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
             vit_embeds = vit_embeds.reshape(
                 vit_embeds.shape[0], H_patches, W_patches, -1
@@ -1488,7 +1508,11 @@ class NemotronH_Nano_VL_V2(
         """
         return MultiModelKeys.from_string_field(
             language_model="language_model",
-            connector=["mlp1", "sound_encoder.projection"],
+            connector=[
+                "mlp1",
+                "vision_final_layernorm",
+                "sound_encoder.projection",
+            ],
             tower_model=["vision_model", "sound_encoder.encoder"],
         )
 
@@ -1505,6 +1529,12 @@ class NemotronH_Nano_VL_V2(
             for modality in ("image", "video", "audio")
         )
         adapter_dict = dict(self.mlp1.named_parameters())
+        final_layernorm = getattr(self, "vision_final_layernorm", None)
+        final_layernorm_dict = (
+            dict(final_layernorm.named_parameters())
+            if load_multimodal_weights and final_layernorm is not None
+            else {}
+        )
 
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
@@ -1521,6 +1551,15 @@ class NemotronH_Nano_VL_V2(
                     return name.replace(source_prefix, target_prefix, 1)
             return None
 
+        def get_final_layernorm_name(name: str) -> str | None:
+            for source_prefix in (
+                "vision_final_layernorm.",
+                "vision_projector.vision_final_layernorm.",
+            ):
+                if name.startswith(source_prefix):
+                    return name.removeprefix(source_prefix)
+            return None
+
         def is_vision_weights(name: str) -> bool:
             return name.startswith("vision_model.")
 
@@ -1534,6 +1573,7 @@ class NemotronH_Nano_VL_V2(
         # sound) are detach+cloned on append so they are independent of any
         # reusable buffer the streamer may use, then loaded after the LLM.
         adapter_weights: list[tuple[str, torch.Tensor]] = []
+        final_layernorm_weights: list[tuple[str, torch.Tensor]] = []
         vision_weights: list[tuple[str, torch.Tensor]] = []
         sound_weights: list[tuple[str, torch.Tensor]] = []
 
@@ -1546,6 +1586,14 @@ class NemotronH_Nano_VL_V2(
                     if not load_multimodal_weights:
                         continue
                     adapter_weights.append((adapter_name, w.detach().clone()))
+                elif (
+                    final_layernorm_name := get_final_layernorm_name(name)
+                ) is not None:
+                    if not final_layernorm_dict:
+                        continue
+                    final_layernorm_weights.append(
+                        (final_layernorm_name, w.detach().clone())
+                    )
                 elif is_vision_weights(name):
                     if not load_multimodal_weights:
                         continue
@@ -1571,6 +1619,21 @@ class NemotronH_Nano_VL_V2(
                 param = adapter_dict[trimmed_name]
                 with torch.no_grad():
                     default_weight_loader(param, w)
+            for trimmed_name, w in final_layernorm_weights:
+                param = final_layernorm_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+                self._loaded_vision_final_layernorm_params.add(trimmed_name)
+            if final_layernorm_weights and (
+                self._loaded_vision_final_layernorm_params
+                >= final_layernorm_dict.keys()
+            ):
+                if not self._vision_final_layernorm_enabled:
+                    logger.info_once(
+                        "Loaded and enabled checkpoint-backed RADIO final LayerNorm",
+                        scope="global",
+                    )
+                self._vision_final_layernorm_enabled = True
             self.vision_model.load_weights(vision_weights)
             if self.sound_encoder is not None and len(sound_weights) > 0:
                 self.sound_encoder.load_weights(sound_weights)
