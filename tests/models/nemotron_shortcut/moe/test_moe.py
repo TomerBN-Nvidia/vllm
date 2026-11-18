@@ -214,3 +214,79 @@ def test_graph_replay_routes_the_new_inputs(compiled):
 
     torch.testing.assert_close(output, moe(routed, shared), atol=2e-6, rtol=2e-5)
     assert not torch.equal(output, first)
+
+
+@torch.inference_mode()
+def test_cutlass_reuses_workspace():
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEParallelConfig,
+        FusedMoEQuantConfig,
+    )
+    from vllm.models.nemotron_shortcut.nvidia.moe.config import (
+        NemotronShortcutMoEConfig,
+    )
+    from vllm.models.nemotron_shortcut.nvidia.moe.flashinfer import (
+        NemotronShortcutFlashInferExperts,
+        _cutlass_workspace_size,
+        has_cutlass_clamped_relu2,
+    )
+
+    if not has_cutlass_clamped_relu2() or _cutlass_workspace_size() is None:
+        pytest.skip("FlashInfer needs clamped ReLU2 and caller-owned workspace")
+    m, n, k, experts, topk = 4096, 1024, 1024, 32, 8
+    config = NemotronShortcutMoEConfig(
+        num_experts=experts,
+        num_local_experts=experts,
+        num_logical_experts=experts,
+        experts_per_token=topk,
+        hidden_dim=k,
+        intermediate_size=n,
+        activation=MoEActivation.RELU2_NO_MUL,
+        activation_clamp_value=0.25,
+        in_dtype=torch.bfloat16,
+        device="cuda",
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    )
+    kernel = NemotronShortcutFlashInferExperts(config, FusedMoEQuantConfig.make())
+    torch.manual_seed(7)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 10
+    w1 = torch.randn(experts, n, k, device="cuda", dtype=torch.bfloat16) / 10
+    w2 = torch.randn(experts, k, n, device="cuda", dtype=torch.bfloat16) / 10
+    ids = torch.rand(m, experts, device="cuda").topk(topk).indices.int()
+    weights = torch.full((m, topk), 1 / topk, device="cuda")
+    output = torch.empty_like(x)
+    _, scratch_shape, _ = kernel.workspace_shapes(
+        m, n, k, topk, experts, experts, None, MoEActivation.RELU2_NO_MUL
+    )
+    scratch = torch.empty(scratch_shape, dtype=x.dtype, device="cuda")
+
+    def run(workspace):
+        kernel.apply(
+            output,
+            x,
+            w1,
+            w2,
+            weights,
+            ids,
+            MoEActivation.RELU2_NO_MUL,
+            experts,
+            None,
+            None,
+            None,
+            None,
+            workspace,
+            None,
+            False,
+        )
+
+    run(None)
+    reference = output.clone()
+    run(scratch)
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    before = torch.accelerator.memory_allocated()
+    run(scratch)
+    torch.accelerator.synchronize()
+    assert torch.accelerator.max_memory_allocated() - before < scratch.nbytes // 4
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)

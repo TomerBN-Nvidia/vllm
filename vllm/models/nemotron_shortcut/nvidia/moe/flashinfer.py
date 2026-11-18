@@ -50,6 +50,7 @@ from vllm.models.nemotron_shortcut.nvidia.moe.config import activation_clamp
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe, has_flashinfer_cutedsl
 from vllm.utils.func_utils import supports_kw
+from vllm.utils.math_utils import cdiv
 
 
 @functools.cache
@@ -75,6 +76,20 @@ def _cute_dsl_fused_moe() -> Any:
 def has_cutlass_clamped_relu2() -> bool:
     """FlashInfer's CUTLASS fused MoE implements `ClampedRelu2`."""
     return hasattr(_activation_type(), "ClampedRelu2")
+
+
+@functools.cache
+def _cutlass_workspace_size() -> Any:
+    try:
+        from flashinfer.fused_moe import (
+            cutlass_fused_moe,
+            cutlass_fused_moe_workspace_size,
+        )
+    except ImportError:
+        return None
+    if supports_kw(cutlass_fused_moe, "workspace_buffer", allow_var_kwargs=False):
+        return cutlass_fused_moe_workspace_size
+    return None
 
 
 def has_cute_dsl_options(*options: str) -> bool:
@@ -133,6 +148,9 @@ class NemotronShortcutFlashInferExperts(FlashInferExperts):
     ) -> None:
         super().__init__(moe_config, quant_config)
         self.clamp_limit = _clamp_limit(moe_config)
+        self._workspace_size = _cutlass_workspace_size()
+        self._workspace_tokens = 0
+        self._workspace_bytes = 0
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -152,6 +170,43 @@ class NemotronShortcutFlashInferExperts(FlashInferExperts):
     def _supports_activation(activation: MoEActivation) -> bool:
         return activation == MoEActivation.RELU2_NO_MUL
 
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        if self._workspace_size is None:
+            return (M, K), (0,), (M, K)
+        if self._workspace_tokens < M:
+            self._workspace_bytes = self._workspace_size(
+                M,
+                K,
+                N,
+                local_num_experts * self.ep_size,
+                topk,
+                x_dtype=self.out_dtype,
+                weight_dtype=self.out_dtype,
+                output_dtype=self.out_dtype,
+                activation_type=(
+                    _activation_type().ClampedRelu2
+                    if self.clamp_limit is not None
+                    else _activation_type().Relu2
+                ),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                device=self.device,
+            )
+            self._workspace_tokens = M
+        return (M, K), (cdiv(self._workspace_bytes, self.out_dtype.itemsize),), (M, K)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -170,25 +225,10 @@ class NemotronShortcutFlashInferExperts(FlashInferExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        if self.clamp_limit is None:
-            return super().apply(
-                output,
-                hidden_states,
-                w1,
-                w2,
-                topk_weights,
-                topk_ids,
-                activation,
-                global_num_experts,
-                expert_map,
-                a1q_scale,
-                a2_scale,
-                workspace13,
-                workspace2,
-                expert_tokens_meta,
-                apply_router_weight_on_input,
-            )
         assert not apply_router_weight_on_input
+        workspace = {}
+        if self._workspace_size is not None and workspace2 is not None:
+            workspace["workspace_buffer"] = workspace2.view(torch.uint8)
         flashinfer_cutlass_fused_moe(
             input=hidden_states,
             token_selected_experts=topk_ids.to(torch.int),
@@ -202,8 +242,13 @@ class NemotronShortcutFlashInferExperts(FlashInferExperts):
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            activation_type=_activation_type().ClampedRelu2,
+            activation_type=(
+                _activation_type().ClampedRelu2
+                if self.clamp_limit is not None
+                else _activation_type().Relu2
+            ),
             clamped_relu2_limit=self.clamp_limit,
+            **workspace,
         )
 
 

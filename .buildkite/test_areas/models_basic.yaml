@@ -552,7 +552,6 @@ steps:
   - vllm/transformers_utils/configs/nemotron_shortcut.py
   - vllm/transformers_utils/processors/nemotron_shortcut.py
   - tests/models/nemotron_shortcut/
-  - vllm/config/speculative.py
   commands:
   - pytest -v -s models/nemotron_shortcut/
 

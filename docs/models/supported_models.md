@@ -5,8 +5,6 @@ vLLM supports [generative](./generative_models.md) and [pooling](./pooling_model
 For each task, we list the model architectures that have been implemented in vLLM.
 Alongside each architecture, we include some popular models that use it.
 
-See [Nemotron Shortcut](nemotron_shortcut.md) for RL and video settings.
-
 ## Model Implementation
 
 ### vLLM
