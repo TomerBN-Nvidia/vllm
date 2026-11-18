@@ -28,10 +28,19 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import 
     is_valid_flashinfer_cutlass_fused_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_type,
+    swap_w13_to_w31,
+)
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
+from vllm.utils.flashinfer import (
+    flashinfer_cutlass_fused_moe_workspace_size,
+    has_flashinfer_cutlass_fused_moe,
+    has_flashinfer_cutlass_fused_moe_workspace,
+)
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.worker.workspace import lock_workspace
 
 if not has_flashinfer_cutlass_fused_moe() or not current_platform.has_device_capability(
     100
@@ -247,6 +256,101 @@ def test_flashinfer_fp4_moe_no_graph(
 
         torch.testing.assert_close(
             torch_output, flashinfer_output, atol=1e-1, rtol=1e-1
+        )
+
+
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@torch.inference_mode()
+def test_flashinfer_cutlass_moe_scratch_comes_from_the_workspace(
+    activation: MoEActivation, workspace_init
+):
+    """The kernel's scratch grows with the batch, to GiBs once data parallelism
+    gathers every rank's tokens onto each one. It must come from the workspace
+    manager, sized once and then locked, not from an allocation on every call:
+    those fragment the allocator until a later call finds no room for its own."""
+    if not has_flashinfer_cutlass_fused_moe_workspace():
+        pytest.skip("This FlashInfer's CUTLASS MoE takes no caller-owned workspace")
+    set_random_seed(7)
+    m, n, k, e, topk = 4096, 1024, 1024, 32, 8
+    dtype = torch.bfloat16
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        w1_rows = (2 if activation.is_gated else 1) * n
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w1 = torch.randn((e, w1_rows, k), device="cuda", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)
+
+        quant_config = FusedMoEQuantConfig.make()
+        moe_config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=e,
+            num_logical_experts=e,
+            activation=activation,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=dtype,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=next_power_of_2(m),
+        )
+        kernel = FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            FlashInferExperts(moe_config=moe_config, quant_config=quant_config),
+        )
+        # FlashInfer takes the gated projections as [up; gate].
+        w1_kernel = swap_w13_to_w31(w1) if activation.is_gated else w1
+
+        def run() -> torch.Tensor:
+            return kernel.apply(
+                hidden_states=a,
+                w1=w1_kernel,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=e,
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        run()  # sizes the workspace, as the memory profiling run does
+        lock_workspace()  # as after CUDA graph capture: no more growth
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        allocated_before = torch.accelerator.memory_allocated()
+        output = run()
+        torch.accelerator.synchronize()
+        allocated_by_call = torch.accelerator.max_memory_allocated() - allocated_before
+
+        scratch = flashinfer_cutlass_fused_moe_workspace_size(
+            m,
+            k,
+            n,
+            e,
+            topk,
+            x_dtype=dtype,
+            weight_dtype=dtype,
+            output_dtype=dtype,
+            activation_type=activation_to_flashinfer_type(activation),
+        )
+        assert allocated_by_call < scratch // 4, (
+            f"a call allocated {allocated_by_call} bytes, its scratch takes {scratch}"
+        )
+        torch.testing.assert_close(
+            output,
+            torch_moe(a, w1, w2, score, topk, activation=activation),
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 
