@@ -584,7 +584,6 @@ class _NemotronShortcutTimedVideoDataParser(MultiModalDataParser):
 
 class NemotronShortcutProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
-        # Every T: the video prompt labels frames with times from the metadata.
         return _NemotronShortcutTimedVideoDataParser(
             expected_hidden_size=self._get_expected_hidden_size(),
             allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
@@ -923,12 +922,6 @@ class NemotronShortcutMultiModalProcessor(Mistral3MultiModalProcessor):
             )
             return PromptUpdateDetails.select_token_id(tokens, processor.image_token_id)
 
-        def video_replacement(item_idx: int):
-            # The training prompt for every T: a "This is a video:" header, then
-            # one "Frame i sampled at X.XX seconds: <img...>" line per tubelet
-            # (per frame for T = 1).
-            return tubelet_video_replacement(item_idx)
-
         return image_updates + [
             PromptReplacement(
                 modality="video",
@@ -936,7 +929,7 @@ class NemotronShortcutMultiModalProcessor(Mistral3MultiModalProcessor):
                     cast(NemotronShortcutProcessingInfo, self.info).video_token,
                     add_special_tokens=False,
                 ),
-                replacement=video_replacement,
+                replacement=tubelet_video_replacement,
             )
         ]
 

@@ -133,20 +133,12 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 dtype=torch.float32,
             )
 
-        # The kernel needs scratch that grows with the token count, to GiBs
-        # when data parallelism gathers every rank's tokens onto each one.
-        # Left to itself, FlashInfer allocates and frees it on every call, and
-        # the caching allocator, having split the freed block for other
-        # tensors, may then find no room for the next call's, though memory
-        # profiling counted it. Run the kernel on workspace2 instead, which the
-        # workspace manager sizes once, for the most tokens profiled.
+        # Keep large scratch allocations stable across calls to avoid fragmentation.
         self.use_workspace_buffer = has_flashinfer_cutlass_fused_moe_workspace()
-        # Per problem shape: the most tokens sized so far, and their bytes.
         self._workspace_sizes: dict[tuple, tuple[int, int]] = {}
 
     def _kernel_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        """The activation and weight dtypes `apply` runs the kernel on,
-        format by format in the same order."""
+        """Activation and weight dtypes passed to FlashInfer."""
         if (
             self.quant_dtype == torch.float8_e4m3fn
             and not self.use_deepseek_fp8_block_scale
@@ -172,11 +164,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         topk: int,
         activation: MoEActivation,
     ) -> int:
-        """Bytes of scratch the kernel needs for up to the most tokens seen.
-
-        The size only grows with the token count, so the scratch for the most
-        tokens serves fewer too: ask FlashInfer again only for more.
-        """
+        """Cache the scratch size for the largest batch seen at each shape."""
         key = (hidden_size, intermediate_size, num_experts, topk, activation)
         max_tokens, nbytes = self._workspace_sizes.get(key, (0, 0))
         if num_tokens > max_tokens:
@@ -322,8 +310,6 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # so the actual hidden dim is 2x the size of K here.
         output_shape = (M, K * 2 if self.quant_dtype == "nvfp4" else K)
         if self.use_workspace_buffer:
-            # The kernel takes the hidden size from the output and the
-            # intermediate size from w1, whose rows a gated activation doubles.
             nbytes = self._kernel_workspace_bytes(
                 M,
                 hidden_size=output_shape[1],

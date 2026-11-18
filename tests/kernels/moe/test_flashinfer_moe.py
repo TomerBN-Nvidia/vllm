@@ -264,10 +264,7 @@ def test_flashinfer_fp4_moe_no_graph(
 def test_flashinfer_cutlass_moe_scratch_comes_from_the_workspace(
     activation: MoEActivation, workspace_init
 ):
-    """The kernel's scratch grows with the batch, to GiBs once data parallelism
-    gathers every rank's tokens onto each one. It must come from the workspace
-    manager, sized once and then locked, not from an allocation on every call:
-    those fragment the allocator until a later call finds no room for its own."""
+    """Locked workspace is reused without allocating per-call kernel scratch."""
     if not has_flashinfer_cutlass_fused_moe_workspace():
         pytest.skip("This FlashInfer's CUTLASS MoE takes no caller-owned workspace")
     set_random_seed(7)
