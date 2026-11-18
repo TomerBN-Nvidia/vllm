@@ -552,8 +552,13 @@ steps:
   - vllm/transformers_utils/configs/nemotron_shortcut.py
   - vllm/transformers_utils/processors/nemotron_shortcut.py
   - tests/models/nemotron_shortcut/
+  - vllm/config/speculative.py
+  - tests/config/test_speculative_draft_hf_overrides.py
   commands:
-  - pytest -v -s models/nemotron_shortcut/
+  - >-
+    pytest -v -s
+    models/nemotron_shortcut/
+    config/test_speculative_draft_hf_overrides.py
 
 - label: ":computer: (CPU) Basic Models Other"
   key: basic-models-test-other-cpu
