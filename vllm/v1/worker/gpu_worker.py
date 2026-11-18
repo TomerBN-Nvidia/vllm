@@ -773,6 +773,13 @@ class Worker(WorkerBase):
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+            # Buffers kept across steps, like the MoE workspace, can grow after
+            # activations were freed: a draft model running after the target
+            # grows the workspace they share. Every real step has those
+            # activations on top of the grown buffers, but the peak above did
+            # not, and only what exceeds the memory kept after profiling counts
+            # as transient. Profile again, on top of the grown buffers.
+            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
 
         # Profile CUDA graph memory if graphs will be captured. The runner
         # decides itself, since encoder graphs don't depend on cudagraph_mode.
