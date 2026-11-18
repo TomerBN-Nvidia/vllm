@@ -576,15 +576,20 @@ class ShortcutMoEGDPLayer(ShortcutMoELayer):
 
 def check_sdsa_indexer_loaded(model: nn.Module, loaded: set[str]) -> None:
     """Refuse to serve SDSA layers whose indexer the checkpoint did not provide."""
+    if getattr(model, "_sdsa_indexer_validated", False):
+        return
     has_sparse = any(
         isinstance(m, NemotronShortcutSparseAttention) for m in model.modules()
     )
     if has_sparse and not any(".indexer." in name for name in loaded):
         raise ValueError(
             "The checkpoint's config has index_topk, but the checkpoint has no "
-            "SDSA indexer weights. Without index_topk the model runs full "
-            'attention: --hf-overrides \'{"text_config": {"index_topk": null}}\'.'
+            "SDSA indexer weights. Load the matching checkpoint with its "
+            "trained indexer weights."
         )
+
+    if has_sparse:
+        model._sdsa_indexer_validated = True
 
 
 def skip_indexer_weights(
