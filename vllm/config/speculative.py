@@ -1054,7 +1054,7 @@ class SpeculativeConfig:
             # The MTP head reads the language model's fields; the quant config
             # lives only at the top level of the VL checkpoint.
             quantization_config = getattr(hf_config, "quantization_config", None)
-            hf_config = hf_config.get_text_config()
+            hf_config = copy.deepcopy(hf_config.get_text_config())
             if (
                 quantization_config is not None
                 and getattr(hf_config, "quantization_config", None) is None

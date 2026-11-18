@@ -43,6 +43,43 @@ def _make_hf_config(**kwargs) -> PreTrainedConfig:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("quantization_location", ["outer", "text", "both", "none"])
+def test_nemotron_shortcut_mtp_keeps_target_config_isolated(quantization_location):
+    """Promoting a VLM config must not rewrite its target model or share scales."""
+    from vllm.transformers_utils.configs.nemotron_shortcut import (
+        NemotronShortcutConfig,
+        NemotronShortcutTextConfig,
+    )
+
+    text = NemotronShortcutTextConfig(num_nextn_predict_layers=2)
+    target = NemotronShortcutConfig(text_config=text)
+    outer_quant = {"quant_method": "modelopt", "quant_algo": "MXFP8"}
+    text_quant = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    if quantization_location in ("outer", "both"):
+        target.quantization_config = outer_quant
+    if quantization_location in ("text", "both"):
+        text.quantization_config = text_quant
+
+    draft = SpeculativeConfig.hf_config_override(target)
+
+    assert draft.model_type == "nemotron_shortcut_mtp"
+    assert draft.architectures == ["NemotronShortcutMTPModel"]
+    assert text.model_type == "nemotron4_text"
+    assert getattr(text, "n_predict", None) is None
+    expected = (
+        text_quant
+        if quantization_location in ("text", "both")
+        else outer_quant
+        if quantization_location == "outer"
+        else None
+    )
+    assert getattr(draft, "quantization_config", None) == expected
+    if expected is not None:
+        draft.quantization_config["quant_algo"] = "changed"
+        assert expected["quant_algo"] != "changed"
+
+
+@pytest.mark.cpu_test
 def test_non_rope_dict_overrides_are_not_forwarded_to_draft():
     """Non-rope dict patches stay target-only; the draft keeps arch mapping."""
     composed = SpeculativeConfig.compose_draft_hf_overrides({"num_hidden_layers": 1})
