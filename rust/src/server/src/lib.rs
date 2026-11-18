@@ -132,7 +132,9 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             hf_token: config.hf_token.clone(),
             hf_overrides: config.hf_overrides.clone(),
             generation_config: config.generation_config,
-            renderer: config.renderer,
+            renderer: config
+                .renderer
+                .for_parsers(&config.tool_call_parser, &config.reasoning_parser),
             language_model_only: config.language_model_only,
             chat_template: config.chat_template.clone(),
             trust_request_chat_template: config.trust_request_chat_template,
@@ -142,6 +144,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .clone()
                 .unwrap_or_default(),
             limit_mm_per_prompt: config.limit_mm_per_prompt.clone(),
+            media_options: config.media_options.clone(),
         },
     )
     .await

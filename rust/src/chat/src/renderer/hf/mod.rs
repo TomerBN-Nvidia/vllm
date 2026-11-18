@@ -12,10 +12,11 @@ use vllm_text::backend::hf::{
     HfChatTemplate, HfSpecialTokens, HfTokenizerConfig, ResolvedModelFiles, load_tokenizer_config,
 };
 
-use self::format::{
+pub(crate) use self::format::{
     ChatTemplateContentFormat, ChatTemplateContentFormatOption as ContentFormatOption, ProbeContext,
 };
-use self::template::{CompiledChatTemplate, TemplateContext, request_template_fuel};
+pub(crate) use self::template::CompiledChatTemplate;
+use self::template::{TemplateContext, request_template_fuel};
 use super::{ChatRenderer, RenderedPrompt, tool_call_arguments_or_empty};
 use crate::error::Result;
 use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
@@ -26,7 +27,7 @@ use crate::{
 mod developer;
 mod error;
 mod format;
-mod generation;
+pub(crate) mod generation;
 mod template;
 mod tojson;
 
@@ -36,7 +37,7 @@ pub use self::format::ChatTemplateContentFormatOption;
 
 /// Extract the effective chat-template kwargs visible to the renderer from the request,
 /// using the provided defaults as the base.
-fn effective_template_kwargs(
+pub(crate) fn effective_template_kwargs(
     default_template_kwargs: &HashMap<String, JsonValue>,
     request: &ChatRequest,
 ) -> HashMap<String, JsonValue> {
@@ -331,7 +332,7 @@ impl ChatRenderer for HfChatRenderer {
 // TODO: borrow more fields directly from the original `ChatMessage`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Serialize)]
-struct TemplateMessage<'a> {
+pub(crate) struct TemplateMessage<'a> {
     role: &'a str,
     content: TemplateContent,
     // Developer-role messages may provide message-local tools in the same shape
@@ -386,7 +387,7 @@ struct TemplateToolFunction {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct TemplateTool {
+pub(crate) struct TemplateTool {
     #[serde(rename = "type")]
     tool_type: &'static str,
     function: TemplateToolDefinition,
@@ -404,7 +405,7 @@ struct TemplateToolDefinition {
 }
 
 /// Convert chat messages into the JSON shape expected by Jinja chat templates.
-fn to_template_messages<'a>(
+pub(crate) fn to_template_messages<'a>(
     messages: &'a [ChatMessage],
     content_format: ChatTemplateContentFormat,
     multimodal: Option<&MultimodalRenderInfo>,
@@ -697,7 +698,7 @@ fn truncate_prompt_at_continue_final_message_tag(
     Ok(rendered)
 }
 
-fn to_template_tools(tools: &[ChatTool]) -> Vec<TemplateTool> {
+pub(crate) fn to_template_tools(tools: &[ChatTool]) -> Vec<TemplateTool> {
     tools
         .iter()
         .map(|tool| TemplateTool {

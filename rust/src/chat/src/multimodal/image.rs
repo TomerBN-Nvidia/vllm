@@ -35,6 +35,11 @@ impl MultimodalModelInfo {
         let support = self.image.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Image.to_string(),
         })?;
+        if let super::VisionProcessor::Nemotron4(processor) = &support.processor {
+            return processor
+                .prepare_images(frames, uuids, &self.context, support, model_dtype)
+                .await;
+        }
         let preprocessed = self.preprocess_images(support, &frames, preprocessing_context).await?;
         let replacements = support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
         if replacements.len() != frames.len() {
@@ -68,7 +73,10 @@ impl MultimodalModelInfo {
         image_frames: &[Arc<ImageFrame>],
         preprocessing_context: VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs> {
-        let processor = Arc::clone(&support.processor);
+        let super::VisionProcessor::Registered(processor) = &support.processor else {
+            unreachable!("native media is prepared by its model processor");
+        };
+        let processor = Arc::clone(processor);
         let images = image_frames
             .iter()
             .map(|frame| frame.image().cloned())

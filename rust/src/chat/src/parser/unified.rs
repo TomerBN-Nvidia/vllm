@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 pub use vllm_parser::unified::{
     BeamUnifiedParser, Gemma4UnifiedParser, HfTemplateError, HfUnifiedParser, HyV3UnifiedParser,
     HyV4UnifiedParser, InklingUnifiedParser, KimiK3UnifiedParser, MuseUnifiedParser,
-    ResponseTemplate, UnifiedParser,
+    NEMOTRON4_VERSION, Nemotron4UnifiedParser, ResponseTemplate, UnifiedParser,
 };
 use vllm_tokenizer::DynTokenizer;
 
@@ -33,6 +33,58 @@ pub mod names {
     /// Beam checkpoints: [`HF`] with Beam's tool-call grammar, built from the
     /// model's template the same way.
     pub const BEAM: &str = "beam";
+    pub const NEMOTRON4: &str = "nemotron4";
+    /// The Python nemotron4 tool parser's name: with the `nemotron4` reasoning parser it selects
+    /// the `nemotron4` unified parser ([`paired_unified_name`]).
+    pub const NEMOTRON4_TOOL: &str = "nemotron4_tool";
+}
+
+/// Tool and reasoning parser names that together select one unified parser, as the Python
+/// frontend composes them: `--tool-call-parser nemotron4_tool --reasoning-parser nemotron4`
+/// selects `nemotron4`. The Python plugins' `NEMOTRON4_TOOL_PARSER_NAMES` /
+/// `NEMOTRON4_REASONING_PARSER_NAMES` (comma-separated) rename the two halves here as there.
+pub fn paired_unified_name(tool: Option<&str>, reasoning: Option<&str>) -> Option<&'static str> {
+    let (tool, reasoning) = (tool?, reasoning?);
+    (NEMOTRON4_TOOL_NAMES.iter().any(|name| name == tool)
+        && NEMOTRON4_REASONING_NAMES.iter().any(|name| name == reasoning))
+    .then_some(names::NEMOTRON4)
+}
+
+/// Whether `name` is the `kind` ("tool" or "reasoning") half of a pair that
+/// [`paired_unified_name`] accepts.
+pub fn is_paired_name(kind: &str, name: &str) -> bool {
+    paired_names(kind).any(|candidate| candidate == name)
+}
+
+/// The `kind` ("tool" or "reasoning") halves of the pairs [`paired_unified_name`] accepts.
+pub fn paired_names(kind: &str) -> impl Iterator<Item = String> {
+    let names: &[String] = match kind {
+        "tool" => &NEMOTRON4_TOOL_NAMES,
+        "reasoning" => &NEMOTRON4_REASONING_NAMES,
+        _ => &[],
+    };
+    names.iter().cloned()
+}
+
+static NEMOTRON4_TOOL_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(|| names_from_env("NEMOTRON4_TOOL_PARSER_NAMES", names::NEMOTRON4_TOOL));
+static NEMOTRON4_REASONING_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(|| names_from_env("NEMOTRON4_REASONING_PARSER_NAMES", names::NEMOTRON4));
+
+/// The comma-separated names in `variable`, or `default`.
+fn names_from_env(variable: &str, default: &str) -> Vec<String> {
+    let names: Vec<String> = std::env::var(variable)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        vec![default.to_owned()]
+    } else {
+        names
+    }
 }
 
 /// Constructor signature for one registered unified parser implementation.
@@ -65,6 +117,7 @@ impl UnifiedParserFactory {
         // Opt-in only: no model patterns map to it.
         factory.register_parser::<HfUnifiedParser>(names::HF);
         factory.register_parser::<BeamUnifiedParser>(names::BEAM);
+        factory.register_parser::<Nemotron4UnifiedParser>(names::NEMOTRON4);
 
         factory
             .register_pattern("gemma-4", names::GEMMA4)
@@ -199,6 +252,38 @@ mod tests {
             let explicit = crate::ParserSelection::Explicit(name.to_owned());
             crate::parser::validate_parser_overrides(&explicit, &explicit).unwrap();
         }
+    }
+
+    #[test]
+    fn factory_registers_nemotron4_and_the_python_pair() {
+        let factory = UnifiedParserFactory::new();
+        let tokenizer = TestTokenizer::new()
+            .with_regular_token("<think>", 300)
+            .with_regular_token("</think>", 301)
+            .with_regular_token("<tool_call>", 302)
+            .with_regular_token("</tool_call>", 303);
+
+        assert!(factory.contains(names::NEMOTRON4));
+        factory.create(names::NEMOTRON4, &[], Arc::new(tokenizer)).unwrap();
+        // opt-in only: no model name selects it
+        assert_eq!(
+            factory.resolve_name_for_model("nvidia/Nemotron-4-Nano"),
+            None
+        );
+        assert_eq!(
+            super::paired_unified_name(Some("nemotron4_tool"), Some("nemotron4")),
+            Some(names::NEMOTRON4)
+        );
+        assert_eq!(
+            super::paired_unified_name(Some("qwen3_coder"), Some("nemotron4")),
+            None
+        );
+        assert_eq!(
+            super::paired_unified_name(Some("nemotron4_tool"), None),
+            None
+        );
+        assert!(super::is_paired_name("tool", "nemotron4_tool"));
+        assert!(!super::is_paired_name("reasoning", "nemotron4_tool"));
     }
 
     #[test]

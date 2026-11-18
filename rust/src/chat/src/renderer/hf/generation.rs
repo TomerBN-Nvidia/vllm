@@ -26,7 +26,7 @@ enum CallBlockKind {
 }
 
 /// Rewrite Hugging Face's assistant-mask blocks as scoped MiniJinja call blocks.
-pub(super) fn rewrite_generation_blocks(source: String) -> Result<String, Error> {
+pub(crate) fn rewrite_generation_blocks(source: String) -> Result<String, Error> {
     let tokens = tokenize(&source, false, Default::default(), Default::default())
         .collect::<Result<Vec<_>, _>>()?;
     // Track native calls too: rewriting makes both block kinds use `endcall`,

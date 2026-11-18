@@ -9,6 +9,7 @@
 
 mod logging;
 mod model;
+mod parser_plugins;
 mod ssl;
 mod unsupported;
 
@@ -184,6 +185,13 @@ pub struct RenderArgs {
     /// `none` to disable parsing.
     #[arg(long, default_value_t)]
     reasoning_parser: ParserSelection,
+    /// A Python tool-parser plugin file: the nemotron4 plugin only, whose parser vllm-rs has
+    /// built in (as `serve`'s flag).
+    #[arg(long, value_parser = parser_plugins::parse_tool_plugin)]
+    tool_parser_plugin: Option<PathBuf>,
+    /// A Python reasoning-parser plugin file: the nemotron4 plugin only (as `serve`'s flag).
+    #[arg(long, value_parser = parser_plugins::parse_reasoning_plugin)]
+    reasoning_parser_plugin: Option<PathBuf>,
     /// Server-side floor for structural-tag based tool calling: `auto`,
     /// `function`, or `parameter`. When unset, the tool parser's default
     /// level applies, else `auto`.
@@ -383,6 +391,23 @@ pub struct SharedRuntimeArgs {
     #[arg(long, default_value_t)]
     #[serde(default = "default_py_bootstrap_parser_selection")]
     pub reasoning_parser: ParserSelection,
+    /// A Python tool-parser plugin file. vllm-rs loads no Python plugins: it
+    /// accepts the nemotron4 plugin (`nemotron4_tool_parser_plugin.py`), whose
+    /// parser it has built in (`--tool-call-parser nemotron4_tool`), and
+    /// refuses any other file.
+    #[arg(long, value_parser = parser_plugins::parse_tool_plugin)]
+    #[serde(default, deserialize_with = "parser_plugins::deserialize_tool_plugin")]
+    pub tool_parser_plugin: Option<PathBuf>,
+    /// A Python reasoning-parser plugin file: the nemotron4 plugin
+    /// (`nemotron4_reasoning_parser.py`, `--reasoning-parser nemotron4`) only,
+    /// as for `--tool-parser-plugin`. A managed Python engine gets it too, for
+    /// the structured-output reasoning gate.
+    #[arg(long, value_parser = parser_plugins::parse_reasoning_plugin)]
+    #[serde(
+        default,
+        deserialize_with = "parser_plugins::deserialize_reasoning_plugin"
+    )]
+    pub reasoning_parser_plugin: Option<PathBuf>,
     /// Server-side floor for structural-tag based tool calling, applied on
     /// top of the per-tool `strict` field: `auto` follows the request's
     /// tool choice and per-tool strictness,
@@ -479,6 +504,21 @@ pub struct SharedRuntimeArgs {
     #[arg(long, value_parser = parse_json::<MmLimitPerPrompt>, value_name = "JSON", default_value = "{}")]
     #[serde(default)]
     pub limit_mm_per_prompt: MmLimitPerPrompt,
+
+    /// Directory allowed for local video inputs.
+    #[arg(long)]
+    #[serde(default)]
+    pub allowed_local_media_path: Option<PathBuf>,
+
+    /// Media loading options, keyed by modality.
+    #[arg(long, value_parser = parse_json::<HashMap<String, Value>>)]
+    #[serde(default)]
+    pub media_io_kwargs: Option<HashMap<String, Value>>,
+
+    /// Model-specific multimodal processor options.
+    #[arg(long, value_parser = parse_json::<HashMap<String, Value>>)]
+    #[serde(default)]
+    pub mm_processor_kwargs: Option<HashMap<String, Value>>,
 
     /// LoRA adapters to load before serving, each as `name=path` or a JSON
     /// object: `{"name": "name", "path": "lora_path", "base_model_name": "id"}`.
@@ -1070,6 +1110,11 @@ impl SharedRuntimeArgs {
             trust_request_chat_template: self.trust_request_chat_template,
             exclude_tools_when_tool_choice_none: self.exclude_tools_when_tool_choice_none,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
+            media_options: vllm_chat::multimodal::MediaOptions {
+                allowed_local_media_path: self.allowed_local_media_path,
+                media_io_kwargs: self.media_io_kwargs.unwrap_or_default(),
+                mm_processor_kwargs: self.mm_processor_kwargs.unwrap_or_default(),
+            },
             lora_modules: self.lora_modules,
             default_mm_loras: self.default_mm_loras,
             chat_template_content_format: self.chat_template_content_format,
@@ -1162,6 +1207,11 @@ impl SharedRuntimeArgs {
             trust_request_chat_template: self.trust_request_chat_template,
             exclude_tools_when_tool_choice_none: self.exclude_tools_when_tool_choice_none,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
+            media_options: vllm_chat::multimodal::MediaOptions {
+                allowed_local_media_path: self.allowed_local_media_path,
+                media_io_kwargs: self.media_io_kwargs.unwrap_or_default(),
+                mm_processor_kwargs: self.mm_processor_kwargs.unwrap_or_default(),
+            },
             lora_modules: self.lora_modules,
             default_mm_loras: self.default_mm_loras,
             chat_template_content_format: self.chat_template_content_format,
@@ -1561,6 +1611,29 @@ impl ServeArgs {
         });
 
         let mut managed_engine = self.managed_engine.clone();
+        if let Some(path) = &self.runtime.allowed_local_media_path {
+            managed_engine.python_args.extend([
+                "--allowed-local-media-path".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
+        for (flag, value) in [
+            ("--media-io-kwargs", &self.runtime.media_io_kwargs),
+            ("--mm-processor-kwargs", &self.runtime.mm_processor_kwargs),
+        ] {
+            if let Some(value) = value {
+                managed_engine.python_args.extend([
+                    flag.to_owned(),
+                    serde_json::to_string(value).expect("JSON object serializes"),
+                ]);
+            }
+        }
+        if let Some(path) = &self.runtime.reasoning_parser_plugin {
+            managed_engine.python_args.extend([
+                "--reasoning-parser-plugin".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
         managed_engine.python_args.extend(self.runtime.model_args().python_args());
         if let Some(logging_config) = self.runtime.logging_config_json() {
             managed_engine

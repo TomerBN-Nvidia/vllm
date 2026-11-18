@@ -88,9 +88,9 @@ impl fmt::Display for ChatTemplateContentFormatOption {
 
 /// Renderer inputs that every probe renders with: the same for all requests.
 #[derive(Default)]
-pub(super) struct ProbeContext<'a> {
-    pub(super) special_tokens: Option<&'a HfSpecialTokens>,
-    pub(super) template_kwargs: Option<&'a HashMap<String, JsonValue>>,
+pub(crate) struct ProbeContext<'a> {
+    pub(crate) special_tokens: Option<&'a HfSpecialTokens>,
+    pub(crate) template_kwargs: Option<&'a HashMap<String, JsonValue>>,
 }
 
 /// Content shapes a chat template renders correctly, found by rendering probe

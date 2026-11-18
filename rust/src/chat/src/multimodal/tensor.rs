@@ -110,7 +110,11 @@ impl KwargValue {
 
     /// Convert a float tensor to the target float dtype if needed, keeping the
     /// same shape.
-    fn from_f32_parts(data: Vec<f32>, shape: Vec<usize>, float_dtype: ModelDtype) -> Result<Self> {
+    pub(super) fn from_f32_parts(
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        float_dtype: ModelDtype,
+    ) -> Result<Self> {
         let wire = match float_dtype {
             ModelDtype::Float16 => {
                 WireTensor::from_f16(shape, data.into_iter().map(f16::from_f32).collect())

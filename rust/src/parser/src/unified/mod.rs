@@ -11,6 +11,7 @@ mod hy;
 mod inkling;
 mod kimi_k3;
 mod muse;
+mod nemotron4;
 
 pub use beam::BeamUnifiedParser;
 pub use combined::CombinedParser;
@@ -20,9 +21,16 @@ pub use hy::{HyV3UnifiedParser, HyV4UnifiedParser};
 pub use inkling::InklingUnifiedParser;
 pub use kimi_k3::KimiK3UnifiedParser;
 pub use muse::MuseUnifiedParser;
+pub use nemotron4::{
+    NEMOTRON4_VERSION, Nemotron4Options, Nemotron4ToolChoice, Nemotron4UnifiedParser,
+};
+use std::collections::HashMap;
+
+use serde_json::Value;
 use thiserror::Error;
 use thiserror_ext::Macro;
 use vllm_tokenizer::{DecodedText, DynTokenizer};
+use xgrammar_structural_tag::ToolChoice;
 
 use crate::output_grammar::{self, BuiltOutputGrammar, OutputGrammarContext, ToolStrictLevel};
 use crate::reasoning::ReasoningError;
@@ -229,12 +237,40 @@ mod tests {
     }
 }
 
+/// Request facts a unified parser may use beyond its tools, handed over before
+/// [`UnifiedParser::initialize`].
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedParserRequest<'a> {
+    /// Effective tool-choice policy.
+    pub tool_choice: &'a ToolChoice,
+    /// The chat-template kwargs the prompt was rendered with: the server's
+    /// defaults and the request's.
+    pub template_kwargs: &'a HashMap<String, Value>,
+    /// The request's own chat template, when it overrides the model's.
+    pub chat_template: Option<&'a str>,
+    /// Whether the response is streamed (intermediate deltas reach the client).
+    pub stream: bool,
+    /// The tokenizer's named special tokens (`bos_token`, `eos_token`,
+    /// `unk_token`, `pad_token`, ... and `additional_special_tokens`), as
+    /// transformers' `all_special_ids`, when known.
+    pub special_token_ids: Option<&'a [u32]>,
+    /// The end tokens the engine stops on: the tokenizer's eos and those the
+    /// model's generation and model configs list, when known.
+    pub end_token_ids: Option<&'a [u32]>,
+}
+
 /// Incremental parser that extracts reasoning and tool-call events from assistant output.
 pub trait UnifiedParser: Send {
     /// Construct a boxed parser instance for one request stream.
     fn create(tools: &[Tool], tokenizer: DynTokenizer) -> Result<Box<dyn UnifiedParser>>
     where
         Self: Sized + 'static;
+
+    /// Take the request's options, before [`Self::initialize`]. Parsers that
+    /// need nothing beyond their tools ignore them.
+    fn configure(&mut self, _request: &UnifiedParserRequest<'_>) -> Result<()> {
+        Ok(())
+    }
 
     /// Initialize parser state from prompt token IDs before output deltas arrive.
     fn initialize(&mut self, _prompt_token_ids: &[u32]) -> Result<()> {

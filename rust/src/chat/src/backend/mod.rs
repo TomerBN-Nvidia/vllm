@@ -100,6 +100,7 @@ pub struct LoadModelBackendsOptions {
     /// Maximum number of input items allowed per prompt for each modality.
     /// Unspecified modalities are unlimited.
     pub limit_mm_per_prompt: MmLimitPerPrompt,
+    pub media_options: crate::multimodal::MediaOptions,
 }
 
 /// Shared backends loaded from a model id.

@@ -171,7 +171,7 @@ pub fn resolve_chat_template(chat_template: &str) -> Result<String> {
 
 /// One compiled chat template with its Jinja environment and content format
 /// selection.
-pub(super) struct CompiledChatTemplate {
+pub(crate) struct CompiledChatTemplate {
     /// Cached, fully-configured environment for one compiled template.
     env: Environment<'static>,
     content_format: ContentFormatSelection,
@@ -227,7 +227,7 @@ impl CompiledChatTemplate {
 
     /// Apply the compiled template to the given context and return the rendered
     /// prompt.
-    pub fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
+    pub(super) fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
         render(&self.env, ctx)
     }
 
@@ -240,7 +240,7 @@ impl CompiledChatTemplate {
     }
 
     /// How developer messages reach this template.
-    pub fn developer_role(&self) -> DeveloperRole {
+    pub(super) fn developer_role(&self) -> DeveloperRole {
         self.developer_role
     }
 }

@@ -5,12 +5,13 @@
 
 mod unified;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Once};
 
 use futures::StreamExt as _;
 use tracing::info;
 use vllm_parser::output_grammar::{BuiltOutputGrammar, OutputGrammarContext};
-use vllm_parser::unified::{CombinedParser, UnifiedParser};
+use vllm_parser::unified::{CombinedParser, UnifiedParser, UnifiedParserRequest};
 use vllm_text::tokenizer::DynTokenizer;
 use xgrammar_structural_tag::ToolChoice;
 use xgrammar_structural_tag::format::Format;
@@ -24,7 +25,7 @@ use crate::parser::reasoning::{ReasoningParser, ReasoningParserFactory};
 use crate::parser::tool::{ToolParser, ToolParserFactory};
 use crate::parser::unified::{
     BeamUnifiedParser, HfTemplateError, HfUnifiedParser, ResponseTemplate, UnifiedParserFactory,
-    names,
+    names, paired_unified_name,
 };
 use crate::parser::{ParserSelection, ToolStrictLevel};
 use crate::request::{ChatRequest, ChatTool, ResolvedToolContext};
@@ -42,6 +43,20 @@ pub struct DefaultChatOutputProcessor {
     /// Request facts the initialized parser needs to build its output grammar.
     /// Absent for the plain-text-only processor, which never builds one.
     grammar_inputs: Option<GrammarInputs>,
+    /// Request options handed to the parser before it is initialized
+    /// ([`UnifiedParser::configure`]).
+    parser_inputs: ParserInputs,
+}
+
+/// Request facts for [`UnifiedParser::configure`]: captured at construction, except the
+/// effective chat-template kwargs, which rendering decides.
+#[derive(Default)]
+struct ParserInputs {
+    stream: bool,
+    chat_template: Option<String>,
+    template_kwargs: HashMap<String, serde_json::Value>,
+    special_token_ids: Option<Arc<[u32]>>,
+    end_token_ids: Option<Arc<[u32]>>,
 }
 
 /// Request-scoped inputs for [`UnifiedParser::build_output_grammar`], captured
@@ -146,7 +161,28 @@ impl DefaultChatOutputProcessor {
                 parallel_tool_calls: request.parallel_tool_calls(),
                 answer: request.sampling_params.structured_outputs.as_ref().and_then(answer_format),
             }),
+            parser_inputs: ParserInputs {
+                stream: request.intermediate,
+                chat_template: request.chat_options.chat_template.clone(),
+                template_kwargs: request.chat_options.template_kwargs.clone(),
+                special_token_ids: None,
+                end_token_ids: None,
+            },
         })
+    }
+
+    /// Set the tokenizer's named special tokens (transformers' `all_special_ids`) for parsers
+    /// that tell them apart ([`UnifiedParserRequest::special_token_ids`]).
+    pub fn with_special_token_ids(mut self, special_token_ids: Option<Arc<[u32]>>) -> Self {
+        self.parser_inputs.special_token_ids = special_token_ids;
+        self
+    }
+
+    /// Set the end tokens the engine stops on (the tokenizer's eos and the generation and model
+    /// configs'), for parsers that tell them apart ([`UnifiedParserRequest::end_token_ids`]).
+    pub fn with_end_token_ids(mut self, end_token_ids: Option<Arc<[u32]>>) -> Self {
+        self.parser_inputs.end_token_ids = end_token_ids;
+        self
     }
 
     /// Build the plain-text-only default output processor.
@@ -159,6 +195,7 @@ impl DefaultChatOutputProcessor {
             parser: Box::new(CombinedParser::plain_text_only()),
             max_tool_calls: None,
             grammar_inputs: None,
+            parser_inputs: ParserInputs::default(),
         }
     }
 
@@ -208,12 +245,12 @@ impl DefaultChatOutputProcessor {
         reasoning_name: Option<&str>,
     ) -> ChatResult<Option<Box<dyn UnifiedParser>>> {
         let factory = UnifiedParserFactory::global();
-        let Some(parser_name) =
+        let Some(parser_name) = paired_unified_name(tool_name, reasoning_name).or_else(|| {
             tool_name.into_iter().chain(reasoning_name).find(|name| factory.contains(name))
-        else {
+        }) else {
             return Ok(None);
         };
-        if tool_name != reasoning_name {
+        if tool_name != reasoning_name && paired_unified_name(tool_name, reasoning_name).is_none() {
             return Err(Error::IncompatibleParserSelections {
                 tool: tool_name.unwrap_or("none").to_owned(),
                 reasoning: reasoning_name.unwrap_or("none").to_owned(),
@@ -265,12 +302,28 @@ static UNIFIED_PARSER_LOG_ONCE: Once = Once::new();
 static RESPONSE_TEMPLATE_HINT_ONCE: Once = Once::new();
 
 impl ChatOutputProcessor for DefaultChatOutputProcessor {
+    fn set_template_kwargs(&mut self, template_kwargs: &HashMap<String, serde_json::Value>) {
+        self.parser_inputs.template_kwargs = template_kwargs.clone();
+    }
+
     fn initialize(&mut self, prompt_token_ids: &[u32]) -> Result<()> {
-        self.parser.initialize(prompt_token_ids).map_err(|error| {
-            Error::OutputParserInitialization {
-                error: Box::new(error),
-            }
-        })
+        let to_error = |error| Error::OutputParserInitialization {
+            error: Box::new(error),
+        };
+        if let Some(inputs) = &self.grammar_inputs {
+            let parser_inputs = &self.parser_inputs;
+            self.parser
+                .configure(&UnifiedParserRequest {
+                    tool_choice: &inputs.tool_choice,
+                    template_kwargs: &parser_inputs.template_kwargs,
+                    chat_template: parser_inputs.chat_template.as_deref(),
+                    stream: parser_inputs.stream,
+                    special_token_ids: parser_inputs.special_token_ids.as_deref(),
+                    end_token_ids: parser_inputs.end_token_ids.as_deref(),
+                })
+                .map_err(to_error)?;
+        }
+        self.parser.initialize(prompt_token_ids).map_err(to_error)
     }
 
     fn build_output_grammar(&self) -> Result<Option<BuiltOutputGrammar>> {
@@ -314,6 +367,7 @@ mod tests {
     use vllm_parser::output_grammar::BuiltOutputGrammar;
     use vllm_text::output::{DecodedTextEvent, Finished};
     use vllm_text::{DecodedText, SampledDelta};
+    use vllm_tokenizer::Tokenizer as _;
     use vllm_tokenizer::test_utils::TestTokenizer;
     use xgrammar_structural_tag::format::Format;
 
@@ -626,6 +680,166 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// One nemotron4 turn through the processor as chat serving runs it: the Python frontend's
+    /// pair of names, the effective template kwargs, the prompt, then the output ids decoded with
+    /// special tokens kept, in `chunk_size` ids per delta. Returns (reasoning, content, calls).
+    fn nemotron4_turn(
+        tool_choice: ChatToolChoice,
+        stream: bool,
+        prompt: &[u32],
+        output: &[u32],
+        chunk_size: usize,
+    ) -> (String, String, Vec<(String, serde_json::Value)>) {
+        use vllm_parser::unified::{UnifiedParserEvent, UnifiedParserOutput};
+
+        let tokenizer = nemotron4_tokenizer();
+        let mut request = ChatRequest {
+            tool_context: ResolvedToolContext::new(
+                &[],
+                vec![ChatTool {
+                    name: "f".to_owned(),
+                    description: None,
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"a": {"type": "integer"}}
+                    }),
+                    strict: None,
+                    defer_loading: None,
+                }],
+                Some(tool_choice),
+                true,
+            )
+            .unwrap(),
+            intermediate: stream,
+            ..ChatRequest::for_test()
+        };
+        let mut processor = DefaultChatOutputProcessor::new(
+            &mut request,
+            "nemotron4",
+            tokenizer.clone(),
+            &ParserSelection::Explicit("nemotron4_tool".to_owned()),
+            &ParserSelection::Explicit("nemotron4".to_owned()),
+            Some(ToolStrictLevel::Auto),
+        )
+        .unwrap();
+        assert!(!request.decode_options.skip_special_tokens);
+        processor.set_template_kwargs(&Default::default());
+        processor.initialize(prompt).unwrap();
+        let mut decoder =
+            tokenizer.create_decode_stream(prompt, request.decode_options.skip_special_tokens, 0);
+        let mut events = UnifiedParserOutput::default();
+        for chunk in output.chunks(chunk_size) {
+            for &id in chunk {
+                decoder.push_token(id).unwrap();
+            }
+            let (_, decoded) = decoder.flush(None).unwrap();
+            processor.parser.parse_into(decoded, &mut events).unwrap();
+        }
+        events.events.extend(processor.parser.finish().unwrap().events);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        let mut calls: Vec<(String, String)> = Vec::new();
+        for event in events.events {
+            match event {
+                UnifiedParserEvent::Reasoning(text) => reasoning.push_str(&text.text),
+                UnifiedParserEvent::Text(text) => content.push_str(&text),
+                UnifiedParserEvent::ToolCall(call) => {
+                    if calls.len() <= call.tool_index {
+                        calls.resize(call.tool_index + 1, Default::default());
+                    }
+                    let slot = &mut calls[call.tool_index];
+                    slot.0.push_str(call.name.as_deref().unwrap_or_default());
+                    slot.1.push_str(&call.arguments);
+                }
+            }
+        }
+        let calls = calls
+            .into_iter()
+            .map(|(name, arguments)| (name, serde_json::from_str(&arguments).unwrap()))
+            .collect();
+        (reasoning, content, calls)
+    }
+
+    fn nemotron4_tokenizer() -> Arc<TestTokenizer> {
+        Arc::new(
+            TestTokenizer::new()
+                .with_regular_token("<think>", 300)
+                .with_regular_token("</think>", 301)
+                .with_regular_token("<tool_call>", 302)
+                .with_regular_token("</tool_call>", 303)
+                .with_special_token("<|im_start|>", 304)
+                .with_special_token("<|im_end|>", 305),
+        )
+    }
+
+    /// The text's ids, every character a byte id: control-token spellings written as text.
+    fn as_text(text: &str) -> Vec<u32> {
+        text.bytes().map(u32::from).collect()
+    }
+
+    #[test]
+    fn nemotron4_python_pair_parses_by_token_id() {
+        let tokenizer = nemotron4_tokenizer();
+        let prompt = tokenizer.encode("<|im_start|>assistant\n<think>\n", false).unwrap();
+        let call =
+            "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>";
+        let output = tokenizer.encode(&format!("Plan.\n</think>\nSure.\n{call}"), false).unwrap();
+        // the same turn with the call's markup written as text: no call
+        let mut quoted = tokenizer.encode("Plan.\n</think>\nSure.\n", false).unwrap();
+        quoted.extend(as_text(call));
+        for stream in [false, true] {
+            for chunk_size in [output.len(), 1, 3] {
+                let (reasoning, content, calls) =
+                    nemotron4_turn(ChatToolChoice::Auto, stream, &prompt, &output, chunk_size);
+                assert_eq!(
+                    reasoning, "Plan.\n",
+                    "stream {stream}, chunk size {chunk_size}"
+                );
+                assert_eq!(content, "\nSure.\n");
+                assert_eq!(calls, vec![("f".to_owned(), serde_json::json!({"a": 1}))]);
+                let (_, content, calls) =
+                    nemotron4_turn(ChatToolChoice::Auto, stream, &prompt, &quoted, chunk_size);
+                assert_eq!(content, format!("\nSure.\n{call}"));
+                assert!(calls.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn nemotron4_without_a_call_not_streamed_keeps_the_generated_text() {
+        // An empty block is no call: streamed, the parser drops it as it goes; not streamed, a turn
+        // without a call has the text as generated as its content (vLLM's DelegatingParser).
+        let tokenizer = nemotron4_tokenizer();
+        let prompt = tokenizer.encode("<|im_start|>assistant\n<think>\n", false).unwrap();
+        let output = tokenizer
+            .encode(
+                "Plan.\n</think>\nSure.<tool_call>\n</tool_call>Done.",
+                false,
+            )
+            .unwrap();
+        let (_, content, _) = nemotron4_turn(ChatToolChoice::Auto, false, &prompt, &output, 1);
+        assert_eq!(content, "\nSure.<tool_call>\n</tool_call>Done.");
+        let (_, content, _) = nemotron4_turn(ChatToolChoice::Auto, true, &prompt, &output, 1);
+        assert_eq!(content, "\nSure.Done.");
+        // tool_choice none: no tool parsing at all
+        let (_, content, calls) = nemotron4_turn(
+            ChatToolChoice::None,
+            true,
+            &prompt,
+            &tokenizer
+                .encode(
+                    "Plan.\n</think>\n<tool_call>\n<function=f>\n</function>\n</tool_call>",
+                    false,
+                )
+                .unwrap(),
+            1,
+        );
+        assert_eq!(
+            content,
+            "\n<tool_call>\n<function=f>\n</function>\n</tool_call>"
+        );
+        assert!(calls.is_empty());
     }
 
     #[test]

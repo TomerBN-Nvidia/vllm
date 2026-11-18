@@ -153,13 +153,16 @@ async fn build_state(config: &RenderConfig) -> Result<Arc<RenderState>> {
             hf_token: config.hf_token.clone(),
             hf_overrides: config.hf_overrides.clone(),
             generation_config: Default::default(),
-            renderer: config.renderer,
+            renderer: config
+                .renderer
+                .for_parsers(&config.tool_call_parser, &config.reasoning_parser),
             language_model_only: config.language_model_only,
             chat_template: config.chat_template.clone(),
             trust_request_chat_template: config.trust_request_chat_template,
             chat_template_content_format: config.chat_template_content_format,
             default_chat_template_kwargs: config.default_chat_template_kwargs.clone(),
             limit_mm_per_prompt: config.limit_mm_per_prompt.clone(),
+            media_options: Default::default(),
         },
     )
     .await

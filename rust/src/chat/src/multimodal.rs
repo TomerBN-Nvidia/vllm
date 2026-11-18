@@ -43,6 +43,7 @@ mod image;
 mod input;
 mod item;
 mod models;
+mod nemotron4;
 mod preprocessed;
 mod tensor;
 mod timing;
@@ -52,6 +53,20 @@ use self::expand::expand_prompt_token_ids;
 pub use self::input::MultimodalInput;
 use self::timing::MM_STAGE_TARGET;
 pub use self::timing::{mm_request_span, mm_timing_layer};
+
+/// Media preprocessing options shared with the Python engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaOptions {
+    pub allowed_local_media_path: Option<std::path::PathBuf>,
+    pub media_io_kwargs: HashMap<String, serde_json::Value>,
+    pub mm_processor_kwargs: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone)]
+enum VisionProcessor {
+    Registered(Arc<dyn VisionPreProcessor>),
+    Nemotron4(Arc<nemotron4::Processor>),
+}
 
 /// Resolved multimodal support for one loaded model.
 #[derive(Clone)]
@@ -288,7 +303,7 @@ struct VisionModalitySupport {
     placeholder: ResolvedPlaceholder,
     /// Built by the spec with this modality's preprocessor config resolved
     /// into it; reused across requests.
-    processor: Arc<dyn VisionPreProcessor>,
+    processor: VisionProcessor,
     /// The modality's preprocessor config, consulted per request by the
     /// video sampling policy and media-aware prompt replacements.
     config: PreProcessorConfig,
@@ -314,6 +329,8 @@ pub struct MultimodalConfigFiles<'a> {
     /// Combined processor config (`processor_config.json`), whose modality
     /// sections take precedence over legacy standalone files.
     pub processor_config: Option<&'a Path>,
+    /// `tokenizer_config.json`, which may name a model's media tokens (Nemotron4).
+    pub tokenizer_config: Option<&'a Path>,
 }
 
 /// Load a modality's section from the combined processor config, falling back
@@ -389,6 +406,7 @@ impl MultimodalModelInfo {
         files: MultimodalConfigFiles<'_>,
         tokenizer: DynTokenizer,
         limit_mm_per_prompt: MmLimitPerPrompt,
+        options: &MediaOptions,
     ) -> Result<Option<Self>> {
         let config = match files.config {
             Some(path) => {
@@ -422,6 +440,16 @@ impl MultimodalModelInfo {
         )?
         .unwrap_or_else(|| preprocessor_config.clone());
 
+        let mut config = config;
+        if config.get("model_type").and_then(serde_json::Value::as_str) == Some("nemotron4") {
+            // the media tokens' spellings, resolved once (the spec reads them from the config)
+            nemotron4::resolve_media_tokens(
+                &mut config,
+                files.processor_config,
+                files.tokenizer_config,
+                tokenizer.as_ref(),
+            )?;
+        }
         let context = MultimodalModelContext {
             model_id,
             model_type,
@@ -435,6 +463,7 @@ impl MultimodalModelInfo {
             video_preprocessor_config,
             audio_preprocessor_config,
             limit_mm_per_prompt,
+            options,
         )
     }
 
@@ -446,9 +475,14 @@ impl MultimodalModelInfo {
         video_preprocessor_config: PreProcessorConfig,
         audio_preprocessor_config: PreProcessorConfig,
         limit_mm_per_prompt: MmLimitPerPrompt,
+        options: &MediaOptions,
     ) -> Result<Option<Self>> {
-        let (image, video) =
-            Self::resolve_vision_lanes(&context, preprocessor_config, video_preprocessor_config)?;
+        let (image, video) = Self::resolve_vision_lanes(
+            &context,
+            preprocessor_config,
+            video_preprocessor_config,
+            options,
+        )?;
         let audio = Self::resolve_audio_lane(&context, &audio_preprocessor_config)?;
 
         if image.is_none() && video.is_none() && audio.is_none() {
@@ -499,6 +533,7 @@ impl MultimodalModelInfo {
         context: &MultimodalModelContext,
         preprocessor_config: PreProcessorConfig,
         video_preprocessor_config: PreProcessorConfig,
+        options: &MediaOptions,
     ) -> Result<(Option<VisionModalitySupport>, Option<VisionModalitySupport>)> {
         let Some(raw_spec) = context.resolve_model_spec() else {
             warn!(
@@ -507,6 +542,38 @@ impl MultimodalModelInfo {
                 "multimodal model spec is not registered; disabling image/video support for this model"
             );
             return Ok((None, None));
+        };
+
+        let native = if raw_spec.name() == "nemotron4" {
+            let mut options = options.clone();
+            if !options.mm_processor_kwargs.contains_key("size") {
+                if let Some(size) = &preprocessor_config.size {
+                    if let Some(longest_edge) = size.get("longest_edge") {
+                        options.mm_processor_kwargs.insert(
+                            "size".to_owned(),
+                            serde_json::json!({"longest_edge": longest_edge}),
+                        );
+                    }
+                }
+            }
+            Some(Arc::new(nemotron4::Processor::new(
+                &context.config,
+                &options,
+            )?))
+        } else {
+            if options != &MediaOptions::default() {
+                bail_multimodal!("media preprocessing options are only supported for Nemotron4");
+            }
+            None
+        };
+        let resolve_processor = |config: &PreProcessorConfig, modality| {
+            if let Some(processor) = &native {
+                Ok(Some(VisionProcessor::Nemotron4(processor.clone())))
+            } else {
+                context
+                    .resolve_vision_processor(raw_spec, config, modality)
+                    .map(|processor| processor.map(VisionProcessor::Registered))
+            }
         };
 
         // Warn and disable the modality if the placeholder resolution fails.
@@ -525,14 +592,14 @@ impl MultimodalModelInfo {
             };
 
         let image = if let Some(placeholder) = resolve_placeholder(Modality::Image) {
-            context
-                .resolve_vision_processor(raw_spec, &preprocessor_config, Modality::Image)?
-                .map(|processor| VisionModalitySupport {
+            resolve_processor(&preprocessor_config, Modality::Image)?.map(|processor| {
+                VisionModalitySupport {
                     spec: ResolvedMultimodalSpec::new(raw_spec, Modality::Image),
                     placeholder,
                     processor,
                     config: preprocessor_config,
-                })
+                }
+            })
         } else {
             None
         };
@@ -549,18 +616,14 @@ impl MultimodalModelInfo {
                 );
                 None
             } else {
-                context
-                    .resolve_vision_processor(
-                        raw_spec,
-                        &video_preprocessor_config,
-                        Modality::Video,
-                    )?
-                    .map(|processor| VisionModalitySupport {
+                resolve_processor(&video_preprocessor_config, Modality::Video)?.map(|processor| {
+                    VisionModalitySupport {
                         spec: ResolvedMultimodalSpec::new(raw_spec, Modality::Video),
                         placeholder,
                         processor,
                         config: video_preprocessor_config,
-                    })
+                    }
+                })
             }
         } else {
             None
@@ -1041,11 +1104,21 @@ impl MultimodalModelInfo {
         fields(stage = "media_fetch")
     )]
     async fn fetch_media(&self, media_parts: Vec<MediaContentPart>) -> Result<FetchedMedia> {
+        if let Some(VisionModalitySupport {
+            processor: VisionProcessor::Nemotron4(processor),
+            ..
+        }) = self.video.as_ref().or(self.image.as_ref())
+        {
+            return processor.fetch_media(&self.media_connector, media_parts).await;
+        }
         // Python's image loader composites transparent pixels over white
         // (`rgba_background_color`), except for a processor that handles the
         // alpha channel itself (Kimi-K3, whose Python renderer keeps it).
         let transparency = match &self.image {
-            Some(image) if image.processor.keeps_alpha() => TransparencyPolicy::KeepAlpha,
+            Some(VisionModalitySupport {
+                processor: VisionProcessor::Registered(processor),
+                ..
+            }) if processor.keeps_alpha() => TransparencyPolicy::KeepAlpha,
             _ => TransparencyPolicy::CompositeOverWhite,
         };
         let mut tracker = AsyncMultiModalTracker::new(Arc::clone(&self.media_connector))
@@ -1234,6 +1307,7 @@ mod tests {
             PreProcessorConfig::default(),
             PreProcessorConfig::default(),
             limit_mm_per_prompt,
+            &MediaOptions::default(),
         )
         .unwrap()
         .unwrap_or_else(|| panic!("{model_type} multimodal support should resolve"))
@@ -1314,6 +1388,7 @@ mod tests {
             video_config,
             PreProcessorConfig::default(),
             HashMap::new(),
+            &MediaOptions::default(),
         )
         .unwrap()
         .expect("GLM-5.3-Flash multimodal support")
@@ -1548,6 +1623,7 @@ mod tests {
             PreProcessorConfig::default(),
             PreProcessorConfig::default(),
             HashMap::new(),
+            &MediaOptions::default(),
         )
         .unwrap()
         .expect("Nemotron-H Omni multimodal support")
@@ -1837,11 +1913,13 @@ mod tests {
             MultimodalConfigFiles {
                 config: Some(&config),
                 processor_config: Some(&processor),
+                tokenizer_config: None,
                 preprocessor_config: None,
                 video_preprocessor_config: None,
             },
             Arc::new(muse_spark_tokenizer()),
             HashMap::new(),
+            &MediaOptions::default(),
         )
         .unwrap()
         .unwrap();
@@ -1941,7 +2019,10 @@ mod tests {
         // structural tokens only appear inside the replacement sequence.
         assert_eq!(image.placeholder.marker_token_ids, vec![STEP3_IM_PATCH_ID]);
         assert_eq!(image.placeholder.embed_token_id, STEP3_IM_PATCH_ID);
-        assert_eq!(image.processor.model_name(), "step3_vl");
+        let VisionProcessor::Registered(processor) = &image.processor else {
+            panic!("registered processor expected")
+        };
+        assert_eq!(processor.model_name(), "step3_vl");
     }
 
     #[test]
@@ -1970,6 +2051,7 @@ mod tests {
             PreProcessorConfig::default(),
             PreProcessorConfig::default(),
             HashMap::new(),
+            &MediaOptions::default(),
         )
         .expect("resolution should not error");
 

@@ -50,6 +50,11 @@ impl MultimodalModelInfo {
         let support = self.video.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Video.to_string(),
         })?;
+        if let super::VisionProcessor::Nemotron4(processor) = &support.processor {
+            return processor
+                .prepare_videos(clips, uuids, &self.context, support, model_dtype)
+                .await;
+        }
         let mut replacements = Vec::with_capacity(clips.len());
         let mut items = Vec::with_capacity(clips.len());
 
@@ -100,7 +105,10 @@ impl MultimodalModelInfo {
         support: &VisionModalitySupport,
         clip: Arc<VideoClip>,
     ) -> Result<PreprocessedEncoderInputs> {
-        let processor = Arc::clone(&support.processor);
+        let super::VisionProcessor::Registered(processor) = &support.processor else {
+            unreachable!("native media is prepared by its model processor");
+        };
+        let processor = Arc::clone(processor);
 
         tokio::task::spawn_blocking(move || {
             // Request-scoped clip facts travel per call; the checkpoint's
@@ -236,6 +244,7 @@ mod tests {
                 files,
                 Arc::new(qwen3_vl_tokenizer()),
                 std::collections::HashMap::new(),
+                &crate::multimodal::MediaOptions::default(),
             )
         };
 

@@ -18,6 +18,7 @@ mod step3_vl;
 /// Specs for models that `llm-multimodal` does not have yet, one model per
 /// submodule.
 static SPECS: &[&dyn ModelProcessorSpec] = &[
+    &super::nemotron4::SPEC,
     &step3_vl::Step3VLVisionSpec, // Step3-VL, Step5-VL
     &muse_spark::MuseSparkSpec,   // MuseSpark (image + video + audio)
 ];

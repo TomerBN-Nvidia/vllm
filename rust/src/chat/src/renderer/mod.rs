@@ -20,6 +20,7 @@ pub mod harmony;
 pub mod hf;
 mod inkling;
 mod kimi_k3;
+pub mod nemotron4;
 mod selection;
 #[cfg(test)]
 mod test_utils;

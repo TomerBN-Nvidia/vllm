@@ -32,6 +32,9 @@ pub enum RendererSelection {
     KimiK3,
     /// Force the native GLM-5.3 / GLM-5.3-Flash renderer.
     Glm5Next,
+    /// The nemotron4 structural renderer: the HF chat template compiled to a symbolic encoder
+    /// (selected with the nemotron4 parsers).
+    Nemotron4,
 }
 
 impl RendererSelection {
@@ -47,6 +50,34 @@ impl RendererSelection {
     pub const KIMI_K3_LITERAL: &str = "kimi_k3";
     pub const KIMI_K31_MODEL_TYPE: &str = "kimi_k31";
     pub const GLM5_NEXT_LITERAL: &str = "glm5_next";
+    pub const NEMOTRON4_LITERAL: &str = "nemotron4";
+
+    /// The renderer for these parser selections: `Auto` becomes the nemotron4 structural renderer
+    /// when the nemotron4 parsers are selected (as the Python plugin's input hook comes with its
+    /// tool parser), unless `NEMOTRON4_STRUCTURAL_CHAT=0`.
+    pub fn for_parsers(
+        self,
+        tool_call_parser: &crate::parser::ParserSelection,
+        reasoning_parser: &crate::parser::ParserSelection,
+    ) -> Self {
+        use crate::parser::ParserSelection;
+        if self != Self::Auto || !crate::renderer::nemotron4::structural_chat_enabled() {
+            return self;
+        }
+        let name = |s: &ParserSelection| match s {
+            ParserSelection::Explicit(name) => Some(name.clone()),
+            _ => None,
+        };
+        let (tool, reasoning) = (name(tool_call_parser), name(reasoning_parser));
+        let nemotron4 =
+            crate::parser::unified::paired_unified_name(tool.as_deref(), reasoning.as_deref())
+                .is_some()
+                || tool.as_deref() == Some(crate::parser::unified::names::NEMOTRON4)
+                || tool
+                    .as_deref()
+                    .is_some_and(|t| crate::parser::unified::is_paired_name("tool", t));
+        if nemotron4 { Self::Nemotron4 } else { self }
+    }
 
     /// Resolve the renderer selection using the given model type string, if
     /// it's `Auto`.
@@ -89,6 +120,8 @@ impl FromStr for RendererSelection {
             Ok(Self::KimiK3)
         } else if value.eq_ignore_ascii_case(Self::GLM5_NEXT_LITERAL) {
             Ok(Self::Glm5Next)
+        } else if value.eq_ignore_ascii_case(Self::NEMOTRON4_LITERAL) {
+            Ok(Self::Nemotron4)
         } else {
             Err(format!(
                 "unknown renderer `{value}` (expected one of: {})",
@@ -110,6 +143,7 @@ impl fmt::Display for RendererSelection {
             Self::Inkling => f.write_str(Self::INKLING_LITERAL),
             Self::KimiK3 => f.write_str(Self::KIMI_K3_LITERAL),
             Self::Glm5Next => f.write_str(Self::GLM5_NEXT_LITERAL),
+            Self::Nemotron4 => f.write_str(Self::NEMOTRON4_LITERAL),
         }
     }
 }
@@ -150,7 +184,7 @@ mod tests {
     fn renderer_selection_expected_error_message() {
         let err = RendererSelection::from_str("unknown").unwrap_err();
         expect_test::expect![
-            "unknown renderer `unknown` (expected one of: auto, hf, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3, glm5_next)"
+            "unknown renderer `unknown` (expected one of: auto, hf, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3, glm5_next, nemotron4)"
         ]
         .assert_eq(&err);
     }

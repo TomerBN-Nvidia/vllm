@@ -277,6 +277,8 @@ fn serve_args_forward_python_flags_with_separator() {
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
+                        tool_parser_plugin: None,
+                        reasoning_parser_plugin: None,
                         tool_strict_level: None,
                         structured_outputs_config: None,
                         renderer: Auto,
@@ -291,6 +293,9 @@ fn serve_args_forward_python_flags_with_separator() {
                         trust_request_chat_template: false,
                         exclude_tools_when_tool_choice_none: false,
                         limit_mm_per_prompt: {},
+                        allowed_local_media_path: None,
+                        media_io_kwargs: None,
+                        mm_processor_kwargs: None,
                         lora_modules: [],
                         default_mm_loras: {},
                         chat_template_content_format: Auto,
@@ -2183,7 +2188,7 @@ fn serve_args_reject_unknown_renderer_value() {
     .unwrap_err();
 
     expect![[r#"
-        error: invalid value 'definitely_missing' for '--tokenizer-mode <RENDERER>': unknown renderer `definitely_missing` (expected one of: auto, hf, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3, glm5_next)
+        error: invalid value 'definitely_missing' for '--tokenizer-mode <RENDERER>': unknown renderer `definitely_missing` (expected one of: auto, hf, deepseek_v32, deepseek_v4, deepseek_v41, harmony, inkling, kimi_k3, glm5_next, nemotron4)
 
         For more information, try '--help'.
     "#]]
@@ -2340,6 +2345,8 @@ fn frontend_args_accept_json() {
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: None,
                         reasoning_parser: None,
+                        tool_parser_plugin: None,
+                        reasoning_parser_plugin: None,
                         tool_strict_level: None,
                         structured_outputs_config: None,
                         renderer: Auto,
@@ -2354,6 +2361,9 @@ fn frontend_args_accept_json() {
                         trust_request_chat_template: false,
                         exclude_tools_when_tool_choice_none: false,
                         limit_mm_per_prompt: {},
+                        allowed_local_media_path: None,
+                        media_io_kwargs: None,
+                        mm_processor_kwargs: None,
                         lora_modules: [],
                         default_mm_loras: {},
                         chat_template_content_format: Auto,
@@ -3368,6 +3378,8 @@ fn serve_args_accept_handshake_aliases() {
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
+                        tool_parser_plugin: None,
+                        reasoning_parser_plugin: None,
                         tool_strict_level: None,
                         structured_outputs_config: None,
                         renderer: Auto,
@@ -3382,6 +3394,9 @@ fn serve_args_accept_handshake_aliases() {
                         trust_request_chat_template: false,
                         exclude_tools_when_tool_choice_none: false,
                         limit_mm_per_prompt: {},
+                        allowed_local_media_path: None,
+                        media_io_kwargs: None,
+                        mm_processor_kwargs: None,
                         lora_modules: [],
                         default_mm_loras: {},
                         chat_template_content_format: Auto,
@@ -3690,6 +3705,11 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             trust_request_chat_template: false,
             exclude_tools_when_tool_choice_none: false,
             limit_mm_per_prompt: {},
+            media_options: MediaOptions {
+                allowed_local_media_path: None,
+                media_io_kwargs: {},
+                mm_processor_kwargs: {},
+            },
             lora_modules: [],
             default_mm_loras: {},
             chat_template_content_format: Auto,
@@ -3826,6 +3846,11 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             trust_request_chat_template: false,
             exclude_tools_when_tool_choice_none: false,
             limit_mm_per_prompt: {},
+            media_options: MediaOptions {
+                allowed_local_media_path: None,
+                media_io_kwargs: {},
+                mm_processor_kwargs: {},
+            },
             lora_modules: [],
             default_mm_loras: {},
             chat_template_content_format: Auto,
@@ -4075,6 +4100,11 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             trust_request_chat_template: false,
             exclude_tools_when_tool_choice_none: false,
             limit_mm_per_prompt: {},
+            media_options: MediaOptions {
+                allowed_local_media_path: None,
+                media_io_kwargs: {},
+                mm_processor_kwargs: {},
+            },
             lora_modules: [],
             default_mm_loras: {},
             chat_template_content_format: Auto,
@@ -4360,4 +4390,82 @@ fn tokens_only_implies_scale_out_and_skip_tokenizer_init() {
     let config = args.into_config();
     assert!(config.api_server_options.enable_scale_out);
     assert!(config.skip_tokenizer_init);
+}
+
+#[test]
+fn serve_args_accept_the_nemotron4_plugins_and_forward_the_reasoning_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = dir.path().join("nemotron4_tool_parser_plugin.py");
+    let reasoning = dir.path().join("nemotron4_reasoning_parser.py");
+    std::fs::write(
+        &tool,
+        "PLUGIN_NAME = \"nemotron4_tool_parser_plugin\"\nREVISION = \"1.2.0rc1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &reasoning,
+        "PLUGIN_NAME = \"nemotron4_reasoning_parser\"\nREVISION = \"1.2.0rc1\"\n",
+    )
+    .unwrap();
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "nvidia/nemotron4",
+        "--tool-call-parser",
+        "nemotron4_tool",
+        "--reasoning-parser",
+        "nemotron4",
+        "--tool-parser-plugin",
+        tool.to_str().unwrap(),
+        "--reasoning-parser-plugin",
+        reasoning.to_str().unwrap(),
+    ])
+    .unwrap();
+
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args");
+    };
+    assert_eq!(
+        args.runtime.tool_parser_plugin.as_deref(),
+        Some(tool.as_path())
+    );
+    let config = args.to_managed_engine_config(5555, &topology(&args), None);
+    assert_eq!(
+        config.python_args,
+        [
+            "--reasoning-parser-plugin",
+            reasoning.to_str().unwrap(),
+            "--reasoning-parser",
+            "nemotron4",
+        ]
+    );
+
+    // any other plugin file is refused, from the command line and from the Python supervisor
+    let other = dir.path().join("my_parser.py");
+    std::fs::write(&other, "PLUGIN_NAME = \"mine\"\n").unwrap();
+    assert!(
+        Cli::try_parse_from([
+            "vllm-rs",
+            "serve",
+            "nvidia/nemotron4",
+            "--tool-parser-plugin",
+            other.to_str().unwrap(),
+        ])
+        .is_err()
+    );
+    let json = serde_json::json!({
+        "model_tag": "nvidia/nemotron4",
+        "tool_parser_plugin": other,
+    });
+    assert!(super::parse_runtime_args_json(&json.to_string()).is_err());
+    let json = serde_json::json!({
+        "model_tag": "nvidia/nemotron4",
+        "tool_parser_plugin": tool,
+        "reasoning_parser_plugin": reasoning,
+    });
+    let runtime = super::parse_runtime_args_json(&json.to_string()).unwrap();
+    assert_eq!(
+        runtime.reasoning_parser_plugin.as_deref(),
+        Some(reasoning.as_path())
+    );
 }

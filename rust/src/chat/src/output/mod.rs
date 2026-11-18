@@ -85,6 +85,14 @@ pub type DynChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Sen
 /// [`Self::build_output_grammar`], in that order, both before
 /// [`Self::process`].
 pub trait ChatOutputProcessor: Send {
+    /// Take the chat-template kwargs the prompt was rendered with (the server's defaults and the
+    /// request's), before [`Self::initialize`].
+    fn set_template_kwargs(
+        &mut self,
+        _template_kwargs: &std::collections::HashMap<String, serde_json::Value>,
+    ) {
+    }
+
     /// Initialize request-scoped parser state from the final prompt token IDs.
     fn initialize(&mut self, _prompt_token_ids: &[u32]) -> Result<()> {
         Ok(())

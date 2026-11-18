@@ -178,12 +178,6 @@ pub struct TopLevelUnsupportedArgs {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Args, Serialize, Deserialize)]
 pub struct EngineUnsupportedArgs {
-    /// Allowing API requests to read local images or videos from directories
-    /// specified by the server file system. This is a security risk. Should
-    /// only be enabled in trusted environments.
-    #[arg(long)]
-    pub allowed_local_media_path: Option<Unsupported>,
-
     /// If set, only media URLs that belong to this domain can be used for
     /// multi-modal inputs.
     #[arg(long)]
@@ -220,11 +214,6 @@ pub struct EngineUnsupportedArgs {
     #[arg(long)]
     pub renderer_num_workers: Option<Noop>,
 
-    /// Path to a dynamically reasoning parser plugin that can be dynamically
-    /// loaded and registered.
-    #[arg(long)]
-    pub reasoning_parser_plugin: Option<Unsupported>,
-
     /// Enable fault tolerance for detailed error recovery, such as scaling
     /// down fault DPEngineCore.
     #[arg(
@@ -254,15 +243,6 @@ pub struct EngineUnsupportedArgs {
         num_args = 0..=1
     )]
     pub enable_tower_connector_lora: Option<Unsupported>,
-
-    /// Additional args passed to process media inputs, keyed by modalities.
-    #[arg(long)]
-    pub media_io_kwargs: Option<Unsupported>,
-
-    /// Arguments to be forwarded to the model's processor for multi-modal data,
-    /// e.g., image processor.
-    #[arg(long)]
-    pub mm_processor_kwargs: Option<Unsupported>,
 
     /// The size (in GiB) of the multi-modal processor cache.
     #[arg(long)]
@@ -358,12 +338,6 @@ pub struct ServerUnsupportedArgs {
         hide = true
     )]
     pub enable_auto_tool_choice: Option<Noop>,
-
-    /// Special the tool parser plugin write to parse the model-generated tool
-    /// into OpenAI API format, the name register in this plugin can be used in
-    /// `--tool-call-parser`.
-    #[arg(long)]
-    pub tool_parser_plugin: Option<Unsupported>,
 
     /// Comma-separated list of host:port pairs (IPv4, IPv6, or hostname).
     /// Examples: 127.0.0.1:8000, [::1]:8000, localhost:1234. Or `demo` for

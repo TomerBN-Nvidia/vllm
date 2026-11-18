@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::path::Path;
 use std::sync::Arc;
 
 use thiserror_ext::AsReport as _;
@@ -24,6 +25,7 @@ use crate::output::{
 };
 use crate::parser::unified::{HfTemplateError, ResponseTemplate};
 use crate::renderer::hf::{HfChatRenderer, MultimodalRenderInfo};
+use crate::renderer::nemotron4::Nemotron4ChatRenderer;
 use crate::renderer::{
     DeepSeekV4ChatRenderer, DeepSeekV32ChatRenderer, DeepSeekV41ChatRenderer, DynChatRenderer,
     Glm5NextChatRenderer, HarmonyChatRenderer, InklingChatRenderer, KimiK3ChatRenderer,
@@ -42,6 +44,10 @@ pub struct HfChatBackend {
     /// `response_template` from `tokenizer_config.json` for the `hf` parser, or
     /// why it is unavailable.
     response_template: std::result::Result<Arc<ResponseTemplate>, HfTemplateError>,
+    /// The tokenizer's named special tokens, as transformers' `all_special_ids`.
+    special_token_ids: Option<Arc<[u32]>>,
+    /// The end tokens the engine stops on (the text backend's EOS ids).
+    end_token_ids: Option<Arc<[u32]>>,
 }
 
 impl HfChatBackend {
@@ -65,17 +71,25 @@ impl HfChatBackend {
                     preprocessor_config: files.preprocessor_config_path.as_deref(),
                     video_preprocessor_config: files.video_preprocessor_config_path.as_deref(),
                     processor_config: files.processor_config_path.as_deref(),
+                    tokenizer_config: files.tokenizer_config_path.as_deref(),
                 },
                 tokenizer.clone(),
                 options.limit_mm_per_prompt.clone(),
+                &options.media_options,
             )?
         };
         let multimodal_render_info = resolve_multimodal_render_info(multimodal_model_info.as_ref());
         let response_template = load_response_template(&files)?;
+        let special_token_ids =
+            named_special_token_ids(files.tokenizer_config_path.as_deref(), &tokenizer);
 
         let renderer = options.renderer.resolve(model_type);
-        // Only the HF renderer renders Jinja templates.
-        if renderer != RendererSelection::Hf && options.chat_template.is_some() {
+        // HF and Nemotron4 render Jinja chat templates.
+        if !matches!(
+            renderer,
+            RendererSelection::Hf | RendererSelection::Nemotron4
+        ) && options.chat_template.is_some()
+        {
             return Err(Error::UnsupportedChatTemplateOption { renderer });
         }
         let chat_renderer: DynChatRenderer = match renderer {
@@ -111,6 +125,12 @@ impl HfChatBackend {
                     .with_multimodal(model_type == "glm5_next")
                     .with_tokenizer(tokenizer.clone())?,
             ),
+            RendererSelection::Nemotron4 => Arc::new(Nemotron4ChatRenderer::load(
+                &files,
+                options,
+                multimodal_render_info,
+                tokenizer.clone(),
+            )?),
         };
 
         info!(
@@ -127,8 +147,72 @@ impl HfChatBackend {
             chat_renderer,
             multimodal_model_info,
             response_template,
+            special_token_ids,
+            end_token_ids: None,
         })
     }
+
+    /// Set the end tokens the engine stops on, for the output parsers.
+    pub fn with_end_token_ids(mut self, end_token_ids: Option<Arc<[u32]>>) -> Self {
+        self.end_token_ids = end_token_ids;
+        self
+    }
+}
+
+/// The ids of the special tokens `tokenizer_config.json` (and a `special_tokens_map.json` next
+/// to it) names: `bos_token`, `eos_token`, `unk_token`, `sep_token`, `pad_token`, `cls_token`,
+/// `mask_token`, `additional_special_tokens` and `extra_special_tokens`, which is what
+/// transformers' `all_special_ids` lists. `None` without a tokenizer config.
+fn named_special_token_ids(
+    tokenizer_config_path: Option<&Path>,
+    tokenizer: &DynTokenizer,
+) -> Option<Arc<[u32]>> {
+    const NAMED: [&str; 7] = [
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "sep_token",
+        "pad_token",
+        "cls_token",
+        "mask_token",
+    ];
+    fn spelling(value: &serde_json::Value) -> Option<&str> {
+        value
+            .as_str()
+            .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+    }
+    let config_path = tokenizer_config_path?;
+    let mut tokens = Vec::new();
+    for path in [
+        config_path.with_file_name("special_tokens_map.json"),
+        config_path.to_path_buf(),
+    ] {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        for key in NAMED {
+            tokens.extend(config.get(key).and_then(spelling).map(str::to_owned));
+        }
+        for key in ["additional_special_tokens", "extra_special_tokens"] {
+            match config.get(key) {
+                Some(serde_json::Value::Array(values)) => {
+                    tokens.extend(values.iter().filter_map(spelling).map(str::to_owned));
+                }
+                Some(serde_json::Value::Object(values)) => {
+                    tokens.extend(values.values().filter_map(spelling).map(str::to_owned));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut ids: Vec<u32> =
+        tokens.iter().filter_map(|token| tokenizer.token_to_id(token)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Some(ids.into())
 }
 
 /// Load and compile the checkpoint's `response_template`, if any.
@@ -183,7 +267,9 @@ impl ChatBackend for HfChatBackend {
                 options.tool_call_parser,
                 options.reasoning_parser,
                 options.tool_strict_level,
-            )?,
+            )?
+            .with_special_token_ids(self.special_token_ids.clone())
+            .with_end_token_ids(self.end_token_ids.clone()),
         ))
     }
 }
@@ -211,14 +297,24 @@ pub(super) async fn load_model_backends(
         options.generation_config,
     )?;
     let tokenizer = text_backend.tokenizer();
+    let hints = text_backend.sampling_hints()?;
+    let end_token_ids: Arc<[u32]> = hints
+        .primary_eos_token_id
+        .into_iter()
+        .chain(hints.extra_eos_token_ids)
+        .collect::<Vec<_>>()
+        .into();
     // Rendering and parsing a chat need a tokenizer.
     let chat_backend: DynChatBackend = if text_backend.has_tokenizer() {
-        Arc::new(HfChatBackend::from_resolved_model_files(
-            files,
-            model_id.to_string(),
-            options,
-            tokenizer,
-        )?)
+        Arc::new(
+            HfChatBackend::from_resolved_model_files(
+                files,
+                model_id.to_string(),
+                options,
+                tokenizer,
+            )?
+            .with_end_token_ids(Some(end_token_ids)),
+        )
     } else {
         Arc::new(TokenizerlessChatBackend)
     };
@@ -325,6 +421,7 @@ mod tests {
                 trust_request_chat_template: false,
                 default_chat_template_kwargs: HashMap::new(),
                 limit_mm_per_prompt: HashMap::new(),
+                media_options: Default::default(),
                 skip_tokenizer_init: false,
                 hf_token: None,
             },

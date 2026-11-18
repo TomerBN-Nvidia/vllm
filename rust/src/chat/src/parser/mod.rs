@@ -81,9 +81,11 @@ fn validate_selection<C>(
     if let ParserSelection::Explicit(name) = selection
         && !factory.contains(name)
         && !unified.contains(name)
+        && !unified::is_paired_name(kind, name)
     {
         let mut available_names = factory.list();
         available_names.extend(unified.list());
+        available_names.extend(unified::paired_names(kind));
         available_names.sort_unstable();
         available_names.dedup();
         return Err(crate::Error::ParserUnavailableByName {
